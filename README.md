@@ -814,3 +814,539 @@ class MyCustomMetric(nn.Module):
 ```
 
 The metric will be loaded by SegLab's metric_loader using the path and class name specified in a YAML configuration file.
+
+
+___
+
+# Implementing Unsupervised and Semi-Supervised Learning in SegLab
+
+This guide explains how to use SegLab for unsupervised learning (like autoencoders) and semi-supervised learning (like contrastive approaches) without needing to modify the dataset structure.
+
+## Table of Contents
+- [Unsupervised Learning with Autoencoders](#unsupervised-learning-with-autoencoders)
+  - [Autoencoder Model Implementation](#autoencoder-model-implementation)
+  - [Reconstruction Loss Functions](#reconstruction-loss-functions)
+  - [Configuration and Training](#configuration-and-training)
+- [Semi-Supervised Learning with Contrastive Approaches](#semi-supervised-learning-with-contrastive-approaches)
+  - [Contrastive Model Implementation](#contrastive-model-implementation)
+  - [Contrastive Loss Implementation](#contrastive-loss-implementation)
+  - [Configuration and Training](#configuration-and-training-1)
+- [Using the Models for Downstream Tasks](#using-the-models-for-downstream-tasks)
+
+## Unsupervised Learning with Autoencoders
+
+Autoencoders can be implemented within the SegLab framework by creating appropriate model and loss components that follow the framework's conventions.
+
+### Autoencoder Model Implementation
+
+Create an autoencoder model in the `models/` directory:
+
+```python
+# models/autoencoder.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=128, hidden_dims=[32, 64, 128, 256]):
+        super().__init__()
+        
+        # Build Encoder
+        modules = []
+        for h_dim in hidden_dims:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, h_dim, kernel_size=3, stride=2, padding=1),
+                    nn.BatchNorm2d(h_dim),
+                    nn.LeakyReLU()
+                )
+            )
+            in_channels = h_dim
+        
+        self.encoder = nn.Sequential(*modules)
+        self.fc_z = nn.Linear(hidden_dims[-1] * 4, latent_dim)
+    
+    def forward(self, x):
+        result = self.encoder(x)
+        result = torch.flatten(result, start_dim=1)
+        z = self.fc_z(result)
+        return z
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim=128, out_channels=3, hidden_dims=[256, 128, 64, 32]):
+        super().__init__()
+        
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[0] * 4)
+        
+        modules = []
+        for i in range(len(hidden_dims) - 1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(hidden_dims[i], hidden_dims[i + 1],
+                                     kernel_size=3, stride=2, padding=1, output_padding=1),
+                    nn.BatchNorm2d(hidden_dims[i + 1]),
+                    nn.LeakyReLU()
+                )
+            )
+        
+        self.decoder = nn.Sequential(*modules)
+        self.final_layer = nn.Sequential(
+            nn.ConvTranspose2d(hidden_dims[-1], out_channels,
+                             kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid()  # For normalized image output
+        )
+    
+    def forward(self, z):
+        result = self.decoder_input(z)
+        result = result.view(-1, 256, 2, 2)  # Adjust dimensions based on your input size
+        result = self.decoder(result)
+        result = self.final_layer(result)
+        return result
+
+class Autoencoder(nn.Module):
+    def __init__(
+        self, 
+        in_channels=3, 
+        out_channels=3, 
+        latent_dim=128,
+        encoder_hidden_dims=[32, 64, 128, 256],
+        decoder_hidden_dims=[256, 128, 64, 32]
+    ):
+        super().__init__()
+        
+        self.encoder = Encoder(in_channels, latent_dim, encoder_hidden_dims)
+        self.decoder = Decoder(latent_dim, out_channels, decoder_hidden_dims)
+    
+    def forward(self, x):
+        z = self.encoder(x)
+        reconstruction = self.decoder(z)
+        return reconstruction
+    
+    def encode(self, x):
+        return self.encoder(x)
+```
+
+### Reconstruction Loss Functions
+
+Create a reconstruction loss function in the `losses/` directory:
+
+```python
+# losses/reconstruction_loss.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ReconstructionLoss(nn.Module):
+    def __init__(self, loss_type="mse", weight=1.0):
+        super().__init__()
+        self.loss_type = loss_type
+        self.weight = weight
+    
+    def forward(self, y_pred, y_true):
+        """
+        y_pred: reconstructed image
+        y_true: original image (same as input)
+        
+        Note: For use with SegLab, y_true would be passed in as the target/label,
+        but for autoencoders, we compute loss against the original input.
+        """
+        if self.loss_type == "mse":
+            loss = F.mse_loss(y_pred, y_true)
+        elif self.loss_type == "bce":
+            loss = F.binary_cross_entropy(y_pred, y_true)
+        elif self.loss_type == "l1":
+            loss = F.l1_loss(y_pred, y_true)
+        else:
+            raise ValueError(f"Unsupported loss type: {self.loss_type}")
+        
+        return self.weight * loss
+```
+
+### Configuration and Training
+
+Create configuration files for the autoencoder:
+
+```yaml
+# configs/model/autoencoder.yaml
+path: "models.autoencoder"
+class: "Autoencoder"
+params:
+  in_channels: 3
+  out_channels: 3
+  latent_dim: 128
+  encoder_hidden_dims: [32, 64, 128, 256]
+  decoder_hidden_dims: [256, 128, 64, 32]
+```
+
+```yaml
+# configs/loss/reconstruction.yaml
+primary_loss:
+  path: "losses.reconstruction_loss"
+  class: "ReconstructionLoss"
+  params:
+    loss_type: "mse"
+    weight: 1.0
+
+secondary_loss: null
+alpha: 0.0
+start_epoch: 0
+```
+
+To use these in training, modify your main configuration:
+
+```yaml
+# configs/unsupervised_main.yaml
+dataset_config: "your_dataset.yaml"
+model_config: "autoencoder.yaml"
+loss_config: "reconstruction.yaml"
+metrics_config: "reconstruction_metrics.yaml"  # Define appropriate metrics
+inference_config: "chunk.yaml"
+
+# Output directory
+output_dir: "outputs/autoencoder_experiment"
+
+# Make sure your dataset contains the same values for both input and target keys
+target_x: "image_patch"  # Input images
+target_y: "image_patch"  # For autoencoders, target is the same as input
+
+# Rest of configuration remains the same
+```
+
+## Semi-Supervised Learning with Contrastive Approaches
+
+### Contrastive Model Implementation
+
+Create a contrastive model in the `models/` directory:
+
+```python
+# models/contrastive_model.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class EncoderWithProjection(nn.Module):
+    def __init__(
+        self, 
+        in_channels=3, 
+        base_channels=64, 
+        projection_dim=128, 
+        n_levels=4
+    ):
+        super().__init__()
+        
+        # Use an existing encoder backbone (e.g., UNet encoder)
+        from models.base_models import DownBlock
+        
+        # Encoder blocks - reusing existing components
+        self.inc = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.down_blocks = nn.ModuleList()
+        
+        # First block is special (no downsampling)
+        self.down_blocks.append(DownBlock(base_channels, base_channels, 
+                                        is_first=True, n_convs=2, three_dimensional=False))
+        
+        # Remaining blocks with downsampling
+        current_channels = base_channels
+        for i in range(1, n_levels):
+            out_channels = current_channels * 2
+            self.down_blocks.append(DownBlock(current_channels, out_channels, 
+                                            is_first=False, n_convs=2, three_dimensional=False))
+            current_channels = out_channels
+        
+        # Projection head
+        self.projection = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # Global average pooling
+            nn.Flatten(),
+            nn.Linear(current_channels, 512),
+            nn.ReLU(),
+            nn.Linear(512, projection_dim)
+        )
+    
+    def forward(self, x):
+        # Initial conv
+        x = self.inc(x)
+        
+        # Down blocks
+        features = []
+        for block in self.down_blocks:
+            x = block(x)
+            features.append(x)
+        
+        # Projection
+        projection = self.projection(x)
+        # Normalize projection to unit sphere
+        projection = F.normalize(projection, dim=1)
+        
+        return projection, features
+    
+class DecoderWithSegmentation(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels=1,
+        n_levels=4
+    ):
+        super().__init__()
+        
+        # Use existing decoder structure (e.g., from UNet)
+        from models.base_models import UpBlock
+        
+        self.up_blocks = nn.ModuleList()
+        
+        # Create decoder blocks
+        current_channels = in_channels
+        for i in range(n_levels - 1):
+            self.up_blocks.append(UpBlock(current_channels, n_convs=2, three_dimensional=False))
+            current_channels = current_channels // 2
+        
+        # Final convolution for segmentation
+        self.final_conv = nn.Conv2d(current_channels, out_channels, kernel_size=1)
+    
+    def forward(self, features):
+        """
+        features: List of features from encoder (in reverse order)
+        """
+        # Start with the bottleneck features
+        x = features[-1]
+        
+        # Upsampling path
+        for i, block in enumerate(self.up_blocks):
+            skip = features[-(i+2)]  # Corresponding skip connection
+            x = block(x, skip)
+        
+        # Final convolution
+        x = self.final_conv(x)
+        
+        return torch.sigmoid(x)  # Apply sigmoid for binary segmentation
+
+class ContrastiveSegmentationModel(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1,
+        base_channels=64,
+        projection_dim=128,
+        n_levels=4
+    ):
+        super().__init__()
+        
+        self.encoder = EncoderWithProjection(
+            in_channels, base_channels, projection_dim, n_levels
+        )
+        
+        # Last encoder output channels = base_channels * 2**(n_levels-1)
+        last_channels = base_channels * (2 ** (n_levels - 1))
+        
+        self.decoder = DecoderWithSegmentation(
+            last_channels, out_channels, n_levels
+        )
+        
+    def forward(self, x):
+        """Standard forward pass for segmentation"""
+        projection, features = self.encoder(x)
+        segmentation = self.decoder(features)
+        return segmentation
+    
+    def encode_project(self, x):
+        """Forward pass for contrastive learning"""
+        projection, _ = self.encoder(x)
+        return projection
+    
+    def train_step(self, x1, x2=None):
+        """
+        Training step for contrastive learning
+        
+        If x2 is provided:
+          - Compute projections for both views
+          - Return both projections for contrastive loss
+        
+        If x2 is None:
+          - Perform regular segmentation
+        """
+        if x2 is not None:
+            # Contrastive learning mode
+            z1, _ = self.encoder(x1)
+            z2, _ = self.encoder(x2)
+            return {'projections': (z1, z2)}
+        else:
+            # Segmentation mode
+            return {'segmentation': self.forward(x1)}
+```
+
+### Contrastive Loss Implementation
+
+Create a contrastive loss function:
+
+```python
+# losses/contrastive_loss.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class NTXentLoss(nn.Module):
+    """
+    Normalized Temperature-scaled Cross Entropy Loss (from SimCLR)
+    """
+    def __init__(self, temperature=0.5):
+        super().__init__()
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss(reduction="mean")
+        
+    def forward(self, z_i, z_j):
+        """
+        z_i, z_j are batches of embeddings, where corresponding pairs are positive examples
+        """
+        batch_size = z_i.shape[0]
+        
+        # Concatenate embeddings from both augmentations
+        representations = torch.cat([z_i, z_j], dim=0)
+        
+        # Compute similarity matrix
+        similarity_matrix = F.cosine_similarity(representations.unsqueeze(1), 
+                                               representations.unsqueeze(0), dim=2)
+        
+        # Remove self-similarity
+        sim_ij = torch.diag(similarity_matrix, batch_size)
+        sim_ji = torch.diag(similarity_matrix, -batch_size)
+        positives = torch.cat([sim_ij, sim_ji], dim=0)
+        
+        # Remove diagonals - don't compare a representation with itself
+        mask = (~torch.eye(batch_size*2, batch_size*2, dtype=bool, device=z_i.device))
+        negatives = similarity_matrix[mask].view(batch_size*2, -1)
+        
+        # Concatenate positives and negatives for each row
+        logits = torch.cat([positives.unsqueeze(1), negatives], dim=1)
+        
+        # Divide by temperature
+        logits = logits / self.temperature
+        
+        # Labels always indicate the positive sample is at index 0
+        labels = torch.zeros(batch_size*2, dtype=torch.long, device=z_i.device)
+        
+        loss = self.criterion(logits, labels)
+        
+        return loss
+
+class SegmentationWithContrastiveLoss(nn.Module):
+    """
+    Loss function that combines segmentation and contrastive learning
+    """
+    def __init__(
+        self, 
+        contrastive_weight=1.0, 
+        segmentation_weight=1.0,
+        temperature=0.5,
+        segmentation_loss_type='bce'
+    ):
+        super().__init__()
+        self.contrastive_weight = contrastive_weight
+        self.segmentation_weight = segmentation_weight
+        self.contrastive_loss = NTXentLoss(temperature)
+        
+        # Segmentation loss
+        if segmentation_loss_type == 'bce':
+            self.seg_loss = nn.BCELoss()
+        elif segmentation_loss_type == 'dice':
+            # You could add a custom Dice loss here
+            self.seg_loss = nn.BCELoss()
+        else:
+            self.seg_loss = nn.BCELoss()
+            
+    def forward(self, y_pred, y_true):
+        """
+        For compatibility with SegLab, handle either dict or tensor input:
+        
+        If y_pred is dict with 'projections' key:
+            - Compute contrastive loss
+        If y_pred is a tensor:
+            - Compute segmentation loss
+        """
+        if isinstance(y_pred, dict) and 'projections' in y_pred:
+            # Contrastive mode
+            z1, z2 = y_pred['projections']
+            return self.contrastive_weight * self.contrastive_loss(z1, z2)
+        elif isinstance(y_pred, dict) and 'segmentation' in y_pred:
+            # Segmentation mode
+            return self.segmentation_weight * self.seg_loss(y_pred['segmentation'], y_true)
+        else:
+            # Default (assume segmentation output)
+            return self.segmentation_weight * self.seg_loss(y_pred, y_true)
+```
+
+### Configuration and Training
+
+Create configuration files for the contrastive approach:
+
+```yaml
+# configs/model/contrastive.yaml
+path: "models.contrastive_model"
+class: "ContrastiveSegmentationModel"
+params:
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  projection_dim: 128
+  n_levels: 4
+```
+
+```yaml
+# configs/loss/contrastive.yaml
+primary_loss:
+  path: "losses.contrastive_loss"
+  class: "SegmentationWithContrastiveLoss"
+  params:
+    contrastive_weight: 1.0
+    segmentation_weight: 1.0
+    temperature: 0.5
+    segmentation_loss_type: 'bce'
+
+secondary_loss: null
+alpha: 0.0
+start_epoch: 0
+```
+
+## Using the Models for Downstream Tasks
+
+Once you've trained your unsupervised or semi-supervised models, you can use them for downstream tasks:
+
+### 1. Using Pretrained Encoder for Segmentation
+
+```python
+# Load pretrained autoencoder
+autoencoder = load_model(autoencoder_config)
+autoencoder.load_state_dict(torch.load('path/to/autoencoder/checkpoint.ckpt'))
+
+# Create a segmentation model using the pretrained encoder
+class SegmentationModel(nn.Module):
+    def __init__(self, pretrained_encoder, out_channels=1):
+        super().__init__()
+        self.encoder = pretrained_encoder.encoder
+        # Add your decoder for segmentation
+        self.decoder = Decoder(...)
+        
+    def forward(self, x):
+        features = self.encoder(x)
+        segmentation = self.decoder(features)
+        return segmentation
+
+# Initialize with pretrained weights
+segmentation_model = SegmentationModel(autoencoder, out_channels=1)
+```
+
+### 2. Fine-tuning a Contrastive Model for Segmentation
+
+For contrastive models that already have a segmentation head, you can simply fine-tune the model:
+
+```python
+# Load pretrained contrastive model
+contrastive_model = load_model(contrastive_config)
+contrastive_model.load_state_dict(torch.load('path/to/contrastive/checkpoint.ckpt'))
+
+# Fine-tune with segmentation loss only
+segmentation_loss = nn.BCELoss()
+
+# Use the model directly for segmentation tasks
+# The forward method already outputs segmentation
+```
+
+This approach allows you to leverage unsupervised and semi-supervised learning techniques within the SegLab framework without needing to modify the dataset structure fundamentally. You just need to be careful about how the data is processed during training and how the loss functions are applied.
