@@ -22,7 +22,7 @@ from torchvision.utils import make_grid
 
 class SamplePlotCallback(pl.Callback):
     """
-    After each training & validation epoch, log the first `num_samples`
+    After each training & validation epoch, log up to `num_samples`
     examples as figures:
       - train/samples: [input | ground-truth | prediction]
       - val/samples:   [input | ground-truth | prediction]
@@ -30,11 +30,21 @@ class SamplePlotCallback(pl.Callback):
     def __init__(self, num_samples: int = 5):
         super().__init__()
         self.num_samples = num_samples
-        self._train_sample = None  # tuple(x, y, preds)
-        self._val_sample   = None
+        self._reset_buffers()
+
+    def _reset_buffers(self):
+        self._images   = []   # list of torch.Tensor batches
+        self._gts      = []
+        self._preds    = []
+        self._collected = 0
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._reset_buffers()
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._reset_buffers()
 
     def _capture(self, batch, pl_module):
-        # Use dynamic key names:
         x = batch[pl_module.input_key].float().to(pl_module.device)
         y = batch[pl_module.target_key].float().to(pl_module.device)
         if y.ndim == 3:
@@ -45,52 +55,57 @@ class SamplePlotCallback(pl.Callback):
         return x.cpu(), y.cpu(), preds.cpu()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
-        if batch_idx == 0 and self._train_sample is None:
-            self._train_sample = self._capture(batch, pl_module)
+        if self._collected >= self.num_samples:
+            return
+        x, y, preds = self._capture(batch, pl_module)
+        remaining = self.num_samples - self._collected
+        take = min(remaining, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._collected += take
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
-        if batch_idx == 0 and self._val_sample is None:
-            self._val_sample = self._capture(batch, pl_module)
+        if self._collected >= self.num_samples:
+            return
+        x, y, preds = self._capture(batch, pl_module)
+        remaining = self.num_samples - self._collected
+        take = min(remaining, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._collected += take
 
-    def _plot_and_log(self, sample, tag, trainer):
-        x, y, preds = sample
-        n = min(self.num_samples, x.size(0))
+    def _plot_and_log(self, tag, trainer):
+        # concatenate everything we gathered
+        imgs  = torch.cat(self._images, 0)
+        gts   = torch.cat(self._gts,    0)
+        preds = torch.cat(self._preds,  0)
+        n = imgs.size(0)
 
-        fig, axes = plt.subplots(n, 3, figsize=(3 * 3, n * 3), tight_layout=True)
+        fig, axes = plt.subplots(n, 3, figsize=(3*3, n*3), tight_layout=True)
         if n == 1:
             axes = axes[None, :]
 
         for i in range(n):
-            img = x[i].permute(1, 2, 0)
-            gt  = y[i, 0]
-            pr  = preds[i, 0]
+            img = imgs[i].permute(1,2,0)
+            gt  = gts[i,0]
+            pr  = preds[i,0]
 
-            axes[i, 0].imshow(img)
-            axes[i, 0].set_title("input")
-            axes[i, 0].axis("off")
+            axes[i,0].imshow(img); axes[i,0].set_title("input"); axes[i,0].axis("off")
+            axes[i,1].imshow(gt,  cmap="gray");       axes[i,1].set_title("gt");    axes[i,1].axis("off")
+            axes[i,2].imshow(pr,  cmap="gray");       axes[i,2].set_title("pred");  axes[i,2].axis("off")
 
-            axes[i, 1].imshow(gt, cmap="gray")
-            axes[i, 1].set_title("gt")
-            axes[i, 1].axis("off")
-
-            axes[i, 2].imshow(pr, cmap="gray")
-            axes[i, 2].set_title("pred")
-            axes[i, 2].axis("off")
-
-        trainer.logger.experiment.add_figure(
-            f"{tag}/samples", fig, global_step=trainer.current_epoch
-        )
+        trainer.logger.experiment.add_figure(f"{tag}/samples", fig, global_step=trainer.current_epoch)
         plt.close(fig)
 
     def on_train_epoch_end(self, trainer, pl_module):
-        if self._train_sample is not None:
-            self._plot_and_log(self._train_sample, "train", trainer)
-            self._train_sample = None
+        if self._collected > 0:
+            self._plot_and_log("train", trainer)
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if self._val_sample is not None:
-            self._plot_and_log(self._val_sample, "val", trainer)
-            self._val_sample = None
+        if self._collected > 0:
+            self._plot_and_log("val", trainer)
 
 
 class PredictionLogger(Callback):
