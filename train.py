@@ -67,6 +67,10 @@ def main():
     max_epochs             = trainer_cfg.get("max_epochs", 100)
     val_check_interval     = trainer_cfg.get("val_check_interval", 1.0)
     skip_valid_until_epoch = trainer_cfg.get("skip_validation_until_epoch", 0)
+    
+    # Track metrics frequency from config (for consistent visualization even if not all shown in progress bar)
+    train_metrics_every_n_epochs = trainer_cfg.get("train_metrics_every_n_epochs", 1)
+    val_metrics_every_n_epochs = trainer_cfg.get("val_metrics_every_n_epochs", 1)
 
     # --- model, loss, metrics ---
     logger.info("Loading model...")
@@ -103,27 +107,39 @@ def main():
         inference_config=inference_cfg,
         input_key=input_key,
         target_key=target_key,
+        train_metrics_every_n_epochs=train_metrics_every_n_epochs,
+        val_metrics_every_n_epochs=val_metrics_every_n_epochs,
     )
 
     # --- callbacks ---
     callbacks: List[pl.Callback] = []
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     mkdir(ckpt_dir)
+    
+    # Add BestMetricCheckpoint callback to save best models for each metric
     callbacks.append(BestMetricCheckpoint(
         dirpath=ckpt_dir,
         metric_names=list(metric_list.keys()),
         mode="max",
         save_last=True,
     ))
+    
+    # Add PredictionLogger to visualize predictions
     callbacks.append(PredictionLogger(
         log_dir=os.path.join(output_dir, "predictions"),
         log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
         max_samples=4
     ))
+    
+    # Add SamplePlotCallback to monitor sample predictions during training
     callbacks.append(SamplePlotCallback(
         num_samples=trainer_cfg.get("num_samples_plot", 3)
     ))
+    
+    # Add LearningRateMonitor to track learning rate changes
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
+    
+    # Archive code if not resuming
     if not args.resume:
         code_dir = os.path.join(output_dir, "code")
         mkdir(code_dir)
@@ -131,6 +147,8 @@ def main():
             output_dir=code_dir,
             project_root=os.path.dirname(os.path.abspath(__file__))
         ))
+    
+    # Skip validation for early epochs if needed
     if skip_valid_until_epoch > 0:
         callbacks.append(SkipValidation(skip_until_epoch=skip_valid_until_epoch))
 
@@ -141,6 +159,7 @@ def main():
         "callbacks": callbacks,
         "logger": tb_logger,
         "val_check_interval": val_check_interval,
+        "check_val_every_n_epoch": trainer_cfg.get("val_every_n_epochs", 1),  # Validate every N epochs
         **trainer_cfg.get("extra_args", {}),
     }
     if args.resume:

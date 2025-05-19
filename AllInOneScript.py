@@ -70,6 +70,10 @@ def main():
     max_epochs             = trainer_cfg.get("max_epochs", 100)
     val_check_interval     = trainer_cfg.get("val_check_interval", 1.0)
     skip_valid_until_epoch = trainer_cfg.get("skip_validation_until_epoch", 0)
+    
+    # Track metrics frequency from config (for consistent visualization even if not all shown in progress bar)
+    train_metrics_every_n_epochs = trainer_cfg.get("train_metrics_every_n_epochs", 1)
+    val_metrics_every_n_epochs = trainer_cfg.get("val_metrics_every_n_epochs", 1)
 
     # --- model, loss, metrics ---
     logger.info("Loading model...")
@@ -106,27 +110,39 @@ def main():
         inference_config=inference_cfg,
         input_key=input_key,
         target_key=target_key,
+        train_metrics_every_n_epochs=train_metrics_every_n_epochs,
+        val_metrics_every_n_epochs=val_metrics_every_n_epochs,
     )
 
     # --- callbacks ---
     callbacks: List[pl.Callback] = []
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     mkdir(ckpt_dir)
+    
+    # Add BestMetricCheckpoint callback to save best models for each metric
     callbacks.append(BestMetricCheckpoint(
         dirpath=ckpt_dir,
         metric_names=list(metric_list.keys()),
         mode="max",
         save_last=True,
     ))
+    
+    # Add PredictionLogger to visualize predictions
     callbacks.append(PredictionLogger(
         log_dir=os.path.join(output_dir, "predictions"),
         log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
         max_samples=4
     ))
+    
+    # Add SamplePlotCallback to monitor sample predictions during training
     callbacks.append(SamplePlotCallback(
         num_samples=trainer_cfg.get("num_samples_plot", 3)
     ))
+    
+    # Add LearningRateMonitor to track learning rate changes
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
+    
+    # Archive code if not resuming
     if not args.resume:
         code_dir = os.path.join(output_dir, "code")
         mkdir(code_dir)
@@ -134,6 +150,8 @@ def main():
             output_dir=code_dir,
             project_root=os.path.dirname(os.path.abspath(__file__))
         ))
+    
+    # Skip validation for early epochs if needed
     if skip_valid_until_epoch > 0:
         callbacks.append(SkipValidation(skip_until_epoch=skip_valid_until_epoch))
 
@@ -173,18 +191,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 # ------------------------------------
 # seglit_module.py
 # ------------------------------------
 # seglit_module.py
-"""
-SegLitModule: a PyTorch LightningModule for segmentation that
-  • uses dynamic batch‐dict keys for x/y,
-  • wraps all metrics in a ModuleDict so they get .to(device()) automatically,
-  • supports MixedLoss + chunked inference + PL schedulers.
-"""
-
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -192,7 +202,6 @@ from typing import Any, Dict
 
 from core.mix_loss import MixedLoss
 from core.validator import Validator
-
 
 class SegLitModule(pl.LightningModule):
     def __init__(
@@ -204,19 +213,23 @@ class SegLitModule(pl.LightningModule):
         inference_config: Dict[str, Any],
         input_key: str = "image_patch",
         target_key: str = "label_patch",
+        train_metrics_every_n_epochs: int = 1,
+        val_metrics_every_n_epochs: int = 1,
     ):
         super().__init__()
-        # avoid dumping large modules into hparams.yaml
-        self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
+        self.save_hyperparameters(ignore=['model','loss_fn','metrics'])
 
-        self.model      = model
-        self.loss_fn    = loss_fn
-        # wrap metrics so Lightning moves them to the same device
-        self.metrics    = nn.ModuleDict(metrics)
-        self.opt_cfg    = optimizer_config
-        self.validator  = Validator(inference_config)
-        self.input_key  = input_key
+        self.model = model
+        self.loss_fn = loss_fn
+        self.metrics = nn.ModuleDict(metrics)
+        self.opt_cfg = optimizer_config
+        self.validator = Validator(inference_config)
+        self.input_key = input_key
         self.target_key = target_key
+
+        # how often to compute/log metrics
+        self.train_freq = train_metrics_every_n_epochs
+        self.val_freq = val_metrics_every_n_epochs
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -224,76 +237,113 @@ class SegLitModule(pl.LightningModule):
     def on_train_epoch_start(self):
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
+        # Reset metrics at the start of each epoch
+        for m in self.metrics.values():
+            if hasattr(m, 'reset'):
+                m.reset()
 
     def training_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
-        self.log("train_loss", loss, prog_bar=True, on_epoch=True, batch_size=batch[self.input_key].size(0))
+        
+        # Always log training loss per epoch
+        self.log("train_loss", loss,
+                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+
+        # Always compute metrics but control frequency of logging
+        y_int = y.long()
+        for name, metric in self.metrics.items():
+            val = metric(y_hat, y_int)
+            if self.current_epoch % self.train_freq == 0:
+                self.log(f"train_{name}", val,
+                         prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         return loss
+
+    def on_validation_epoch_start(self):
+        # Always reset metrics at the start of validation
+        for m in self.metrics.values():
+            if hasattr(m, 'reset'):
+                m.reset()
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
-        # full‐res chunked inference
         y_hat = self.validator.run_chunked_inference(self.model, x)
 
+        # Always log validation loss
         loss = self.loss_fn(y_hat, y)
-        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self.log("val_loss", loss,
+                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
+        # Always compute metrics and log based on frequency
         y_int = y.long()
         for name, metric in self.metrics.items():
             val = metric(y_hat, y_int)
-            if isinstance(val, torch.Tensor):
-                val = val.detach()
-            self.log(f"val_{name}", val, prog_bar=True, on_epoch=True, batch_size=batch[self.input_key].size(0))
-
+            # Always log to TensorBoard but control progress bar updates
+            log_prog_bar = self.current_epoch % self.val_freq == 0
+            self.log(f"val_{name}", val,
+                     prog_bar=log_prog_bar, on_step=False, on_epoch=True, batch_size=x.size(0))
+        
         return {"predictions": y_hat, "val_loss": loss}
 
+    def on_test_epoch_start(self):
+        # Reset metrics at the start of test epoch
+        for m in self.metrics.values():
+            if hasattr(m, 'reset'):
+                m.reset()
+
     def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
+        x = batch[self.input_key].float()
+        y = batch[self.target_key].float()
+        y_hat = self.validator.run_chunked_inference(self.model, x)
+
+        # Log test loss
+        loss = self.loss_fn(y_hat, y)
+        self.log("test_loss", loss,
+                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+
+        # Compute and log test metrics
+        y_int = y.long()
+        for name, metric in self.metrics.items():
+            val = metric(y_hat, y_int)
+            self.log(f"test_{name}", val,
+                     prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+        
+        return {"predictions": y_hat, "test_loss": loss}
 
     def configure_optimizers(self):
         Opt = getattr(torch.optim, self.opt_cfg["name"])
         optimizer = Opt(self.model.parameters(), **self.opt_cfg.get("params", {}))
-
         sched_cfg = self.opt_cfg.get("scheduler", None)
         if not sched_cfg:
             return optimizer
-
-        name   = sched_cfg["name"]
-        params = sched_cfg.get("params", {}).copy()
-
+        
+        name, params = sched_cfg["name"], sched_cfg.get("params", {}).copy()
+        
         if name == "ReduceLROnPlateau":
-            # extract monitor, leave other params (patience, factor, mode, min_lr)
             monitor = params.pop("monitor", "val_loss")
             SchedulerClass = getattr(torch.optim.lr_scheduler, name)
             scheduler = SchedulerClass(optimizer, **params)
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": monitor,
-                    "interval": "epoch",
-                    "frequency": 1,
-                    "strict": False   # ← ignore missing val_loss early on
-                }
-            }
-
+            return {"optimizer": optimizer,
+                    "lr_scheduler": {"scheduler": scheduler,
+                                     "monitor": monitor,
+                                     "interval": "epoch",
+                                     "frequency": 1,
+                                     "strict": False}}
+        
         if name == "LambdaLR":
             decay = params.get("lr_decay_factor")
             if decay is None:
-                raise ValueError("LambdaLR requires 'lr_decay_factor' in params")
+                raise ValueError("LambdaLR requires 'lr_decay_factor'")
             lr_lambda = lambda epoch: 1.0 / (1.0 + epoch * decay)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             return {"optimizer": optimizer, "lr_scheduler": scheduler}
-
-        # generic scheduler
+        
         SchedulerClass = getattr(torch.optim.lr_scheduler, name)
         scheduler = SchedulerClass(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
-
 
 # ------------------------------------
 # requirements.txt
@@ -2128,7 +2178,10 @@ trainer:
   val_check_interval: 1.0  # Validate once per epoch
   skip_validation_until_epoch: 5  # Skip validation for the first 5 epochs
   log_every_n_epochs: 2  # Log predictions every 2 epochs
-  
+  log_every_n_steps: 1
+  train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
+  val_metrics_every_n_epochs: 1      # compute/log val   metrics once every epoch
+
   # Extra arguments passed directly to PyTorch Lightning Trainer
   extra_args:
     accelerator: "auto"  # Use GPU if available
@@ -2146,14 +2199,16 @@ optimizer:
   
   # Optional learning rate scheduler
   scheduler:
-    name: "ReduceLROnPlateau"
+    # name: "ReduceLROnPlateau"
+    # params:
+    #   patience: 10
+    #   factor: 0.5
+    #   monitor: "val_loss"
+    #   mode: "min"
+    #   min_lr: 0.00001
+    name: "LambdaLR"
     params:
-      patience: 10
-      factor: 0.5
-      monitor: "val_loss"
-      mode: "min"
-      min_lr: 0.00001
-
+      lr_decay_factor: 0.0001
 
 target_x: "image_patch"
 target_y: "label_patch"
