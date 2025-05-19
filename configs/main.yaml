@@ -1,0 +1,48 @@
+# Main configuration file for segmentation experiments
+# This file references all sub-configs and sets high-level training parameters
+
+# Sub-config references
+dataset_config: "massroads.yaml"
+model_config: "topotokens.yaml"
+loss_config: "mixed_topo.yaml"
+metrics_config: "segmentation.yaml"
+inference_config: "chunk.yaml"
+
+# Output directory
+output_dir: "outputs/experiment_1"
+
+# Trainer configuration
+trainer:
+  max_epochs: 100
+  val_check_interval: 1.0  # Validate once per epoch
+  skip_validation_until_epoch: 5  # Skip validation for the first 5 epochs
+  log_every_n_epochs: 2  # Log predictions every 2 epochs
+  
+  # Extra arguments passed directly to PyTorch Lightning Trainer
+  extra_args:
+    accelerator: "auto"  # Use GPU if available
+    precision: 32  # Mixed precision training
+    gradient_clip_val: 1.0
+    accumulate_grad_batches: 1
+    deterministic: false
+
+# Optimizer configuration
+optimizer:
+  name: "Adam"
+  params:
+    lr: 0.001
+    weight_decay: 0.0001
+  
+  # Optional learning rate scheduler
+  scheduler:
+    name: "ReduceLROnPlateau"
+    params:
+      patience: 10
+      factor: 0.5
+      monitor: "val_loss"
+      mode: "min"
+      min_lr: 0.00001
+
+
+target_x: "image_patch"
+target_y: "label_patch"

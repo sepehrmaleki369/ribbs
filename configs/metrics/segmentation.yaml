@@ -1,0 +1,37 @@
+# Segmentation Metrics Configuration
+
+# List of metrics to evaluate
+metrics:
+  # Dice coefficient
+  - alias: "dice"  # Shorthand name for the metric
+    path: "torchmetrics.classification"
+    class: "Dice"
+    params:
+      threshold: 0.5
+      zero_division: 1.0
+
+  # IoU (Jaccard index)
+  - alias: "iou"
+    path: "torchmetrics.classification"
+    class: "JaccardIndex"
+    params:
+      task: "binary"
+      threshold: 0.5
+      num_classes: 2  # Binary segmentation
+
+  # Connected Components Quality
+  - alias: "ccq"
+    path: "metrics.connected_components"
+    class: "ConnectedComponentsQuality"
+    params:
+      min_size: 5
+      tolerance: 2
+
+  # Average Path Length Similarity
+  - alias: "apls"
+    path: "metrics.apls"
+    class: "APLS"
+    params:
+      min_segment_length: 10
+      max_nodes: 500
+      sampling_ratio: 0.1
