@@ -26,11 +26,7 @@ class SamplePlotCallback(pl.Callback):
     examples as figures:
       - train/samples: [input | ground-truth | prediction]
       - val/samples:   [input | ground-truth | prediction]
-
-    Captures the very first batch during on_*_batch_end,
-    then at epoch end renders once.
     """
-
     def __init__(self, num_samples: int = 5):
         super().__init__()
         self.num_samples = num_samples
@@ -38,8 +34,9 @@ class SamplePlotCallback(pl.Callback):
         self._val_sample   = None
 
     def _capture(self, batch, pl_module):
-        x = batch["image_patch"].float().to(pl_module.device)
-        y = batch["label_patch"].float().to(pl_module.device)
+        # Use dynamic key names:
+        x = batch[pl_module.input_key].float().to(pl_module.device)
+        y = batch[pl_module.target_key].float().to(pl_module.device)
         if y.ndim == 3:
             y = y.unsqueeze(1)
         with torch.no_grad():
@@ -47,16 +44,11 @@ class SamplePlotCallback(pl.Callback):
             preds = torch.sigmoid(logits)
         return x.cpu(), y.cpu(), preds.cpu()
 
-    def on_train_batch_end(
-        self, trainer, pl_module, outputs, batch, batch_idx, *args
-    ):
-        # only capture first batch
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
         if batch_idx == 0 and self._train_sample is None:
             self._train_sample = self._capture(batch, pl_module)
 
-    def on_validation_batch_end(
-        self, trainer, pl_module, outputs, batch, batch_idx, *args
-    ):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
         if batch_idx == 0 and self._val_sample is None:
             self._val_sample = self._capture(batch, pl_module)
 
@@ -100,6 +92,109 @@ class SamplePlotCallback(pl.Callback):
             self._plot_and_log(self._val_sample, "val", trainer)
             self._val_sample = None
 
+
+class PredictionLogger(Callback):
+    """
+    Callback to log input/prediction/ground truth visualization during validation.
+    Accumulates up to `max_samples` across batches and saves one grid per epoch.
+    """
+    def __init__(self, log_dir: str, log_every_n_epochs: int = 1, max_samples: int = 4):
+        super().__init__()
+        self.log_dir = log_dir
+        self.log_every_n_epochs = log_every_n_epochs
+        self.max_samples = max_samples
+        self.logger = logging.getLogger(__name__)
+        self._reset_buffers()
+
+    def _reset_buffers(self):
+        self._images = []
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._logged_this_epoch = False
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.current_epoch % self.log_every_n_epochs == 0:
+            self._reset_buffers()
+        else:
+            self._logged_this_epoch = True
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        if self._logged_this_epoch:
+            return
+        if trainer.current_epoch % self.log_every_n_epochs != 0:
+            return
+
+        # Pull images and labels by dynamic key:
+        x = batch[pl_module.input_key]
+        y_true = batch[pl_module.target_key]
+        y_pred = outputs["predictions"]
+
+        x = x.detach().cpu()
+        y_true = y_true.detach().cpu()
+        y_pred = y_pred.detach().cpu()
+
+        remaining = self.max_samples - self._collected
+        take = min(remaining, x.shape[0])
+
+        self._images.append(x[:take])
+        self._gts.append(y_true[:take])
+        self._preds.append(y_pred[:take])
+        self._collected += take
+
+        if self._collected >= self.max_samples:
+            imgs = torch.cat(self._images, dim=0)
+            gts  = torch.cat(self._gts,    dim=0)
+            preds= torch.cat(self._preds,  dim=0)
+
+            os.makedirs(self.log_dir, exist_ok=True)
+            filename = os.path.join(
+                self.log_dir,
+                f"pred_epoch_{trainer.current_epoch:06d}.png"
+            )
+
+            fig, axes = plt.subplots(
+                self.max_samples, 3,
+                figsize=(12, 4 * self.max_samples)
+            )
+
+            for i in range(self.max_samples):
+                # Input
+                ax = axes[i, 0]
+                if imgs.shape[1] == 1:
+                    ax.imshow(imgs[i, 0], cmap='gray')
+                else:
+                    im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
+                    ax.imshow(im)
+                ax.set_title('Input')
+                ax.axis('off')
+
+                # Ground truth
+                ax = axes[i, 1]
+                if gts.shape[1] == 1:
+                    ax.imshow(gts[i, 0], cmap='gray')
+                else:
+                    mask = torch.argmax(gts[i], dim=0)
+                    ax.imshow(mask, cmap='tab20')
+                ax.set_title('Ground Truth')
+                ax.axis('off')
+
+                # Prediction
+                ax = axes[i, 2]
+                if preds.shape[1] == 1:
+                    ax.imshow(preds[i, 0], cmap='gray')
+                else:
+                    pmask = torch.argmax(preds[i], dim=0)
+                    ax.imshow(pmask, cmap='tab20')
+                ax.set_title('Prediction')
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(filename, dpi=150)
+            plt.close(fig)
+
+            self.logger.info(f"Saved prediction visualization: {filename}")
+            self._logged_this_epoch = True
 
 
 class BestMetricCheckpoint(Callback):
@@ -197,134 +292,7 @@ class BestMetricCheckpoint(Callback):
             trainer.save_checkpoint(filepath)
             self.logger.info(f"Saved last checkpoint at epoch {trainer.current_epoch}")
 
-class PredictionLogger(Callback):
-    """
-    Callback to log input/prediction/ground truth visualization during validation.
-    Accumulates up to `max_samples` across batches and saves one grid per epoch.
-    """
 
-    def __init__(
-        self,
-        log_dir: str,
-        log_every_n_epochs: int = 1,
-        max_samples: int = 4
-    ):
-        super().__init__()
-        self.log_dir = log_dir
-        self.log_every_n_epochs = log_every_n_epochs
-        self.max_samples = max_samples
-        self.logger = logging.getLogger(__name__)
-
-        # Buffers to accumulate per-epoch
-        self._reset_buffers()
-
-    def _reset_buffers(self):
-        self._images = []
-        self._gts = []
-        self._preds = []
-        self._collected = 0
-        self._logged_this_epoch = False
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        # Only prepare to log on epochs matching frequency
-        if trainer.current_epoch % self.log_every_n_epochs == 0:
-            self._reset_buffers()
-        else:
-            # Mark as already done for non-logging epochs
-            self._logged_this_epoch = True
-
-    def on_validation_batch_end(
-        self,
-        trainer,
-        pl_module,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx=0
-    ):
-        # Skip if we already logged this epoch or it's not a logging epoch
-        if self._logged_this_epoch:
-            return
-        if trainer.current_epoch % self.log_every_n_epochs != 0:
-            return
-
-        # Extract raw tensors (up to max needed)
-        x = batch["image_patch"]
-        y_true = batch["label_patch"]
-        y_pred = outputs["predictions"]
-
-        # Move to CPU and detach
-        x = x.detach().cpu()
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
-
-        # How many more we need
-        remaining = self.max_samples - self._collected
-        take = min(remaining, x.shape[0])
-
-        # Append the slice
-        self._images.append(x[:take])
-        self._gts.append(y_true[:take])
-        self._preds.append(y_pred[:take])
-        self._collected += take
-
-        # Once we've got enough, render & save
-        if self._collected >= self.max_samples:
-            # Concatenate buffers
-            imgs = torch.cat(self._images, dim=0)
-            gts  = torch.cat(self._gts,    dim=0)
-            preds= torch.cat(self._preds,  dim=0)
-
-            # Ensure directory exists
-            os.makedirs(self.log_dir, exist_ok=True)
-            filename = os.path.join(
-                self.log_dir,
-                f"pred_epoch_{trainer.current_epoch:06d}.png"
-            )
-
-            # Create grid
-            fig, axes = plt.subplots(
-                self.max_samples, 3,
-                figsize=(12, 4 * self.max_samples)
-            )
-
-            for i in range(self.max_samples):
-                # Input
-                ax = axes[i, 0]
-                if imgs.shape[1] == 1:
-                    ax.imshow(imgs[i, 0], cmap='gray')
-                else:
-                    im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
-                    ax.imshow(im)
-                ax.set_title('Input')
-                ax.axis('off')
-
-                # Ground truth
-                ax = axes[i, 1]
-                if gts.shape[1] == 1:
-                    ax.imshow(gts[i, 0], cmap='gray')
-                else:
-                    mask = torch.argmax(gts[i], dim=0)
-                    ax.imshow(mask, cmap='tab20')
-                ax.set_title('Ground Truth')
-                ax.axis('off')
-
-                # Prediction
-                ax = axes[i, 2]
-                if preds.shape[1] == 1:
-                    ax.imshow(preds[i, 0], cmap='gray')
-                else:
-                    pmask = torch.argmax(preds[i], dim=0)
-                    ax.imshow(pmask, cmap='tab20')
-                ax.set_title('Prediction')
-                ax.axis('off')
-
-            plt.tight_layout()
-            plt.savefig(filename, dpi=150)
-            plt.close(fig)
-
-            self.logger.info(f"Saved prediction visualization: {filename}")
-            self._logged_this_epoch = True
 
 
 class ConfigArchiver(Callback):
@@ -456,3 +424,168 @@ class SkipValidation(Callback):
                 self.logger.info(
                     f"Resuming validation from epoch {trainer.current_epoch}"
                 )
+
+class PredictionSaver(Callback):
+    """
+    Callback to save ground truth and prediction tensors as NumPy arrays.
+    Only saves after a specified starting epoch and at a specified frequency.
+    """
+    
+    def __init__(
+        self,
+        save_dir: str,
+        save_every_n_epochs: int = 5,
+        save_after_epoch: int = 0,
+        max_samples: int = 4
+    ):
+        """
+        Initialize the PredictionSaver callback.
+        
+        Args:
+            save_dir: Directory to save prediction data
+            save_every_n_epochs: How often to save (every N epochs)
+            save_after_epoch: Only start saving after this epoch
+            max_samples: Maximum number of samples to save per epoch
+        """
+        super().__init__()
+        self.save_dir = save_dir
+        self.save_every_n_epochs = save_every_n_epochs
+        self.save_after_epoch = save_after_epoch
+        self.max_samples = max_samples
+        self.logger = logging.getLogger(__name__)
+        
+        # Buffers to collect samples
+        self._reset_buffers()
+    
+    def _reset_buffers(self):
+        """Reset the internal buffers that collect samples."""
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._saved_this_epoch = False
+    
+    def _should_save_this_epoch(self, epoch):
+        """Determine if we should save data for this epoch."""
+        if epoch < self.save_after_epoch:
+            return False
+            
+        return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
+    
+    def on_validation_epoch_start(self, trainer, pl_module):
+        """Reset buffers at the start of a validation epoch."""
+        current_epoch = trainer.current_epoch
+        if self._should_save_this_epoch(current_epoch):
+            self._reset_buffers()
+        else:
+            # Mark as already done for non-saving epochs
+            self._saved_this_epoch = True
+    
+    def on_test_epoch_start(self, trainer, pl_module):
+        """Reset buffers at the start of a test epoch."""
+        # Always save during test
+        self._reset_buffers()
+    
+    def on_validation_batch_end(
+        self,
+        trainer,
+        pl_module,
+        outputs,
+        batch,
+        batch_idx,
+        dataloader_idx=0
+    ):
+        """Collect validation batch results for later saving."""
+        # Skip if we already collected enough samples this epoch or it's not a saving epoch
+        if self._saved_this_epoch or self._collected >= self.max_samples:
+            return
+        
+        current_epoch = trainer.current_epoch
+        if not self._should_save_this_epoch(current_epoch):
+            return
+        
+        # Get ground truth and prediction
+        y_true = batch[pl_module.target_key]
+        y_pred = outputs["predictions"]
+        
+        # Move to CPU and detach
+        y_true = y_true.detach().cpu()
+        y_pred = y_pred.detach().cpu()
+        
+        # How many more samples we need
+        remaining = self.max_samples - self._collected
+        take = min(remaining, y_pred.shape[0])
+        
+        # Append the slices
+        self._gts.append(y_true[:take])
+        self._preds.append(y_pred[:take])
+        self._collected += take
+    
+    def on_test_batch_end(
+        self,
+        trainer,
+        pl_module,
+        outputs,
+        batch,
+        batch_idx,
+        dataloader_idx=0
+    ):
+        """Collect test batch results for later saving."""
+        # Skip if we already collected enough samples
+        if self._saved_this_epoch or self._collected >= self.max_samples:
+            return
+        
+        # Get ground truth and prediction
+        y_true = batch[pl_module.target_key]
+        y_pred = outputs["predictions"]
+        
+        # Move to CPU and detach
+        y_true = y_true.detach().cpu()
+        y_pred = y_pred.detach().cpu()
+        
+        # How many more samples we need
+        remaining = self.max_samples - self._collected
+        take = min(remaining, y_pred.shape[0])
+        
+        # Append the slices
+        self._gts.append(y_true[:take])
+        self._preds.append(y_pred[:take])
+        self._collected += take
+    
+    def _save_data(self, trainer, phase="val"):
+        """Save collected data as NumPy arrays."""
+        if not self._collected:
+            return
+            
+        current_epoch = trainer.current_epoch
+        
+        # Concatenate buffers
+        gts = torch.cat(self._gts, dim=0)
+        preds = torch.cat(self._preds, dim=0)
+        
+        # Create output directory
+        phase_dir = os.path.join(self.save_dir, phase)
+        epoch_dir = os.path.join(phase_dir, f"epoch_{current_epoch:06d}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # Convert to NumPy and save
+        gts_numpy = gts.numpy()
+        preds_numpy = preds.numpy()
+        
+        # Save as .npy files
+        np.save(os.path.join(epoch_dir, "ground_truth.npy"), gts_numpy)
+        np.save(os.path.join(epoch_dir, "predictions.npy"), preds_numpy)
+        
+        self.logger.info(f"Saved {self._collected} {phase} tensors to {epoch_dir}")
+        self._saved_this_epoch = True
+    
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Save data at the end of the validation epoch if conditions are met."""
+        if not self._saved_this_epoch:
+            self._save_data(trainer, "val")
+            self._reset_buffers()
+    
+    def on_test_epoch_end(self, trainer, pl_module):
+        """Save data at the end of the test epoch."""
+        if not self._saved_this_epoch:
+            self._save_data(trainer, "test")
+            self._reset_buffers()

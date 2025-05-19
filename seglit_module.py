@@ -19,6 +19,8 @@ class SegLitModule(pl.LightningModule):
         target_key: str = "label_patch",
         train_metrics_every_n_epochs: int = 1,
         val_metrics_every_n_epochs: int = 1,
+        train_metric_frequencies: Dict[str, int] = None,  # Per-metric train frequencies
+        val_metric_frequencies: Dict[str, int] = None,    # Per-metric val frequencies
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model','loss_fn','metrics'])
@@ -31,9 +33,13 @@ class SegLitModule(pl.LightningModule):
         self.input_key = input_key
         self.target_key = target_key
 
-        # how often to compute/log metrics
+        # Global default frequencies
         self.train_freq = train_metrics_every_n_epochs
         self.val_freq = val_metrics_every_n_epochs
+        
+        # Per-metric frequencies (override defaults when specified)
+        self.train_metric_frequencies = train_metric_frequencies or {}
+        self.val_metric_frequencies = val_metric_frequencies or {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -56,11 +62,15 @@ class SegLitModule(pl.LightningModule):
         self.log("train_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Always compute metrics but control frequency of logging
+        # Compute metrics using per-metric frequencies
         y_int = y.long()
         for name, metric in self.metrics.items():
-            val = metric(y_hat, y_int)
-            if self.current_epoch % self.train_freq == 0:
+            # Get specific frequency for this metric or fall back to default
+            freq = self.train_metric_frequencies.get(name, self.train_freq)
+            
+            # Only compute and log if it's time for this metric
+            if self.current_epoch % freq == 0:
+                val = metric(y_hat, y_int)
                 self.log(f"train_{name}", val,
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         return loss
@@ -81,14 +91,18 @@ class SegLitModule(pl.LightningModule):
         self.log("val_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Always compute metrics and log based on frequency
+        # Compute metrics using per-metric frequencies
         y_int = y.long()
         for name, metric in self.metrics.items():
-            val = metric(y_hat, y_int)
-            # Always log to TensorBoard but control progress bar updates
-            log_prog_bar = self.current_epoch % self.val_freq == 0
-            self.log(f"val_{name}", val,
-                     prog_bar=log_prog_bar, on_step=False, on_epoch=True, batch_size=x.size(0))
+            # Get specific frequency for this metric or fall back to default
+            freq = self.val_metric_frequencies.get(name, self.val_freq)
+            
+            # Only compute and log if it's time for this metric
+            if self.current_epoch % freq == 0:
+                val = metric(y_hat, y_int)
+                # Only show on progress bar if it's time to compute it
+                self.log(f"val_{name}", val,
+                         prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
         
         return {"predictions": y_hat, "val_loss": loss}
 
@@ -108,7 +122,7 @@ class SegLitModule(pl.LightningModule):
         self.log("test_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Compute and log test metrics
+        # Compute and log test metrics - always compute all metrics during testing
         y_int = y.long()
         for name, metric in self.metrics.items():
             val = metric(y_hat, y_int)

@@ -25,7 +25,8 @@ from core.callbacks import (
     PredictionLogger,
     ConfigArchiver,
     SkipValidation,
-    SamplePlotCallback
+    SamplePlotCallback,
+    PredictionSaver
 )
 from core.logger import setup_logger
 from core.checkpoint import CheckpointManager
@@ -71,6 +72,10 @@ def main():
     # Track metrics frequency from config (for consistent visualization even if not all shown in progress bar)
     train_metrics_every_n_epochs = trainer_cfg.get("train_metrics_every_n_epochs", 1)
     val_metrics_every_n_epochs = trainer_cfg.get("val_metrics_every_n_epochs", 1)
+    
+    # Get per-metric frequencies if defined
+    train_metric_frequencies = metrics_cfg.get("train_frequencies", {})
+    val_metric_frequencies = metrics_cfg.get("val_frequencies", {})
 
     # --- model, loss, metrics ---
     logger.info("Loading model...")
@@ -109,6 +114,8 @@ def main():
         target_key=target_key,
         train_metrics_every_n_epochs=train_metrics_every_n_epochs,
         val_metrics_every_n_epochs=val_metrics_every_n_epochs,
+        train_metric_frequencies=train_metric_frequencies,
+        val_metric_frequencies=val_metric_frequencies,
     )
 
     # --- callbacks ---
@@ -151,6 +158,15 @@ def main():
     # Skip validation for early epochs if needed
     if skip_valid_until_epoch > 0:
         callbacks.append(SkipValidation(skip_until_epoch=skip_valid_until_epoch))
+
+    pred_save_dir = os.path.join(output_dir, "saved_predictions")
+    mkdir(pred_save_dir)
+    callbacks.append(PredictionSaver(
+        save_dir=pred_save_dir,
+        save_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
+        save_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
+        max_samples=trainer_cfg.get("save_gt_pred_max_samples", 4)
+    ))
 
     # --- trainer & logger ---
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")

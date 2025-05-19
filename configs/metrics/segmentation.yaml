@@ -35,3 +35,17 @@ metrics:
       min_segment_length: 10
       max_nodes: 500
       sampling_ratio: 0.1
+
+# Per-metric frequencies for training - how often to compute each metric
+train_frequencies:
+  dice: 1    # Compute every epoch (lightweight metric)
+  iou: 1     # Compute every epoch (lightweight metric)
+  ccq: 10    # Compute every 10 epochs (moderately expensive)
+  apls: 25   # Compute every 25 epochs (very computationally expensive)
+
+# Per-metric frequencies for validation - how often to compute each metric
+val_frequencies:
+  dice: 1    # Compute every epoch
+  iou: 1     # Compute every epoch
+  ccq: 5     # Compute every 5 epochs
+  apls: 10   # Compute every 10 epochs

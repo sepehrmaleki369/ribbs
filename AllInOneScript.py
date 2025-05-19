@@ -28,7 +28,8 @@ from core.callbacks import (
     PredictionLogger,
     ConfigArchiver,
     SkipValidation,
-    SamplePlotCallback
+    SamplePlotCallback,
+    PredictionSaver
 )
 from core.logger import setup_logger
 from core.checkpoint import CheckpointManager
@@ -74,6 +75,10 @@ def main():
     # Track metrics frequency from config (for consistent visualization even if not all shown in progress bar)
     train_metrics_every_n_epochs = trainer_cfg.get("train_metrics_every_n_epochs", 1)
     val_metrics_every_n_epochs = trainer_cfg.get("val_metrics_every_n_epochs", 1)
+    
+    # Get per-metric frequencies if defined
+    train_metric_frequencies = metrics_cfg.get("train_frequencies", {})
+    val_metric_frequencies = metrics_cfg.get("val_frequencies", {})
 
     # --- model, loss, metrics ---
     logger.info("Loading model...")
@@ -112,6 +117,8 @@ def main():
         target_key=target_key,
         train_metrics_every_n_epochs=train_metrics_every_n_epochs,
         val_metrics_every_n_epochs=val_metrics_every_n_epochs,
+        train_metric_frequencies=train_metric_frequencies,
+        val_metric_frequencies=val_metric_frequencies,
     )
 
     # --- callbacks ---
@@ -155,6 +162,15 @@ def main():
     if skip_valid_until_epoch > 0:
         callbacks.append(SkipValidation(skip_until_epoch=skip_valid_until_epoch))
 
+    pred_save_dir = os.path.join(output_dir, "saved_predictions")
+    mkdir(pred_save_dir)
+    callbacks.append(PredictionSaver(
+        save_dir=pred_save_dir,
+        save_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
+        save_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
+        max_samples=trainer_cfg.get("save_gt_pred_max_samples", 4)
+    ))
+
     # --- trainer & logger ---
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
     trainer_kwargs = {
@@ -162,6 +178,7 @@ def main():
         "callbacks": callbacks,
         "logger": tb_logger,
         "val_check_interval": val_check_interval,
+        "check_val_every_n_epoch": trainer_cfg.get("val_every_n_epochs", 1),  # Validate every N epochs
         **trainer_cfg.get("extra_args", {}),
     }
     if args.resume:
@@ -215,6 +232,8 @@ class SegLitModule(pl.LightningModule):
         target_key: str = "label_patch",
         train_metrics_every_n_epochs: int = 1,
         val_metrics_every_n_epochs: int = 1,
+        train_metric_frequencies: Dict[str, int] = None,  # Per-metric train frequencies
+        val_metric_frequencies: Dict[str, int] = None,    # Per-metric val frequencies
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model','loss_fn','metrics'])
@@ -227,9 +246,13 @@ class SegLitModule(pl.LightningModule):
         self.input_key = input_key
         self.target_key = target_key
 
-        # how often to compute/log metrics
+        # Global default frequencies
         self.train_freq = train_metrics_every_n_epochs
         self.val_freq = val_metrics_every_n_epochs
+        
+        # Per-metric frequencies (override defaults when specified)
+        self.train_metric_frequencies = train_metric_frequencies or {}
+        self.val_metric_frequencies = val_metric_frequencies or {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -252,11 +275,15 @@ class SegLitModule(pl.LightningModule):
         self.log("train_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Always compute metrics but control frequency of logging
+        # Compute metrics using per-metric frequencies
         y_int = y.long()
         for name, metric in self.metrics.items():
-            val = metric(y_hat, y_int)
-            if self.current_epoch % self.train_freq == 0:
+            # Get specific frequency for this metric or fall back to default
+            freq = self.train_metric_frequencies.get(name, self.train_freq)
+            
+            # Only compute and log if it's time for this metric
+            if self.current_epoch % freq == 0:
+                val = metric(y_hat, y_int)
                 self.log(f"train_{name}", val,
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         return loss
@@ -277,14 +304,18 @@ class SegLitModule(pl.LightningModule):
         self.log("val_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Always compute metrics and log based on frequency
+        # Compute metrics using per-metric frequencies
         y_int = y.long()
         for name, metric in self.metrics.items():
-            val = metric(y_hat, y_int)
-            # Always log to TensorBoard but control progress bar updates
-            log_prog_bar = self.current_epoch % self.val_freq == 0
-            self.log(f"val_{name}", val,
-                     prog_bar=log_prog_bar, on_step=False, on_epoch=True, batch_size=x.size(0))
+            # Get specific frequency for this metric or fall back to default
+            freq = self.val_metric_frequencies.get(name, self.val_freq)
+            
+            # Only compute and log if it's time for this metric
+            if self.current_epoch % freq == 0:
+                val = metric(y_hat, y_int)
+                # Only show on progress bar if it's time to compute it
+                self.log(f"val_{name}", val,
+                         prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
         
         return {"predictions": y_hat, "val_loss": loss}
 
@@ -304,7 +335,7 @@ class SegLitModule(pl.LightningModule):
         self.log("test_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Compute and log test metrics
+        # Compute and log test metrics - always compute all metrics during testing
         y_int = y.long()
         for name, metric in self.metrics.items():
             val = metric(y_hat, y_int)
@@ -1108,6 +1139,171 @@ class SkipValidation(Callback):
                     f"Resuming validation from epoch {trainer.current_epoch}"
                 )
 
+class PredictionSaver(Callback):
+    """
+    Callback to save ground truth and prediction tensors as NumPy arrays.
+    Only saves after a specified starting epoch and at a specified frequency.
+    """
+    
+    def __init__(
+        self,
+        save_dir: str,
+        save_every_n_epochs: int = 5,
+        save_after_epoch: int = 0,
+        max_samples: int = 4
+    ):
+        """
+        Initialize the PredictionSaver callback.
+        
+        Args:
+            save_dir: Directory to save prediction data
+            save_every_n_epochs: How often to save (every N epochs)
+            save_after_epoch: Only start saving after this epoch
+            max_samples: Maximum number of samples to save per epoch
+        """
+        super().__init__()
+        self.save_dir = save_dir
+        self.save_every_n_epochs = save_every_n_epochs
+        self.save_after_epoch = save_after_epoch
+        self.max_samples = max_samples
+        self.logger = logging.getLogger(__name__)
+        
+        # Buffers to collect samples
+        self._reset_buffers()
+    
+    def _reset_buffers(self):
+        """Reset the internal buffers that collect samples."""
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._saved_this_epoch = False
+    
+    def _should_save_this_epoch(self, epoch):
+        """Determine if we should save data for this epoch."""
+        if epoch < self.save_after_epoch:
+            return False
+            
+        return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
+    
+    def on_validation_epoch_start(self, trainer, pl_module):
+        """Reset buffers at the start of a validation epoch."""
+        current_epoch = trainer.current_epoch
+        if self._should_save_this_epoch(current_epoch):
+            self._reset_buffers()
+        else:
+            # Mark as already done for non-saving epochs
+            self._saved_this_epoch = True
+    
+    def on_test_epoch_start(self, trainer, pl_module):
+        """Reset buffers at the start of a test epoch."""
+        # Always save during test
+        self._reset_buffers()
+    
+    def on_validation_batch_end(
+        self,
+        trainer,
+        pl_module,
+        outputs,
+        batch,
+        batch_idx,
+        dataloader_idx=0
+    ):
+        """Collect validation batch results for later saving."""
+        # Skip if we already collected enough samples this epoch or it's not a saving epoch
+        if self._saved_this_epoch or self._collected >= self.max_samples:
+            return
+        
+        current_epoch = trainer.current_epoch
+        if not self._should_save_this_epoch(current_epoch):
+            return
+        
+        # Get ground truth and prediction
+        y_true = batch[pl_module.target_key]
+        y_pred = outputs["predictions"]
+        
+        # Move to CPU and detach
+        y_true = y_true.detach().cpu()
+        y_pred = y_pred.detach().cpu()
+        
+        # How many more samples we need
+        remaining = self.max_samples - self._collected
+        take = min(remaining, y_pred.shape[0])
+        
+        # Append the slices
+        self._gts.append(y_true[:take])
+        self._preds.append(y_pred[:take])
+        self._collected += take
+    
+    def on_test_batch_end(
+        self,
+        trainer,
+        pl_module,
+        outputs,
+        batch,
+        batch_idx,
+        dataloader_idx=0
+    ):
+        """Collect test batch results for later saving."""
+        # Skip if we already collected enough samples
+        if self._saved_this_epoch or self._collected >= self.max_samples:
+            return
+        
+        # Get ground truth and prediction
+        y_true = batch[pl_module.target_key]
+        y_pred = outputs["predictions"]
+        
+        # Move to CPU and detach
+        y_true = y_true.detach().cpu()
+        y_pred = y_pred.detach().cpu()
+        
+        # How many more samples we need
+        remaining = self.max_samples - self._collected
+        take = min(remaining, y_pred.shape[0])
+        
+        # Append the slices
+        self._gts.append(y_true[:take])
+        self._preds.append(y_pred[:take])
+        self._collected += take
+    
+    def _save_data(self, trainer, phase="val"):
+        """Save collected data as NumPy arrays."""
+        if not self._collected:
+            return
+            
+        current_epoch = trainer.current_epoch
+        
+        # Concatenate buffers
+        gts = torch.cat(self._gts, dim=0)
+        preds = torch.cat(self._preds, dim=0)
+        
+        # Create output directory
+        phase_dir = os.path.join(self.save_dir, phase)
+        epoch_dir = os.path.join(phase_dir, f"epoch_{current_epoch:06d}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # Convert to NumPy and save
+        gts_numpy = gts.numpy()
+        preds_numpy = preds.numpy()
+        
+        # Save as .npy files
+        np.save(os.path.join(epoch_dir, "ground_truth.npy"), gts_numpy)
+        np.save(os.path.join(epoch_dir, "predictions.npy"), preds_numpy)
+        
+        self.logger.info(f"Saved {self._collected} {phase} tensors to {epoch_dir}")
+        self._saved_this_epoch = True
+    
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Save data at the end of the validation epoch if conditions are met."""
+        if not self._saved_this_epoch:
+            self._save_data(trainer, "val")
+            self._reset_buffers()
+    
+    def on_test_epoch_end(self, trainer, pl_module):
+        """Save data at the end of the test epoch."""
+        if not self._saved_this_epoch:
+            self._save_data(trainer, "test")
+            self._reset_buffers()
+
 # ------------------------------------
 # core/metric_loader.py
 # ------------------------------------
@@ -1701,7 +1897,8 @@ from core.callbacks import (
     BestMetricCheckpoint,
     PredictionLogger,
     ConfigArchiver,
-    SkipValidation
+    SkipValidation,
+    PredictionSaver
 )
 from core.logger import setup_logger, ColoredFormatter
 from core.checkpoint import CheckpointManager, CheckpointMode
@@ -1724,6 +1921,7 @@ __all__ = [
     'setup_logger',
     'ColoredFormatter',
     'CheckpointManager',
+    'PredictionSaver',
     'CheckpointMode',
     'GeneralizedDataset',
     'custom_collate_fn',
@@ -2020,6 +2218,689 @@ class APLS(nn.Module):
         return torch.tensor(scores.mean(), device=y_pred.device)
 
 # ------------------------------------
+# UsefulScripts/extract_paths.py
+# ------------------------------------
+import os
+import pickle
+import networkx as nx
+import numpy as np
+import itertools
+import tempfile
+import time
+from multiprocessing import Pool, cpu_count
+
+def mkdir(directory):
+    directory = os.path.abspath(directory)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def load_graph_txt(filename):
+    G = nx.Graph()
+    nodes = []
+    edges = []
+    i = 0
+    switch = True
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            if len(line) == 0 and switch:
+                switch = False
+                continue
+            if switch:
+                x, y = line.split(' ')
+                G.add_node(i, pos=(float(x), float(y)))
+                i += 1
+            else:
+                idx_node1, idx_node2 = line.split(' ')
+                G.add_edge(int(idx_node1), int(idx_node2))
+    return G
+
+def save_graph_txt(G, filename):
+    mkdir(os.path.dirname(filename))
+    nodes = list(G.nodes())
+    with open(filename, "w+") as file:
+        for n in nodes:
+            file.write("{:.6f} {:.6f}\r\n".format(G.nodes[n]['pos'][0], G.nodes[n]['pos'][1]))
+        file.write("\r\n")
+        for s, t in G.edges():
+            file.write("{} {}\r\n".format(nodes.index(s), nodes.index(t)))
+
+def txt_to_graph(filecontent):
+    G = nx.Graph()
+    lines = filecontent.strip().splitlines()
+    switch = True  
+    node_index = 0
+    
+    for line in lines:
+        line = line.strip()
+        if len(line) == 0 and switch:
+            switch = False
+            continue
+        
+        if switch:
+            try:
+                x, y = line.split()
+                G.add_node(node_index, pos=(float(x), float(y)))
+                node_index += 1
+            except ValueError:
+                raise ValueError(f"Error parsing node line: {line}")
+        else:
+            try:
+                idx_node1, idx_node2 = line.split()
+                G.add_edge(int(idx_node1), int(idx_node2))
+            except ValueError:
+                raise ValueError(f"Error parsing edge line: {line}")
+    
+    return G
+
+def process_single_graph(graph_file, graphs_folder, temp_dir):
+    start_time = time.time()  # Start time for each graph
+    temp_file = os.path.join(temp_dir, f"{graph_file}.pkl")
+
+    if os.path.exists(temp_file):
+        with open(temp_file, "rb") as f:
+            result = pickle.load(f)
+        elapsed_time = time.time() - start_time
+        print(f"Loaded cached graph {graph_file} in {elapsed_time:.2f} seconds.")
+        return result
+
+    graph_path = os.path.join(graphs_folder, graph_file)
+    G = load_graph_txt(graph_path)
+
+    for n, data in G.nodes(data=True):
+        if 'pos' not in data and 'x' in data and 'y' in data:
+            data['pos'] = (data['x'], data['y'])
+
+    paths = []
+    nodes = list(G.nodes())
+    for s, t in itertools.combinations(nodes, 2):
+        try:
+            sp = nx.shortest_path(G, source=s, target=t, weight='length')
+            s_coords = np.array(G.nodes[s].get('pos', (G.nodes[s].get('x'), G.nodes[s].get('y'))))
+            t_coords = np.array(G.nodes[t].get('pos', (G.nodes[t].get('x'), G.nodes[t].get('y'))))
+            paths.append({
+                's_gt': s_coords,
+                't_gt': t_coords,
+                'shortest_path_gt': sp
+            })
+        except nx.NetworkXNoPath:
+            continue
+
+    result = (graph_file, paths)
+    with open(temp_file, "wb") as f:
+        pickle.dump(result, f)
+
+    elapsed_time = time.time() - start_time
+    print(f"Processed {graph_file} in {elapsed_time:.2f} seconds.")
+
+    return result
+
+def handle_graph_processing(dataset_name, base_dir, num_cores=4):
+    start_total_time = time.time()  # Start measuring total time
+
+    dataset_path = os.path.join(base_dir, dataset_name)
+    graphs_folder = os.path.join(dataset_path, "graphs")
+    output_path = os.path.join(dataset_path, f"{dataset_name}_gt_paths.pkl")
+    temp_dir = os.path.join(tempfile.gettempdir(), f"{dataset_name}_temp")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    if not os.path.exists(graphs_folder):
+        print(f"Graphs folder not found at {graphs_folder}.")
+        return
+
+    graph_files = [f for f in os.listdir(graphs_folder) if f.endswith('.txt')]
+    processed_files = {f for f in os.listdir(temp_dir) if f.endswith('.pkl')}
+    remaining_files = [f for f in graph_files if f"{f}.pkl" not in processed_files]
+
+    print(f"Processing {len(remaining_files)} remaining graphs in parallel using {num_cores} CPU cores...")
+
+    gt_paths_dict = {}
+    with Pool(processes=num_cores) as pool:
+        results = pool.starmap(process_single_graph, [(gf, graphs_folder, temp_dir) for gf in remaining_files])
+
+    for gf, paths in results:
+        gt_paths_dict[gf] = paths
+
+    with open(output_path, "wb") as f:
+        pickle.dump(gt_paths_dict, f)
+
+    total_elapsed_time = time.time() - start_total_time
+    print(f"Saved all processed ground truth paths to {output_path}")
+    print(f"Total processing time: {total_elapsed_time:.2f} seconds.")
+
+# Usage with limited CPU cores
+BaseDirDataset = '/home/ri/Desktop/Projects/ProcessedDatasets'
+Dataset_name = 'CREMI'
+handle_graph_processing(Dataset_name, BaseDirDataset, num_cores=4)
+
+# Uncomment to process DRIVE dataset as well
+# Dataset_name = 'DRIVE'
+# handle_graph_processing(Dataset_name, BaseDirDataset, num_cores=4)
+
+
+# ------------------------------------
+# UsefulScripts/mass_clean_labels.py
+# ------------------------------------
+import os
+import numpy as np
+from tqdm import tqdm
+import warnings
+
+try:
+    import rasterio
+    from rasterio.errors import NotGeoreferencedWarning
+    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+    RASTERIO_AVAILABLE = True
+except ImportError:
+    from PIL import Image
+    RASTERIO_AVAILABLE = False
+
+
+def read_image(path):
+    if RASTERIO_AVAILABLE:
+        with rasterio.open(path) as src:
+            img = src.read()  # (C, H, W)
+            img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
+    else:
+        img = np.array(Image.open(path).convert("RGB"))
+    return img
+
+
+def read_label(path):
+    if RASTERIO_AVAILABLE:
+        with rasterio.open(path) as src:
+            lbl = src.read(1)  # read first band as label
+    else:
+        lbl = np.array(Image.open(path))
+    return lbl
+
+
+def save_label(label_array, out_path):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    if RASTERIO_AVAILABLE:
+        height, width = label_array.shape
+        profile = {
+            'driver': 'GTiff',
+            'height': height,
+            'width': width,
+            'count': 1,
+            'dtype': str(label_array.dtype),
+        }
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            dst.write(label_array, 1)
+    else:
+        from PIL import Image
+        Image.fromarray(label_array).save(out_path)
+
+
+def clean_labels(image_dir, label_dir, output_dir, window_size=8, white_threshold=250):
+    """
+    For each label pixel block (window_size x window_size),
+    if the corresponding image block is 'white' (above white_threshold),
+    set those label pixels to 0.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Gather image and label files by base name, ignoring extension differences
+    image_files = {os.path.splitext(f)[0]: os.path.join(image_dir, f)
+                   for f in os.listdir(image_dir)
+                   if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg'))}
+
+    label_files = {os.path.splitext(f)[0]: os.path.join(label_dir, f)
+                   for f in os.listdir(label_dir)
+                   if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg'))}
+
+    common_keys = sorted(set(image_files.keys()) & set(label_files.keys()))
+
+    for key in tqdm(common_keys, desc=f"Cleaning labels from {image_dir}"):
+        image_path = image_files[key]
+        label_path = label_files[key]
+        output_path = os.path.join(output_dir, f"{key}.tif")  # force .tif output
+
+        try:
+            image = read_image(image_path)
+            label = read_label(label_path)
+        except Exception as e:
+            print(f"Failed to load {key}: {e}")
+            continue
+
+        # If you have an alpha channel, ignore it
+        if image.shape[-1] == 4:
+            image = image[..., :3]
+
+        H, W = image.shape[:2]
+        cleaned = label.copy()
+
+        for y in range(0, H, window_size):
+            for x in range(0, W, window_size):
+                y1 = min(y + window_size, H)
+                x1 = min(x + window_size, W)
+                patch = image[y:y1, x:x1]  # shape ~ (8, 8, 3)
+
+                # is_every_pixel_white? => (pixel_value > white_threshold) in all channels
+                if np.all(patch > white_threshold):
+                    cleaned[y:y1, x:x1] = 0
+
+        save_label(cleaned, output_path)
+
+    print(f"Finished cleaning {len(common_keys)} matched label-image pairs.")
+
+
+if __name__ == "__main__":
+    # Example usage:
+    clean_labels(
+        image_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/train/sat",
+        label_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/train/map",
+        output_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/train/label",
+        window_size=8,
+        white_threshold=250  # can tune to ~240-255
+    )
+
+    clean_labels(
+        image_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/valid/sat",
+        label_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/valid/map",
+        output_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/valid/label",
+        window_size=8,
+        white_threshold=250
+    )
+
+    clean_labels(
+        image_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/test/sat",
+        label_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/test/map",
+        output_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/test/label",
+        window_size=8,
+        white_threshold=250
+    )
+
+
+# ------------------------------------
+# UsefulScripts/mass_roads_dataset_downloader.py
+# ------------------------------------
+import os
+import requests
+def download_file(url, save_path):
+    if not os.path.exists(save_path):
+        print(f"Downloading: {url}")
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(save_path, 'wb') as file:
+                for chunk in response.iter_content(chunk_size=1024):
+                    file.write(chunk)
+            print(f"Downloaded: {save_path}")
+        else:
+            print(f"Failed to download: {url}")
+    else:
+        print(f"File already exists: {save_path}")
+
+from bs4 import BeautifulSoup
+
+def extract_hrefs_from_html(html_file):
+    """
+    Extracts all href attributes from <a> tags in an HTML file.
+    
+    Args:
+        html_file (str): Path to the HTML file.
+        output_file (str, optional): Path to save the extracted hrefs. If None, no file is saved.
+    
+    Returns:
+        list: A list of href strings extracted from the HTML file.
+    """
+    # Load the HTML file
+    with open(html_file, 'r', encoding='utf-8') as file:
+        content = file.read()
+
+    # Parse the HTML content with BeautifulSoup
+    soup = BeautifulSoup(content, 'html.parser')
+
+    # Extract all href attributes from <a> tags
+    hrefs = [a['href'] for a in soup.find_all('a', href=True)]
+
+    return hrefs
+    
+dataset = {
+    ("train","sat"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/train/sat/index.html',
+    ("train","map"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/train/map/index.html',
+    ("valid","sat"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/valid/sat/index.html',
+    ("valid","map"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/valid/map/index.html',
+    ("test", "sat"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/test/sat/index.html',
+    ("test", "map"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/test/map/index.html',
+  
+} 
+BASE = "dataset"
+for folders, url in dataset.items():
+  os.makedirs(BASE, exist_ok=True)
+  f1 = os.path.join(BASE, folders[0]) 
+  f2 = os.path.join(f1, folders[1])
+  os.makedirs(f1, exist_ok=True) 
+  os.makedirs(f2, exist_ok=True)
+  index = os.path.join(f2, "index.html")
+  download_file(url, index)
+  hrefs = extract_hrefs_from_html(index)
+  for href in hrefs:
+    download_file(href, os.path.join(f2, href.split('/')[-1]))
+
+
+# ------------------------------------
+# UsefulScripts/tlts.py
+# ------------------------------------
+import numpy as np
+import networkx as nx
+import queue
+import itertools
+from scipy.spatial.distance import euclidean
+
+def find_connectivity(img, x, y, stop=None):
+    
+    _img = img.copy()   
+    _img2 = img.copy()
+    
+    dy = [0, 0, 1, 1, 1, -1, -1, -1]
+    dx = [1, -1, 0, 1, -1, 0, 1, -1]
+    xs = []
+    ys = []
+    cs = []
+    q = queue.Queue()
+    if _img[y,x] == True:
+        q.put((y,x))
+    i = 0
+    while q.empty() == False:
+        i+=1
+        v,u = q.get()
+        xs.append(u)
+        ys.append(v)
+        adjacent = [(u,v)]
+        if stop is not None and i==stop:
+            return xs, ys, cs
+        for k in range(8):
+            yy = v + dy[k]
+            xx = u + dx[k]            
+            if _img[yy, xx] == True:
+                _img[yy, xx] = False
+                q.put((yy, xx))               
+            if _img2[yy, xx] == True:
+                adjacent.append((xx,yy))
+        cs.append(adjacent)
+    return xs, ys, cs 
+
+def find_connectivity_3d(img, x, y, z, stop=None):
+    
+    _img = img.copy()   
+    _img2 = img.copy()
+    
+    dx = [-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    dy = [-1, -1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, 0, 0, 1, 1, 1, -1, -1, -1, 0, 0, 0, 1, 1, 1]
+    dz = [-1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1]     
+    xs = []
+    ys = []
+    zs = []
+    cs = []
+    q = queue.Queue()
+    if _img[y,x,z] == True:
+        q.put((x,y,z))
+    i = 0
+    while q.empty() == False:
+        i+=1
+        u,v,w = q.get()
+        xs.append(u)
+        ys.append(v)
+        zs.append(w)
+        adjacent = [(u,v,w)]
+        if stop is not None and i==stop:
+            return xs, ys, zs, cs
+        for k in range(26):            
+            xx = u + dx[k]  
+            yy = v + dy[k]
+            zz = w + dz[k]            
+            if _img[yy, xx, zz] == True:
+                _img[yy, xx, zz] = False
+                q.put((xx,yy,zz))               
+            if _img2[yy, xx, zz] == True:
+                adjacent.append((xx,yy,zz))
+        cs.append(adjacent)
+    return xs, ys, zs, cs
+    
+def create_graph(skeleton):
+    
+    _skeleton = skeleton.copy()>0
+
+    # make sure no pixel are active on the borders
+    _skeleton[ 0, :] = False
+    _skeleton[-1, :] = False
+    _skeleton[ :, 0] = False
+    _skeleton[ :,-1] = False
+
+    css = []
+    while True:
+        ys, xs = np.where(_skeleton)
+        if len(ys)==0:
+            break
+        _xs, _ys, _cs = find_connectivity(_skeleton, xs[0], ys[0], stop=None)
+        css += _cs
+        _skeleton[_ys,_xs] = False       
+    
+    graph = nx.Graph()
+
+    for cs in css:
+        for pos in cs:
+            if not graph.has_node(pos):
+                graph.add_node(pos, pos=np.array(pos))  
+        '''   
+        if len(cs)==2:
+            us,vs = [cs[0]],[cs[1]]
+            distances = [euclidean(cs[0],cs[1])]
+        elif len(cs)==3:
+            d1 = euclidean(cs[0],cs[1])
+            d2 = euclidean(cs[1],cs[2])
+            d3 = euclidean(cs[0],cs[2])
+            if d1>d2 and d1>d3:
+                us,vs = [cs[1],cs[0]],[cs[2],cs[2]] 
+                distances = [d2,d3]
+            if d2>d1 and d2>d3:
+                us,vs = [cs[0],cs[0]],[cs[1],cs[2]]  
+                distances = [d1,d3]
+            if d3>d1 and d3>d2:
+                us,vs = [cs[0],cs[1]],[cs[1],cs[2]]
+                distances = [d1,d2]
+        else:
+        '''
+        us,vs = [],[]
+        for u,v in itertools.combinations(cs, 2):
+            us += [u]
+            vs += [v]                    
+        distances = [euclidean(u,v) for u,v in zip(us,vs)] 
+
+        for u,v,d in zip(us,vs,distances):
+            if not graph.has_edge(u,v):
+                '''
+                if False:
+                    try:
+                        length = nx.shortest_path_length(graph,u,v)
+                        if length>5:
+                            graph.add_edge(u,v)
+                    except:
+                        graph.add_edge(u,v)      
+                else:
+                '''
+                if d<1.42:
+                    graph.add_edge(u,v)
+
+    return graph
+
+def create_graph_3d(skeleton):
+    
+    _skeleton = skeleton.copy()>0
+    
+    # make sure no pixel are active on the borders
+    _skeleton[ 0, :, :] = False
+    _skeleton[-1, :, :] = False
+    _skeleton[ :, 0, :] = False
+    _skeleton[ :,-1, :] = False   
+    _skeleton[ :, :, 0] = False
+    _skeleton[ :, :,-1] = False     
+
+    css = []
+    while True:
+        ys, xs, zs = np.where(_skeleton)
+        if len(ys)==0:
+            break
+        _xs, _ys, _zs, _cs = find_connectivity_3d(_skeleton, xs[0], ys[0], zs[0], stop=None)
+        css += _cs
+        _skeleton[_ys,_xs,_zs] = False       
+    
+    graph = nx.Graph()
+
+    for cs in css:
+        for pos in cs:
+            if not graph.has_node(pos):
+                graph.add_node(pos, pos=np.array(pos))  
+
+        us,vs = [],[]
+        for u,v in itertools.combinations(cs, 2):
+            us += [u]
+            vs += [v]                    
+        distances = [euclidean(u,v) for u,v in zip(us,vs)] 
+
+        for u,v,d in zip(us,vs,distances):
+            if not graph.has_edge(u,v):
+                if d<2.1:
+                    graph.add_edge(u,v)
+
+    return graph
+
+def extract_gt_paths(graph_gt, N=100, min_path_length=10):
+
+    cc_graphs = list(graph_gt.subgraph(c) for c in nx.connected_components(graph_gt))
+    n_subgraph = len(cc_graphs)  
+    
+    total = 0
+
+    paths = []
+    for _ in range(N*1000):
+        
+        idx_sub = np.random.choice(np.arange(n_subgraph), 1)[0]
+        graph = cc_graphs[idx_sub]
+        
+        nodes_gt = list(graph.nodes()) 
+        n_nodes = len(nodes_gt)
+        if n_nodes < 2:
+            continue
+    
+        # randomly pick two node in the GT
+        idx_s,idx_t = np.random.choice(np.arange(n_nodes), 2, replace=False)
+        s_gt, t_gt = nodes_gt[idx_s], nodes_gt[idx_t]
+        
+        # search shortest path in GT
+        try:
+            shortest_path_gt = list(nx.shortest_path(graph, tuple(s_gt), tuple(t_gt)))
+            #shortest_path_gt = list(nx.astar_path(graph, tuple(s_gt), tuple(t_gt)))
+            length_line_gt = len(shortest_path_gt)
+        except:
+            # path not found
+            continue 
+            
+        if length_line_gt<min_path_length:
+            continue
+            
+        paths.append({"s_gt":s_gt, "t_gt":t_gt, "shortest_path_gt":shortest_path_gt})
+        
+        total += 1
+        
+        if total==N:
+            break
+
+    return paths
+    
+def toolong_tooshort_score(paths_gt, graph_pred, radius_match=5, length_deviation=0.05):
+    """
+    A higher-order CRF model for road network extraction
+    Jan D. Wegner, Javier A. Montoya-Zegarra, Konrad Schindler
+    2013
+    
+    These are
+    computed in the following way: we randomly sample two
+    points which lie both on the true and the estimated road
+    network, and check whether the shortest path between the
+    two points has the same length in both networks (up to a
+    deviation of 5% to account for geometric uncertainty). We
+    then keep repeating this procedure with different random
+    points and record the percentages of correct, too short, too
+    long and infeasible paths, until these percentages have converged. 
+    Infeasible and too long paths indicate missing links,
+    whereas too short ones indicate hallucinated connections.  
+    
+    """
+      
+    nodes_pred = np.array(graph_pred.nodes())
+    idxs_pred = np.arange(len(nodes_pred))     
+
+    counter_correct = 0
+    counter_toolong = 0
+    counter_tooshort = 0
+    counter_infeasible = 0
+    
+    res = []  
+    for path in paths_gt:
+    
+        # unpack GT path
+        s_gt, t_gt = np.array(path["s_gt"]), np.array(path["t_gt"])
+        shortest_path_gt = path["shortest_path_gt"]
+        length_line_gt = len(shortest_path_gt)
+
+        # match GT nodes in prediction
+        nodes_radius_s = nodes_pred[np.linalg.norm(nodes_pred-s_gt[None], axis=1)<radius_match]
+        nodes_radius_t = nodes_pred[np.linalg.norm(nodes_pred-t_gt[None], axis=1)<radius_match]
+        if len(nodes_radius_s)==0 or len(nodes_radius_t)==0:
+            counter_infeasible += 1
+            res.append({"line_gt":shortest_path_gt, 
+                        "line_pred":None,
+                        "s_gt":s_gt,"t_gt":t_gt,
+                        "s_pred":None, "t_pred":None,
+                        "tooshort":False, "toolong":False,
+                        "correct":False, "infeasible":True})
+            continue
+        s_pred = nodes_radius_s[np.linalg.norm(nodes_radius_s-s_gt[None], axis=1).argmin()]
+        t_pred = nodes_radius_t[np.linalg.norm(nodes_radius_t-t_gt[None], axis=1).argmin()]
+        
+        # find shortest path in prediction
+        try:
+            shortest_path_pred = list(nx.shortest_path(graph_pred, tuple(s_pred), tuple(t_pred)))
+            #shortest_path_pred = list(nx.astar_path(graph_pred, tuple(s_pred), tuple(t_pred)))
+            length_line_pred = len(shortest_path_pred)
+        except:
+            # path not found
+            counter_infeasible += 1
+            res.append({"line_gt":shortest_path_gt, 
+                        "line_pred":None,
+                        "s_gt":s_gt,"t_gt":t_gt,
+                        "s_pred":s_pred, "t_pred":t_pred,
+                        "tooshort":False, "toolong":False,
+                        "correct":False, "infeasible":True})            
+            continue 
+
+        # compare path lengths
+        toolong, tooshort, correct = False,False,False        
+        if length_line_pred>length_line_gt*(1+length_deviation):
+            toolong = True
+            counter_toolong += 1
+        elif length_line_pred<length_line_gt*(1-length_deviation): 
+            tooshort = True
+            counter_tooshort += 1                   
+        else:
+            correct = True
+            counter_correct += 1
+            
+        res.append({"line_gt":shortest_path_gt, 
+                    "line_pred":shortest_path_pred,
+                    "s_gt":s_gt,"t_gt":t_gt,
+                    "s_pred":s_pred, "t_pred":t_pred,
+                    "tooshort":tooshort, "toolong":toolong,
+                    "correct":correct, "infeasible":False}) 
+            
+    total = len(paths_gt)
+        
+    return total, counter_correct/total, counter_tooshort/total, counter_toolong/total, counter_infeasible/total, res    
+
+# ------------------------------------
 # losses/custom_loss.py
 # ------------------------------------
 """
@@ -2176,12 +3057,17 @@ output_dir: "outputs/experiment_1"
 trainer:
   max_epochs: 100
   val_check_interval: 1.0  # Validate once per epoch
-  skip_validation_until_epoch: 5  # Skip validation for the first 5 epochs
+  skip_validation_until_epoch: 0  # Skip validation for the first 5 epochs
+  val_every_n_epochs: 5
   log_every_n_epochs: 2  # Log predictions every 2 epochs
   log_every_n_steps: 1
   train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
   val_metrics_every_n_epochs: 1      # compute/log val   metrics once every epoch
 
+  save_gt_pred_val_test_every_n_epochs: 5  # Save every 5 epochs
+  save_gt_pred_val_test_after_epoch: 10    # Start saving after epoch 10
+  save_gt_pred_max_samples: 4              # Save up to 4 samples per epoch
+  
   # Extra arguments passed directly to PyTorch Lightning Trainer
   extra_args:
     accelerator: "auto"  # Use GPU if available
@@ -2253,6 +3139,20 @@ metrics:
       min_segment_length: 10
       max_nodes: 500
       sampling_ratio: 0.1
+
+# Per-metric frequencies for training - how often to compute each metric
+train_frequencies:
+  dice: 1    # Compute every epoch (lightweight metric)
+  iou: 1     # Compute every epoch (lightweight metric)
+  ccq: 10    # Compute every 10 epochs (moderately expensive)
+  apls: 25   # Compute every 25 epochs (very computationally expensive)
+
+# Per-metric frequencies for validation - how often to compute each metric
+val_frequencies:
+  dice: 1    # Compute every epoch
+  iou: 1     # Compute every epoch
+  ccq: 5     # Compute every 5 epochs
+  apls: 10   # Compute every 10 epochs
 
 # ------------------------------------
 # configs/loss/mixed_topo.yaml

@@ -22,6 +22,10 @@ trainer:
   train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
   val_metrics_every_n_epochs: 1      # compute/log val   metrics once every epoch
 
+  save_gt_pred_val_test_every_n_epochs: 5  # Save every 5 epochs
+  save_gt_pred_val_test_after_epoch: 10    # Start saving after epoch 10
+  save_gt_pred_max_samples: 4              # Save up to 4 samples per epoch
+  
   # Extra arguments passed directly to PyTorch Lightning Trainer
   extra_args:
     accelerator: "auto"  # Use GPU if available

@@ -14,7 +14,8 @@ from core.callbacks import (
     BestMetricCheckpoint,
     PredictionLogger,
     ConfigArchiver,
-    SkipValidation
+    SkipValidation,
+    PredictionSaver
 )
 from core.logger import setup_logger, ColoredFormatter
 from core.checkpoint import CheckpointManager, CheckpointMode
@@ -37,6 +38,7 @@ __all__ = [
     'setup_logger',
     'ColoredFormatter',
     'CheckpointManager',
+    'PredictionSaver',
     'CheckpointMode',
     'GeneralizedDataset',
     'custom_collate_fn',
