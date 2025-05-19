@@ -670,3 +670,147 @@ Failed to load image Python extension: … undefined symbol: _XXXXX
 ``` 
 sudo apt-get install libjpeg-dev libpng-dev
 ```
+
+___
+
+# Prompt for Creating SegLab-Compatible Models and Losses
+
+## For Models
+
+Please write a PyTorch model compatible with the SegLab framework with the following specifications:
+
+[DESCRIBE YOUR MODEL HERE - e.g., "a UNet variation with attention gates" or "a lightweight segmentation model for road extraction"]
+
+The model must follow these requirements to be compatible with SegLab:
+1. Inherit from `torch.nn.Module`
+2. Have an `__init__` method that accepts parameters configurable via YAML
+3. Have a `forward` method that takes a single input tensor and returns the output tensor
+4. For binary segmentation, apply sigmoid in the forward method
+5. Handle tensor dimensions properly (N, C, H, W)
+
+Here's a simplified example of the structure:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MyCustomModel(nn.Module):
+    def __init__(
+        self,
+        in_channels=3,         # Number of input channels
+        out_channels=1,        # Number of output channels
+        base_filters=64,       # Initial number of filters
+        depth=4,               # Network depth
+        dropout=0.2            # Dropout rate
+    ):
+        super().__init__()
+        
+        # Define your model architecture here
+        # ...
+        
+    def forward(self, x):
+        # Forward pass implementation
+        # ...
+        
+        # Apply sigmoid for binary segmentation
+        return torch.sigmoid(x)
+```
+
+The model will be loaded by SegLab's model_loader using the path and class name specified in a YAML configuration file.
+
+---
+
+## For Loss Functions
+
+Please write a PyTorch custom loss function compatible with the SegLab framework with the following specifications:
+
+[DESCRIBE YOUR LOSS FUNCTION HERE - e.g., "a boundary-aware loss function that emphasizes road edges" or "a combined loss function that balances pixel-wise and structural similarity"]
+
+The loss function must follow these requirements to be compatible with SegLab:
+1. Inherit from `torch.nn.Module`
+2. Have an `__init__` method that accepts parameters configurable via YAML
+3. Have a `forward` method that takes `y_pred` and `y_true` tensors and returns a scalar loss value
+4. Handle both binary and multi-class segmentation if specified
+5. Be differentiable for backpropagation
+
+Here's a simplified example of the structure:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MyCustomLoss(nn.Module):
+    def __init__(
+        self,
+        weight=1.0,            # Weight for the loss component
+        smooth=1e-6            # Smoothing factor for numerical stability
+    ):
+        super().__init__()
+        self.weight = weight
+        self.smooth = smooth
+        
+    def forward(self, y_pred, y_true):
+        # Implement your loss calculation here
+        # y_pred: model predictions (N, C, H, W)
+        # y_true: ground truth (N, C, H, W)
+        
+        # Example: compute a simple weighted BCE
+        bce = F.binary_cross_entropy(y_pred, y_true, reduction='mean')
+        
+        # Return the final loss value
+        return self.weight * bce
+```
+
+The loss function will be loaded by SegLab's loss_loader using the path and class name specified in a YAML configuration file.
+
+---
+
+## For Metrics
+
+Please write a PyTorch custom metric compatible with the SegLab framework with the following specifications:
+
+[DESCRIBE YOUR METRIC HERE - e.g., "a boundary F1 score that focuses on accuracy at object boundaries" or "a connectivity-aware metric for road networks"]
+
+The metric must follow these requirements to be compatible with SegLab:
+1. Inherit from `torch.nn.Module`
+2. Have an `__init__` method that accepts parameters configurable via YAML
+3. Have a `forward` method that takes `y_pred` and `y_true` tensors and returns a scalar metric value (higher should be better)
+4. Handle both binary and multi-class segmentation if specified
+5. Be able to handle batched inputs
+
+Here's a simplified example of the structure:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MyCustomMetric(nn.Module):
+    def __init__(
+        self,
+        threshold=0.5,         # Threshold for binary predictions
+        eps=1e-6               # Small value for numerical stability
+    ):
+        super().__init__()
+        self.threshold = threshold
+        self.eps = eps
+        
+    def forward(self, y_pred, y_true):
+        # Convert predictions to binary
+        y_pred_bin = (y_pred > self.threshold).float()
+        
+        # Implement your metric calculation here
+        # y_pred: model predictions (N, C, H, W)
+        # y_true: ground truth (N, C, H, W)
+        
+        # Example: compute accuracy
+        correct = (y_pred_bin == y_true).float()
+        accuracy = torch.mean(correct)
+        
+        # Return the metric value (higher should be better)
+        return accuracy
+```
+
+The metric will be loaded by SegLab's metric_loader using the path and class name specified in a YAML configuration file.
