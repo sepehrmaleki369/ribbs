@@ -199,113 +199,132 @@ class BestMetricCheckpoint(Callback):
 
 class PredictionLogger(Callback):
     """
-    Callback to log input/prediction/ground truth visualization during training.
-    
-    This callback creates a grid visualization of input images, ground truth masks,
-    and model predictions at configurable intervals.
+    Callback to log input/prediction/ground truth visualization during validation.
+    Accumulates up to `max_samples` across batches and saves one grid per epoch.
     """
-    
+
     def __init__(
         self,
         log_dir: str,
         log_every_n_epochs: int = 1,
         max_samples: int = 4
     ):
-        """
-        Initialize the PredictionLogger callback.
-        
-        Args:
-            log_dir: Directory to save visualizations to
-            log_every_n_epochs: Frequency of logging in epochs
-            max_samples: Maximum number of samples to visualize
-        """
         super().__init__()
         self.log_dir = log_dir
         self.log_every_n_epochs = log_every_n_epochs
         self.max_samples = max_samples
         self.logger = logging.getLogger(__name__)
-    
+
+        # Buffers to accumulate per-epoch
+        self._reset_buffers()
+
+    def _reset_buffers(self):
+        self._images = []
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._logged_this_epoch = False
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        # Only prepare to log on epochs matching frequency
+        if trainer.current_epoch % self.log_every_n_epochs == 0:
+            self._reset_buffers()
+        else:
+            # Mark as already done for non-logging epochs
+            self._logged_this_epoch = True
+
     def on_validation_batch_end(
         self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs: Any,
-        batch: Any,
-        batch_idx: int,
-        dataloader_idx: int = 0
+        trainer,
+        pl_module,
+        outputs,
+        batch,
+        batch_idx,
+        dataloader_idx=0
     ):
-        """
-        Log predictions at the end of a validation batch.
-        
-        Args:
-            trainer: PyTorch Lightning trainer
-            pl_module: PyTorch Lightning module
-            outputs: Batch outputs (including predictions)
-            batch: Input batch
-            batch_idx: Batch index
-            dataloader_idx: Dataloader index
-        """
-        # Only log on specified epochs and for the first batch
-        if batch_idx != 0 or trainer.current_epoch % self.log_every_n_epochs != 0:
+        # Skip if we already logged this epoch or it's not a logging epoch
+        if self._logged_this_epoch:
             return
-            
-        # Create log directory if it doesn't exist
-        os.makedirs(self.log_dir, exist_ok=True)
-        
-        # Extract data
-        x = batch["image_patch"][:self.max_samples]
-        y_true = batch["label_patch"][:self.max_samples]
-        y_pred = outputs["predictions"][:self.max_samples]
-        
-        # Ensure we're working with CPU tensors
+        if trainer.current_epoch % self.log_every_n_epochs != 0:
+            return
+
+        # Extract raw tensors (up to max needed)
+        x = batch["image_patch"]
+        y_true = batch["label_patch"]
+        y_pred = outputs["predictions"]
+
+        # Move to CPU and detach
         x = x.detach().cpu()
         y_true = y_true.detach().cpu()
         y_pred = y_pred.detach().cpu()
-        
-        # Create figure
-        fig, axes = plt.subplots(self.max_samples, 3, figsize=(12, 4 * self.max_samples))
-        
-        for i in range(min(self.max_samples, x.shape[0])):
-            # Display input image
-            if x.shape[1] == 1:  # Grayscale
-                axes[i, 0].imshow(x[i, 0], cmap='gray')
-            else:  # RGB
-                # Convert from (C, H, W) to (H, W, C) for matplotlib
-                img = x[i].permute(1, 2, 0)
-                # Clip to [0, 1] range
-                img = torch.clamp(img, 0, 1)
-                axes[i, 0].imshow(img)
-            axes[i, 0].set_title('Input')
-            axes[i, 0].axis('off')
-            
-            # Display ground truth
-            if y_true.shape[1] == 1:  # Binary mask
-                axes[i, 1].imshow(y_true[i, 0], cmap='gray')
-            else:  # Multi-class mask
-                # Use argmax for multi-class segmentation
-                mask = torch.argmax(y_true[i], dim=0)
-                axes[i, 1].imshow(mask, cmap='tab20')
-            axes[i, 1].set_title('Ground Truth')
-            axes[i, 1].axis('off')
-            
-            # Display prediction
-            if y_pred.shape[1] == 1:  # Binary mask
-                axes[i, 2].imshow(y_pred[i, 0], cmap='gray')
-            else:  # Multi-class mask
-                # Use argmax for multi-class segmentation
-                pred = torch.argmax(y_pred[i], dim=0)
-                axes[i, 2].imshow(pred, cmap='tab20')
-            axes[i, 2].set_title('Prediction')
-            axes[i, 2].axis('off')
-        
-        plt.tight_layout()
-        
-        # Save figure
-        filename = os.path.join(self.log_dir, f"pred_epoch_{trainer.current_epoch:06d}.png")
-        plt.savefig(filename, dpi=150)
-        plt.close(fig)
-        
-        self.logger.info(f"Saved prediction visualization: {filename}")
+
+        # How many more we need
+        remaining = self.max_samples - self._collected
+        take = min(remaining, x.shape[0])
+
+        # Append the slice
+        self._images.append(x[:take])
+        self._gts.append(y_true[:take])
+        self._preds.append(y_pred[:take])
+        self._collected += take
+
+        # Once we've got enough, render & save
+        if self._collected >= self.max_samples:
+            # Concatenate buffers
+            imgs = torch.cat(self._images, dim=0)
+            gts  = torch.cat(self._gts,    dim=0)
+            preds= torch.cat(self._preds,  dim=0)
+
+            # Ensure directory exists
+            os.makedirs(self.log_dir, exist_ok=True)
+            filename = os.path.join(
+                self.log_dir,
+                f"pred_epoch_{trainer.current_epoch:06d}.png"
+            )
+
+            # Create grid
+            fig, axes = plt.subplots(
+                self.max_samples, 3,
+                figsize=(12, 4 * self.max_samples)
+            )
+
+            for i in range(self.max_samples):
+                # Input
+                ax = axes[i, 0]
+                if imgs.shape[1] == 1:
+                    ax.imshow(imgs[i, 0], cmap='gray')
+                else:
+                    im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
+                    ax.imshow(im)
+                ax.set_title('Input')
+                ax.axis('off')
+
+                # Ground truth
+                ax = axes[i, 1]
+                if gts.shape[1] == 1:
+                    ax.imshow(gts[i, 0], cmap='gray')
+                else:
+                    mask = torch.argmax(gts[i], dim=0)
+                    ax.imshow(mask, cmap='tab20')
+                ax.set_title('Ground Truth')
+                ax.axis('off')
+
+                # Prediction
+                ax = axes[i, 2]
+                if preds.shape[1] == 1:
+                    ax.imshow(preds[i, 0], cmap='gray')
+                else:
+                    pmask = torch.argmax(preds[i], dim=0)
+                    ax.imshow(pmask, cmap='tab20')
+                ax.set_title('Prediction')
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(filename, dpi=150)
+            plt.close(fig)
+
+            self.logger.info(f"Saved prediction visualization: {filename}")
+            self._logged_this_epoch = True
 
 
 class ConfigArchiver(Callback):

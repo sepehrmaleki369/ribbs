@@ -592,3 +592,27 @@ python train.py --config configs/main.yaml --resume outputs/experiment_1/checkpo
 ---
 
 This framework is designed to be modular and easily extensible. If you encounter any issues or have questions, please open an issue on GitHub.
+
+
+____
+# Share your Tensorboard
+```
+tensorboard --logdir path/to/logs --port 6006 # or any open port
+```
+
+```
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+chmod +x cloudflared
+```
+
+```
+./cloudflared tunnel --url http://localhost:6006
+```
+
+____
+# UserWarning
+Failed to load image Python extension: … undefined symbol: _XXXXX
+
+``` 
+sudo apt-get install libjpeg-dev libpng-dev
+```

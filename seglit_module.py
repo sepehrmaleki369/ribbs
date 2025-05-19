@@ -1,11 +1,4 @@
 # seglit_module.py
-"""
-SegLitModule: a PyTorch LightningModule for segmentation that
-  • uses dynamic batch‐dict keys for x/y,
-  • wraps all metrics in a ModuleDict so they get .to(device()) automatically,
-  • supports MixedLoss + chunked inference + PL schedulers.
-"""
-
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -27,7 +20,6 @@ class SegLitModule(pl.LightningModule):
         target_key: str = "label_patch",
     ):
         super().__init__()
-        # avoid dumping large modules into hparams.yaml
         self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
 
         self.model      = model
@@ -43,36 +35,56 @@ class SegLitModule(pl.LightningModule):
         return self.model(x)
 
     def on_train_epoch_start(self):
+        # update mixed-loss schedule
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
+        # reset torchmetrics states so train metrics are per-epoch
+        for m in self.metrics.values():
+            if hasattr(m, 'reset'):
+                m.reset()
 
     def training_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
-        self.log("train_loss", loss, prog_bar=True, on_epoch=True)
+
+        # log training loss (per epoch)
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+
+        # compute and log each metric on training data
+        y_int = y.long()
+        for name, metric in self.metrics.items():
+            train_val = metric(y_hat, y_int)
+            # torchmetrics often returns a tensor; log it directly
+            self.log(f"train_{name}", train_val,
+                     prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         return loss
+
+    def on_validation_epoch_start(self):
+        # reset metrics so val metrics are fresh each epoch
+        for m in self.metrics.values():
+            if hasattr(m, 'reset'):
+                m.reset()
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
-        # full‐res chunked inference
+        # full-res chunked inference
         y_hat = self.validator.run_chunked_inference(self.model, x)
 
         loss = self.loss_fn(y_hat, y)
-        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         y_int = y.long()
         for name, metric in self.metrics.items():
             val = metric(y_hat, y_int)
-            if isinstance(val, torch.Tensor):
-                val = val.detach()
-            self.log(f"val_{name}", val, prog_bar=True, on_epoch=True)
-
+            self.log(f"val_{name}", val,
+                     prog_bar=True, on_step=False, on_epoch=True)
         return {"predictions": y_hat, "val_loss": loss}
 
     def test_step(self, batch, batch_idx):
+        # reuse validation logic for test
         return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
@@ -87,7 +99,6 @@ class SegLitModule(pl.LightningModule):
         params = sched_cfg.get("params", {}).copy()
 
         if name == "ReduceLROnPlateau":
-            # extract monitor, leave other params (patience, factor, mode, min_lr)
             monitor = params.pop("monitor", "val_loss")
             SchedulerClass = getattr(torch.optim.lr_scheduler, name)
             scheduler = SchedulerClass(optimizer, **params)
@@ -98,7 +109,7 @@ class SegLitModule(pl.LightningModule):
                     "monitor": monitor,
                     "interval": "epoch",
                     "frequency": 1,
-                    "strict": False   # ← ignore missing val_loss early on
+                    "strict": False
                 }
             }
 
@@ -110,7 +121,6 @@ class SegLitModule(pl.LightningModule):
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
-        # generic scheduler
         SchedulerClass = getattr(torch.optim.lr_scheduler, name)
         scheduler = SchedulerClass(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
