@@ -5,20 +5,28 @@ SegLab is a flexible, modular framework for image segmentation experiments built
 
 ## Table of Contents
 
-- [Project Overview](#project-overview)
+- [Introduction](#introduction)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Getting Started](#getting-started)
-- [Implementing Custom Components](#implementing-custom-components)
-  - [Custom Models](#custom-models)
-  - [Custom Loss Functions](#custom-loss-functions)
-  - [Custom Metrics](#custom-metrics)
-- [Configuration](#configuration)
+- [Using Models](#using-models)
+  - [Built-in Models](#built-in-models)
+  - [Creating Custom Models](#creating-custom-models)
+- [Loss Functions](#loss-functions)
+  - [Built-in Losses](#built-in-losses)
+  - [Creating Custom Losses](#creating-custom-losses)
+  - [Mixed Losses](#mixed-losses)
+- [Metrics](#metrics)
+  - [Built-in Metrics](#built-in-metrics)
+  - [Creating Custom Metrics](#creating-custom-metrics)
+- [Configuration System](#configuration-system)
 - [Training and Evaluation](#training-and-evaluation)
-- [Resuming Training](#resuming-training)
+- [Monitoring with TensorBoard](#monitoring-with-tensorboard)
+  - [Sharing TensorBoard with Cloudflare](#sharing-tensorboard-with-cloudflare)
 - [Advanced Features](#advanced-features)
+- [Troubleshooting](#troubleshooting)
 
-## Project Overview
+## Introduction
 
 SegLab provides a unified, configuration-driven interface for image segmentation tasks. Key features include:
 
@@ -53,6 +61,7 @@ seglab/
 │   ├── checkpoint.py         # Checkpoint management
 │   └── utils.py              # Utility functions
 ├── models/                   # Model implementations
+│   ├── base_models.py        # Built-in model implementations
 │   ├── custom_model.py       # Example custom model
 │   └── ...                   # Your custom models
 ├── losses/                   # Loss implementations
@@ -122,477 +131,522 @@ nano configs/main.yaml  # Update dataset_config: "mydataset.yaml"
 python train.py --config configs/main.yaml
 ```
 
-## Implementing Custom Components
+## Using Models
 
-### Custom Models
+### Built-in Models
 
-SegLab makes it easy to implement custom segmentation models. Models should be defined as PyTorch modules that inherit from `nn.Module`.
+SegLab comes with several built-in models in `models/base_models.py`, including:
 
-1. Create a new Python file in the `models/` directory:
+1. **UNet**: Basic UNet architecture for semantic segmentation
+2. **UNetReg**: UNet variant for regression tasks
+3. **UNetBin**: UNet variant for binary segmentation
+
+To use a built-in model, create a model configuration file:
+
+```yaml
+# configs/model/unet_base.yaml
+# Path and class
+path: "models.base_models"  # Path to base_models.py
+class: "UNet"               # Model class name
+
+# Model parameters
+params:
+  in_channels: 3            # Number of input channels (RGB)
+  m_channels: 64            # Base number of channels
+  out_channels: 1           # Number of output channels (1 for binary)
+  n_convs: 2                # Number of convolutions per block
+  n_levels: 4               # Depth of the UNet
+  dropout: 0.2              # Dropout rate
+  batch_norm: true          # Use batch normalization
+  upsampling: "deconv"      # Type of upsampling ("deconv", "nearest", "bilinear")
+  pooling: "max"            # Type of pooling ("max", "avg")
+  three_dimensional: false  # 2D or 3D model
+```
+
+Then update your main configuration to use this model:
+
+```yaml
+# configs/main.yaml
+model_config: "unet_base.yaml"
+```
+
+### Creating Custom Models
+
+You can create your own custom models by:
+
+1. Creating a new Python file in the `models/` directory:
 
 ```python
-# models/my_custom_model.py
+# models/my_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MyCustomModel(nn.Module):
-    """
-    My custom segmentation model.
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 3,
-        out_channels: int = 1,
-        base_filters: int = 64,
-        depth: int = 5,
-        dropout: float = 0.2
-    ):
-        """
-        Initialize the custom model.
-        
-        Args:
-            in_channels: Number of input channels
-            out_channels: Number of output channels
-            base_filters: Initial number of filters
-            depth: Network depth (number of downsampling steps)
-            dropout: Dropout rate
-        """
+class MyCustomSegModel(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=64):
         super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, features, kernel_size=3, padding=1),
+            nn.BatchNorm2d(features),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(features, features*2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(features*2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
+        )
         
-        # Define your model architecture here
-        self.encoder_blocks = nn.ModuleList()
-        self.decoder_blocks = nn.ModuleList()
-        
-        # Example: initial block
-        self.initial_conv = nn.Conv2d(in_channels, base_filters, kernel_size=3, padding=1)
-        self.initial_bn = nn.BatchNorm2d(base_filters)
-        
-        # Encoder blocks
-        current_channels = base_filters
-        for i in range(depth):
-            # Add encoder blocks here
-            self.encoder_blocks.append(
-                nn.Sequential(
-                    nn.Conv2d(current_channels, current_channels * 2, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(current_channels * 2),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool2d(2)
-                )
-            )
-            current_channels *= 2
-            
-        # Decoder blocks
-        for i in range(depth):
-            # Add decoder blocks here
-            self.decoder_blocks.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(current_channels, current_channels // 2, kernel_size=2, stride=2),
-                    nn.Conv2d(current_channels // 2, current_channels // 2, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(current_channels // 2),
-                    nn.ReLU(inplace=True)
-                )
-            )
-            current_channels //= 2
-            
-        # Final layers
-        self.final_conv = nn.Conv2d(base_filters, out_channels, kernel_size=1)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(features*2, features, kernel_size=2, stride=2),
+            nn.Conv2d(features, features, kernel_size=3, padding=1),
+            nn.BatchNorm2d(features),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(features, features//2, kernel_size=2, stride=2),
+            nn.Conv2d(features//2, out_channels, kernel_size=1)
+        )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the model.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            Output tensor
-        """
-        # Initial block
-        x = F.relu(self.initial_bn(self.initial_conv(x)))
-        
-        # Encoder path with skip connections
-        skip_connections = []
-        for block in self.encoder_blocks:
-            skip_connections.append(x)
-            x = block(x)
-        
-        # Decoder path with skip connections
-        for i, block in enumerate(self.decoder_blocks):
-            x = block(x)
-            # Handle skip connections
-            skip = skip_connections[-(i+1)]
-            # Handle size mismatches if necessary
-            if x.shape != skip.shape:
-                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
-            x = x + skip  # Skip connection
-        
-        # Final layers
-        x = self.final_conv(x)
-        
-        return torch.sigmoid(x)  # Apply activation for segmentation
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return torch.sigmoid(x)  # For binary segmentation
 ```
 
-2. Create a configuration file for your model in `configs/model/`:
+2. Creating a configuration file for your model:
 
 ```yaml
 # configs/model/my_custom_model.yaml
-# Path and class
-path: "models.my_custom_model"  # Path to the module containing the model
-class: "MyCustomModel"          # Name of the model class
+path: "models.my_model"          # Path to your model file
+class: "MyCustomSegModel"        # Your model class name
 
-# Model parameters
 params:
-  in_channels: 3                # Number of input channels
-  out_channels: 1               # Number of output channels (1 for binary, >1 for multi-class)
-  base_filters: 64              # Initial number of filters
-  depth: 5                      # Network depth
-  dropout: 0.2                  # Dropout rate
+  in_channels: 3
+  out_channels: 1
+  features: 64
 ```
 
-3. Update the main configuration to use your model:
+3. Updating the main configuration to use your model:
 
 ```yaml
 # configs/main.yaml
-# ... other configuration options
-
-# Set model config to your custom model
 model_config: "my_custom_model.yaml"
-
-# ... rest of configuration
 ```
 
-### Custom Loss Functions
+## Loss Functions
 
-Implementing custom loss functions follows a similar pattern:
+### Built-in Losses
+
+SegLab supports all PyTorch built-in losses like BCE, MSE, etc., which can be directly referenced in the loss configuration:
+
+```yaml
+# configs/loss/bce_loss.yaml
+# Using built-in PyTorch loss
+primary_loss:
+  class: "BCELoss"  # PyTorch's built-in Binary Cross Entropy
+  params: {}
+
+secondary_loss: null
+alpha: 0.0
+start_epoch: 0
+```
+
+```yaml
+# configs/loss/weighted_bce_loss.yaml
+# Using built-in PyTorch loss with weights
+primary_loss:
+  class: "BCELoss"
+  params:
+    weight: [0.1, 0.9]  # Class weights for imbalanced datasets
+    reduction: "mean"
+
+secondary_loss: null
+alpha: 0.0
+start_epoch: 0
+```
+
+```yaml
+# configs/loss/mse_loss.yaml
+# Using built-in PyTorch MSE loss
+primary_loss:
+  class: "MSELoss"  # PyTorch's built-in Mean Squared Error
+  params: {}
+
+secondary_loss: null
+alpha: 0.0
+start_epoch: 0
+```
+
+### Creating Custom Losses
+
+To implement a custom loss function:
 
 1. Create a new Python file in the `losses/` directory:
 
 ```python
-# losses/my_custom_loss.py
+# losses/boundary_aware_loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MyCustomLoss(nn.Module):
+class BoundaryAwareLoss(nn.Module):
     """
-    Custom loss function for segmentation.
-    
-    Combines binary cross-entropy with a boundary-aware term.
+    Loss function that gives higher weight to boundary regions
     """
-    
-    def __init__(
-        self,
-        boundary_weight: float = 0.5,
-        smooth: float = 1e-5
-    ):
-        """
-        Initialize the custom loss.
-        
-        Args:
-            boundary_weight: Weight for the boundary component
-            smooth: Smoothing factor for numerical stability
-        """
+    def __init__(self, boundary_weight=5.0, smooth=1e-6):
         super().__init__()
         self.boundary_weight = boundary_weight
         self.smooth = smooth
-        self.bce_loss = nn.BCELoss()
-    
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the custom loss.
+        self.bce = nn.BCELoss(reduction='none')
         
-        Args:
-            y_pred: Predicted segmentation masks
-            y_true: Ground truth segmentation masks
-            
-        Returns:
-            Tensor containing the calculated loss
-        """
-        # Binary cross-entropy component
-        bce = self.bce_loss(y_pred, y_true)
+    def forward(self, y_pred, y_true):
+        # Basic BCE loss
+        bce_loss = self.bce(y_pred, y_true)
         
-        # Compute boundaries using simple edge detection
-        # For example, using a simple gradient-based approach
-        y_true_boundaries = self._compute_boundaries(y_true)
-        y_pred_boundaries = self._compute_boundaries(y_pred)
+        # Calculate boundary using morphological operations
+        # Simple approach: Dilated - Eroded = Boundary
+        kernel_size = 3
+        padding = kernel_size // 2
         
-        # Boundary loss component
-        boundary_loss = F.mse_loss(y_pred_boundaries, y_true_boundaries)
+        # Max pooling for dilation
+        pooled = F.max_pool2d(y_true, kernel_size=3, stride=1, padding=1)
+        # Min pooling for erosion (using 1-y_true trick)
+        eroded = 1 - F.max_pool2d(1 - y_true, kernel_size=3, stride=1, padding=1)
+        # Boundary mask
+        boundary = (pooled - eroded) > 0
         
-        # Combined loss
-        total_loss = (1 - self.boundary_weight) * bce + self.boundary_weight * boundary_loss
+        # Create weight map
+        weights = torch.ones_like(y_true)
+        weights[boundary] = self.boundary_weight
         
-        return total_loss
-    
-    def _compute_boundaries(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Extract boundaries from segmentation masks using gradients.
+        # Apply weights to BCE loss
+        weighted_loss = (bce_loss * weights).mean()
         
-        Args:
-            x: Input tensor
-            
-        Returns:
-            Tensor with highlighted boundaries
-        """
-        # Simple sobel-like edge detection
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                              dtype=torch.float32, device=x.device).reshape(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                              dtype=torch.float32, device=x.device).reshape(1, 1, 3, 3)
-        
-        if x.dim() == 4:  # (batch, channels, height, width)
-            # Process each channel separately
-            edges = []
-            for c in range(x.shape[1]):
-                # Extract channel
-                channel = x[:, c:c+1, :, :]
-                # Apply edge detection
-                grad_x = F.conv2d(channel, sobel_x, padding=1)
-                grad_y = F.conv2d(channel, sobel_y, padding=1)
-                # Compute magnitude
-                edge = torch.sqrt(grad_x**2 + grad_y**2 + self.smooth)
-                edges.append(edge)
-            # Combine edges from all channels
-            return torch.cat(edges, dim=1)
-        else:
-            # Apply directly if no channel dimension
-            grad_x = F.conv2d(x, sobel_x, padding=1)
-            grad_y = F.conv2d(x, sobel_y, padding=1)
-            return torch.sqrt(grad_x**2 + grad_y**2 + self.smooth)
+        return weighted_loss
 ```
 
-2. Create a configuration file for your loss in `configs/loss/`:
+2. Create a configuration file for your loss:
 
 ```yaml
-# configs/loss/my_custom_loss.yaml
-# Primary loss
+# configs/loss/boundary_aware.yaml
 primary_loss:
-  path: "losses.my_custom_loss"  # Path to the module containing the loss
-  class: "MyCustomLoss"          # Name of the loss class
+  path: "losses.boundary_aware_loss"  # Path to your loss module
+  class: "BoundaryAwareLoss"          # Loss class name
   params:
-    boundary_weight: 0.5         # Weight for the boundary component
-    smooth: 0.00001              # Smoothing factor
+    boundary_weight: 5.0              # Weight for boundary pixels
+    smooth: 0.000001                  # Numerical stability constant
 
-# Secondary loss (optional, can be null)
 secondary_loss: null
-
-# Mixing parameters (used only if secondary_loss is defined)
-alpha: 0.0                      # Weight for the secondary loss
-start_epoch: 0                  # Epoch to start using the secondary loss
+alpha: 0.0
+start_epoch: 0
 ```
 
-3. Update the main configuration to use your loss:
+3. Update your main configuration to use this loss:
 
 ```yaml
 # configs/main.yaml
-# ... other configuration options
-
-# Set loss config to your custom loss
-loss_config: "my_custom_loss.yaml"
-
-# ... rest of configuration
+loss_config: "boundary_aware.yaml"
 ```
 
-### Custom Metrics
+### Mixed Losses
 
-Implementing custom metrics follows the same pattern:
+SegLab supports combining multiple loss functions with different weights and activation epochs:
+
+```yaml
+# configs/loss/mixed_loss.yaml
+# Primary loss (used from the beginning)
+primary_loss:
+  class: "BCELoss"
+  params: {}
+
+# Secondary loss (activated after start_epoch)
+secondary_loss:
+  path: "losses.boundary_aware_loss"
+  class: "BoundaryAwareLoss"
+  params:
+    boundary_weight: 5.0
+    smooth: 0.000001
+
+# Mixing parameters
+alpha: 0.3          # Weight of secondary loss
+start_epoch: 10     # Epoch to start using the secondary loss
+```
+
+This configuration will use only `BCELoss` for the first 10 epochs, then gradually incorporate `BoundaryAwareLoss` with a 0.3 weight.
+
+## Metrics
+
+### Built-in Metrics
+
+SegLab comes with several built-in metrics and supports integration with `torchmetrics`:
+
+```yaml
+# configs/metrics/segmentation.yaml
+metrics:
+  # Dice coefficient
+  - alias: "dice"
+    path: "torchmetrics.classification"
+    class: "Dice"
+    params:
+      threshold: 0.5
+      zero_division: 1.0
+
+  # IoU (Jaccard index)
+  - alias: "iou"
+    path: "torchmetrics.classification"
+    class: "JaccardIndex"
+    params:
+      task: "binary"
+      threshold: 0.5
+      num_classes: 2
+
+  # Connected Components Quality
+  - alias: "ccq"
+    path: "metrics.connected_components"
+    class: "ConnectedComponentsQuality"
+    params:
+      min_size: 5
+      tolerance: 2
+```
+
+### Creating Custom Metrics
+
+To implement a custom metric:
 
 1. Create a new Python file in the `metrics/` directory:
 
 ```python
-# metrics/my_custom_metric.py
+# metrics/boundary_accuracy.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class MyCustomMetric(nn.Module):
+class BoundaryAccuracy(nn.Module):
     """
-    Custom metric for evaluating segmentation quality.
-    
-    This example implements a weighted F1 score with emphasis on boundary regions.
+    Metric that evaluates segmentation accuracy specifically at boundaries
     """
-    
-    def __init__(
-        self,
-        boundary_weight: float = 2.0,
-        eps: float = 1e-6
-    ):
-        """
-        Initialize the custom metric.
-        
-        Args:
-            boundary_weight: Weight multiplier for boundary pixels
-            eps: Small constant for numerical stability
-        """
+    def __init__(self, boundary_width=2, threshold=0.5):
         super().__init__()
-        self.boundary_weight = boundary_weight
-        self.eps = eps
-    
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the custom metric.
+        self.boundary_width = boundary_width
+        self.threshold = threshold
         
-        Args:
-            y_pred: Predicted segmentation masks (B, C, H, W)
-            y_true: Ground truth segmentation masks (B, C, H, W)
+    def forward(self, y_pred, y_true):
+        # Threshold predictions
+        y_pred_bin = (y_pred > self.threshold).float()
+        
+        # Find boundaries in the ground truth
+        kernel_size = self.boundary_width * 2 + 1
+        padding = kernel_size // 2
+        
+        # Dilated - Eroded = Boundary
+        dilated = F.max_pool2d(y_true, kernel_size=kernel_size, stride=1, padding=padding)
+        eroded = 1 - F.max_pool2d(1 - y_true, kernel_size=kernel_size, stride=1, padding=padding)
+        boundaries = (dilated - eroded) > 0
+        
+        # Accuracy at boundaries
+        correct = (y_pred_bin == y_true).float()
+        boundary_correct = correct * boundaries
+        
+        # Calculate accuracy
+        if torch.sum(boundaries) > 0:
+            accuracy = torch.sum(boundary_correct) / torch.sum(boundaries)
+        else:
+            accuracy = torch.tensor(1.0, device=y_pred.device)  # No boundaries
             
-        Returns:
-            Tensor containing the metric value (higher is better)
-        """
-        # Threshold predictions to get binary masks
-        y_pred_bin = (y_pred > 0.5).float()
-        
-        # Compute boundary weights
-        boundaries = self._detect_boundaries(y_true)
-        weights = 1.0 + (self.boundary_weight - 1.0) * boundaries
-        
-        # Compute weighted true positives, false positives, false negatives
-        tp = torch.sum(weights * y_pred_bin * y_true, dim=[1, 2, 3])
-        fp = torch.sum(weights * y_pred_bin * (1 - y_true), dim=[1, 2, 3])
-        fn = torch.sum(weights * (1 - y_pred_bin) * y_true, dim=[1, 2, 3])
-        
-        # Compute precision and recall
-        precision = tp / (tp + fp + self.eps)
-        recall = tp / (tp + fn + self.eps)
-        
-        # Compute F1 score
-        f1 = 2 * precision * recall / (precision + recall + self.eps)
-        
-        # Return batch average
-        return f1.mean()
-    
-    def _detect_boundaries(self, masks: torch.Tensor) -> torch.Tensor:
-        """
-        Detect boundary regions in masks.
-        
-        Args:
-            masks: Input segmentation masks
-            
-        Returns:
-            Tensor with 1s at boundary locations, 0s elsewhere
-        """
-        # Detect edges with simple morphological operations
-        # For example, using dilation and erosion to identify boundaries
-        b, c, h, w = masks.shape
-        
-        # Create kernels for morphological operations
-        kernel_size = 3
-        kernel = torch.ones(1, 1, kernel_size, kernel_size, device=masks.device)
-        
-        boundaries = torch.zeros_like(masks)
-        for i in range(b):
-            for j in range(c):
-                mask = masks[i, j:j+1]
-                # Dilate
-                dilated = torch.clamp(
-                    F.conv2d(mask, kernel, padding=kernel_size//2), 0, 1
-                )
-                # Erode
-                eroded = 1.0 - torch.clamp(
-                    F.conv2d(1.0 - mask, kernel, padding=kernel_size//2), 0, 1
-                )
-                # Boundary is difference between dilation and erosion
-                boundary = torch.clamp(dilated - eroded, 0, 1)
-                boundaries[i, j] = boundary
-        
-        return boundaries
+        return accuracy
 ```
 
-2. Update the metrics configuration to include your metric:
+2. Update your metrics configuration to include your new metric:
 
 ```yaml
 # configs/metrics/segmentation.yaml
-# List of metrics to evaluate
 metrics:
   # ... existing metrics
   
-  # Your custom metric
-  - alias: "custom_f1"  # Shorthand name for the metric
-    path: "metrics.my_custom_metric"
-    class: "MyCustomMetric"
+  # Custom boundary accuracy metric
+  - alias: "boundary_acc"
+    path: "metrics.boundary_accuracy"
+    class: "BoundaryAccuracy"
     params:
-      boundary_weight: 2.0
-      eps: 0.000001
+      boundary_width: 2
+      threshold: 0.5
 ```
 
-3. The metrics will automatically be loaded and used during validation and testing.
+3. Optionally set different frequencies for computing metrics:
 
-## Configuration
+```yaml
+# Per-metric frequencies for training
+train_frequencies:
+  dice: 1          # Compute every epoch
+  iou: 1           # Compute every epoch
+  boundary_acc: 5  # Compute every 5 epochs (if expensive)
+
+# Per-metric frequencies for validation
+val_frequencies:
+  dice: 1
+  iou: 1
+  boundary_acc: 2  # Compute every 2 validation runs
+```
+
+## Configuration System
 
 SegLab uses a hierarchical configuration system with YAML files:
 
-1. **Main configuration** (`configs/main.yaml`): References all sub-configs and sets high-level parameters:
-   - Output directory
-   - Trainer settings (epochs, validation frequency)
-   - Optimizer configuration
+1. **Main configuration** (`configs/main.yaml`): References all sub-configs and sets high-level parameters
 
-2. **Dataset configuration** (`configs/dataset/*.yaml`): Defines the dataset details:
-   - Paths to data
-   - Batch sizes
-   - Augmentation settings
-   - Patch size and sampling strategy
+```yaml
+# Main configuration file
+dataset_config: "massroads.yaml"
+model_config: "unet_base.yaml"
+loss_config: "mixed_loss.yaml"
+metrics_config: "segmentation.yaml"
+inference_config: "chunk.yaml"
 
-3. **Model configuration** (`configs/model/*.yaml`): Specifies the model architecture:
-   - Path to the model module
-   - Class name
-   - Model-specific parameters
+# Output directory
+output_dir: "outputs/experiment_1"
 
-4. **Loss configuration** (`configs/loss/*.yaml`): Defines the loss function(s):
-   - Primary loss
-   - Optional secondary loss
-   - Mixing parameters
+# Trainer configuration
+trainer:
+  max_epochs: 100
+  val_check_interval: 1.0
+  skip_validation_until_epoch: 5
+  val_every_n_epochs: 1
+  log_every_n_epochs: 2
 
-5. **Metrics configuration** (`configs/metrics/*.yaml`): Lists evaluation metrics:
-   - Metric aliases
-   - Paths to metric implementations
-   - Metric parameters
+# Optimizer configuration
+optimizer:
+  name: "Adam"
+  params:
+    lr: 0.001
+    weight_decay: 0.0001
+  
+  # Optional learning rate scheduler
+  scheduler:
+    name: "ReduceLROnPlateau"
+    params:
+      patience: 10
+      factor: 0.5
+      monitor: "val_loss"
+      mode: "min"
+      min_lr: 0.00001
 
-6. **Inference configuration** (`configs/inference/*.yaml`): Configures inference:
-   - Patch size for validation/testing
-   - Patch margin
-   - Test-time augmentation settings
+# Input/output keys for dynamic dataset access
+target_x: "image_patch"
+target_y: "label_patch"
+```
+
+2. Create configuration files for each component (dataset, model, loss, metrics) as described in the previous sections.
 
 ## Training and Evaluation
 
-Basic training with the framework:
+Basic training commands:
 
 ```bash
-# Start training with default main config
+# Start training with the main config
 python train.py --config configs/main.yaml
 
-# Use a different main config
-python train.py --config configs/my_experiment.yaml
+# Resume training from a checkpoint
+python train.py --config configs/main.yaml --resume outputs/experiment_1/checkpoints/last.ckpt
 
 # Run testing on the best checkpoint
 python train.py --config configs/main.yaml --test
 ```
 
-## Resuming Training
+## Monitoring with TensorBoard
 
-Resume training from a checkpoint:
+SegLab automatically logs metrics, loss values, and sample visualizations to TensorBoard. To view the logs:
 
 ```bash
-# Resume from the last checkpoint
-python train.py --config configs/main.yaml --resume outputs/experiment_1/checkpoints/last.ckpt
+# Launch TensorBoard
+tensorboard --logdir outputs/experiment_1/logs --port 6006
 
-# Resume from a specific metric checkpoint
-python train.py --config configs/main.yaml --resume outputs/experiment_1/checkpoints/best_dice.ckpt
+# Open your browser at http://localhost:6006
 ```
+
+### Sharing TensorBoard with Cloudflare
+
+To share your TensorBoard with others (especially useful for remote servers), you can use Cloudflare:
+
+1. Install Cloudflared:
+```bash
+# Download Cloudflared
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+chmod +x cloudflared
+```
+
+2. Create a tunnel to your TensorBoard:
+```bash
+# Make sure TensorBoard is running
+tensorboard --logdir outputs/experiment_1/logs --port 6006
+
+# In a new terminal, create the tunnel
+./cloudflared tunnel --url http://localhost:6006
+```
+
+3. Cloudflare will provide a public URL that you can share with others. This URL will be displayed in the terminal after running the command.
 
 ## Advanced Features
 
-1. **Chunked inference**: Process large images in overlapping patches
-2. **Mixed precision training**: Speed up training with automatic mixed precision
-3. **Learning rate scheduling**: Configure various learning rate schedules
-4. **Distributed training**: Automatic multi-GPU training support
-5. **TensorBoard integration**: Visualize training progress, metrics, and predictions
-6. **Flexible checkpoint management**: Save best checkpoints for each metric
+SegLab includes several advanced features:
+
+1. **Chunked Inference**: Process large images by splitting them into overlapping patches
+   ```yaml
+   # configs/inference/chunk.yaml
+   patch_size: [512, 512]  # Process images in 512x512 patches
+   patch_margin: [64, 64]  # With 64-pixel overlap
+   ```
+
+2. **Selective Metric Calculation**: Control which metrics are calculated and when
+   ```yaml
+   # Apply in configs/metrics/segmentation.yaml
+   train_frequencies:
+     dice: 1    # Calculate every epoch
+     iou: 1     # Calculate every epoch
+     apls: 10   # Calculate every 10 epochs (expensive metric)
+   ```
+
+3. **Mixed Precision Training**: Enable via trainer config
+   ```yaml
+   # In configs/main.yaml
+   trainer:
+     # ...
+     extra_args:
+       precision: 16  # Enable mixed precision training
+   ```
+
+4. **Gradient Accumulation**: For training with effective larger batch sizes
+   ```yaml
+   # In configs/main.yaml
+   trainer:
+     # ...
+     extra_args:
+       accumulate_grad_batches: 4  # Accumulate gradients over 4 batches
+   ```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Image loading issues with libjpeg/libpng**:
+   If you encounter `UserWarning: Failed to load image Python extension: … undefined symbol: _XXXXX`, install the required libraries:
+   ```bash
+   sudo apt-get install libjpeg-dev libpng-dev
+   ```
+
+2. **CUDA out of memory**:
+   - Reduce batch size in your dataset configuration
+   - Use chunked inference with smaller patch sizes
+   - Enable mixed precision training (precision: 16)
+
+3. **Input size validation errors**:
+   The UNet models require input dimensions to be divisible by 2^(n_levels+1). If you encounter an error, adjust your patch size or model depth.
+
+4. **Slow metric calculation**:
+   Use the `train_frequencies` and `val_frequencies` settings to calculate expensive metrics less frequently.
+
+For more help, check the framework documentation or open an issue on the GitHub repository.
 
 ---
 
-This framework is designed to be modular and easily extensible. If you encounter any issues or have questions, please open an issue on GitHub.
-
+This framework is designed to be modular and easily extensible. If you have specific requirements or encounter any issues, please open an issue on GitHub.
 
 ____
 # Share your Tensorboard
@@ -609,7 +663,7 @@ chmod +x cloudflared
 ./cloudflared tunnel --url http://localhost:6006
 ```
 
-____
+
 # UserWarning
 Failed to load image Python extension: … undefined symbol: _XXXXX
 
