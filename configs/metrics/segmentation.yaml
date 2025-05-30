@@ -32,20 +32,22 @@ metrics:
     path: "metrics.apls"
     class: "APLS"
     params:
-      min_segment_length: 10
-      max_nodes: 500
-      sampling_ratio: 0.1
+      angle_range: [175, 185]
+      max_nodes: 1000
+      max_snap_dist: 25
+      allow_renaming: true
+      min_path_length: 10
 
 # Per-metric frequencies for training - how often to compute each metric
 train_frequencies:
   dice: 1    # Compute every epoch (lightweight metric)
   iou: 1     # Compute every epoch (lightweight metric)
-  ccq: 10    # Compute every 10 epochs (moderately expensive)
-  apls: 25   # Compute every 25 epochs (very computationally expensive)
+  ccq: 1    # Compute every 10 epochs (moderately expensive)
+  apls: 1   # Compute every 25 epochs (very computationally expensive)
 
 # Per-metric frequencies for validation - how often to compute each metric
 val_frequencies:
   dice: 1    # Compute every epoch
   iou: 1     # Compute every epoch
-  ccq: 5     # Compute every 5 epochs
-  apls: 10   # Compute every 10 epochs
+  ccq: 1     # Compute every 5 epochs
+  apls: 1   # Compute every 10 epochs

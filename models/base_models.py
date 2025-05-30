@@ -120,7 +120,7 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='deconv',
+                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
                  pooling="max", three_dimensional=False):
         super().__init__()
 
@@ -198,7 +198,7 @@ class UNet(nn.Module):
 
 class UNetReg(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=1, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='deconv',
+                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
                  pooling="max", three_dimensional=False):
         super().__init__()
 
@@ -278,7 +278,7 @@ class UNetReg(nn.Module):
 
 class UNetBin(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='deconv',
+                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
                  pooling="max", three_dimensional=False):
         super().__init__()
 

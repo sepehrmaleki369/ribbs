@@ -5,15 +5,15 @@ primary_loss:
   class: "BCELoss"  # Built-in PyTorch loss
   params: {}
 
-# Secondary loss (activated after start_epoch)
-secondary_loss:
-  path: "losses.custom_loss"  # Path to the module containing the loss
-  class: "TopologicalLoss"  # Name of the loss class
-  params:
-    topo_weight: 0.5  # Weight for the topological component
-    smoothness: 1.0  # Smoothness parameter for gradient computation
-    connectivity_weight: 0.3  # Weight for the connectivity component
+# # Secondary loss (activated after start_epoch)
+# secondary_loss:
+#   path: "losses.custom_loss"  # Path to the module containing the loss
+#   class: "TopologicalLoss"  # Name of the loss class
+#   params:
+#     topo_weight: 0.5  # Weight for the topological component
+#     smoothness: 1.0  # Smoothness parameter for gradient computation
+#     connectivity_weight: 0.3  # Weight for the connectivity component
 
-# Mixing parameters
-alpha: 0.4  # Weight for the secondary loss (0 to 1)
-start_epoch: 10  # Epoch to start using the secondary loss
+# # Mixing parameters
+# alpha: 0.4  # Weight for the secondary loss (0 to 1)
+# start_epoch: 10  # Epoch to start using the secondary loss

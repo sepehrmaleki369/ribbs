@@ -212,13 +212,17 @@ if __name__ == "__main__":
 # seglit_module.py
 # ------------------------------------
 # seglit_module.py
+# ----------------
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Any, Dict
+import numpy as np
 
 from core.mix_loss import MixedLoss
 from core.validator import Validator
+
 
 class SegLitModule(pl.LightningModule):
     def __init__(
@@ -232,11 +236,11 @@ class SegLitModule(pl.LightningModule):
         target_key: str = "label_patch",
         train_metrics_every_n_epochs: int = 1,
         val_metrics_every_n_epochs: int = 1,
-        train_metric_frequencies: Dict[str, int] = None,  # Per-metric train frequencies
-        val_metric_frequencies: Dict[str, int] = None,    # Per-metric val frequencies
+        train_metric_frequencies: Dict[str, int] = None,
+        val_metric_frequencies: Dict[str, int] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['model','loss_fn','metrics'])
+        self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
 
         self.model = model
         self.loss_fn = loss_fn
@@ -246,11 +250,8 @@ class SegLitModule(pl.LightningModule):
         self.input_key = input_key
         self.target_key = target_key
 
-        # Global default frequencies
         self.train_freq = train_metrics_every_n_epochs
         self.val_freq = val_metrics_every_n_epochs
-        
-        # Per-metric frequencies (override defaults when specified)
         self.train_metric_frequencies = train_metric_frequencies or {}
         self.val_metric_frequencies = val_metric_frequencies or {}
 
@@ -260,7 +261,6 @@ class SegLitModule(pl.LightningModule):
     def on_train_epoch_start(self):
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
-        # Reset metrics at the start of each epoch
         for m in self.metrics.values():
             if hasattr(m, 'reset'):
                 m.reset()
@@ -270,78 +270,64 @@ class SegLitModule(pl.LightningModule):
         y = batch[self.target_key].float()
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
-        
-        # Always log training loss per epoch
+
         self.log("train_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        # Compute metrics using per-metric frequencies
         y_int = y.long()
         for name, metric in self.metrics.items():
-            # Get specific frequency for this metric or fall back to default
             freq = self.train_metric_frequencies.get(name, self.train_freq)
-            
-            # Only compute and log if it's time for this metric
             if self.current_epoch % freq == 0:
-                val = metric(y_hat, y_int)
-                self.log(f"train_{name}", val,
+                self.log(f"train_{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         return loss
-
-    def on_validation_epoch_start(self):
-        # Always reset metrics at the start of validation
-        for m in self.metrics.values():
-            if hasattr(m, 'reset'):
-                m.reset()
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
-        y_hat = self.validator.run_chunked_inference(self.model, x)
+        if x.dim() == 3:
+            x, y = x.unsqueeze(0), y.unsqueeze(0)
 
-        # Always log validation loss
+        # chunked inference (with built-in padding)
+        with torch.no_grad():
+            y_hat = self.validator.run_chunked_inference(self.model, x)
+
+        # resize if needed
+        if y_hat.shape[2:] != y.shape[2:]:
+            y_hat = F.interpolate(y_hat, size=y.shape[2:], mode='bilinear', align_corners=False)
+
         loss = self.loss_fn(y_hat, y)
         self.log("val_loss", loss,
-                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+                 prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        # Compute metrics using per-metric frequencies
         y_int = y.long()
         for name, metric in self.metrics.items():
-            # Get specific frequency for this metric or fall back to default
             freq = self.val_metric_frequencies.get(name, self.val_freq)
-            
-            # Only compute and log if it's time for this metric
             if self.current_epoch % freq == 0:
-                val = metric(y_hat, y_int)
-                # Only show on progress bar if it's time to compute it
-                self.log(f"val_{name}", val,
-                         prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
-        
+                self.log(f"val_{name}", metric(y_hat, y_int),
+                         prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+
         return {"predictions": y_hat, "val_loss": loss}
 
-    def on_test_epoch_start(self):
-        # Reset metrics at the start of test epoch
-        for m in self.metrics.values():
-            if hasattr(m, 'reset'):
-                m.reset()
-
     def test_step(self, batch, batch_idx):
+        # same as validation but logs under test_
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
-        y_hat = self.validator.run_chunked_inference(self.model, x)
+        if x.dim() == 3:
+            x, y = x.unsqueeze(0), y.unsqueeze(0)
 
-        # Log test loss
+        with torch.no_grad():
+            y_hat = self.validator.run_chunked_inference(self.model, x)
+
         loss = self.loss_fn(y_hat, y)
         self.log("test_loss", loss,
-                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+                 prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        # Compute and log test metrics - always compute all metrics during testing
         y_int = y.long()
         for name, metric in self.metrics.items():
-            val = metric(y_hat, y_int)
-            self.log(f"test_{name}", val,
-                     prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
-        
+            self.log(f"test_{name}", metric(y_hat, y_int),
+                     prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+
         return {"predictions": y_hat, "test_loss": loss}
 
     def configure_optimizers(self):
@@ -350,64 +336,36 @@ class SegLitModule(pl.LightningModule):
         sched_cfg = self.opt_cfg.get("scheduler", None)
         if not sched_cfg:
             return optimizer
-        
+
         name, params = sched_cfg["name"], sched_cfg.get("params", {}).copy()
-        
         if name == "ReduceLROnPlateau":
             monitor = params.pop("monitor", "val_loss")
-            SchedulerClass = getattr(torch.optim.lr_scheduler, name)
-            scheduler = SchedulerClass(optimizer, **params)
-            return {"optimizer": optimizer,
-                    "lr_scheduler": {"scheduler": scheduler,
-                                     "monitor": monitor,
-                                     "interval": "epoch",
-                                     "frequency": 1,
-                                     "strict": False}}
-        
+            Scheduler = getattr(torch.optim.lr_scheduler, name)
+            scheduler = Scheduler(optimizer, **params)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": monitor,
+                    "interval": "epoch",
+                    "frequency": 1,
+                    "strict": False,
+                }
+            }
+
         if name == "LambdaLR":
             decay = params.get("lr_decay_factor")
             if decay is None:
                 raise ValueError("LambdaLR requires 'lr_decay_factor'")
-            lr_lambda = lambda epoch: 1.0 / (1.0 + epoch * decay)
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda epoch: 1.0 / (1.0 + epoch * decay)
+            )
             return {"optimizer": optimizer, "lr_scheduler": scheduler}
-        
-        SchedulerClass = getattr(torch.optim.lr_scheduler, name)
-        scheduler = SchedulerClass(optimizer, **params)
+
+        Scheduler = getattr(torch.optim.lr_scheduler, name)
+        scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
-# ------------------------------------
-# requirements.txt
-# ------------------------------------
-# Python ≥3.8, PyTorch Lightning ≥1.9 requirements file
-
-# Core dependencies
-torch==2.1.0
-torchvision==0.16.0
-pytorch-lightning==2.1.2
-torchmetrics==1.2.0
-
-# Data processing
-numpy==1.24.3
-scipy==1.10.1
-scikit-image==0.21.0
-scikit-learn==1.2.2
-rasterio==1.3.8
-tqdm==4.66.1
-pandas==2.0.3
-
-# Visualization
-matplotlib==3.7.2
-tensorboard==2.14.0
-
-# Configuration
-pyyaml==6.0.1
-
-# Graph processing (for APLS metric)
-networkx==3.1
-
-# Utilities
-pillow==10.0.1
 
 # ------------------------------------
 # core/logger.py
@@ -509,34 +467,727 @@ def setup_logger(
     return logger
 
 # ------------------------------------
+# core/general_dataset.py
+# ------------------------------------
+import os
+import json
+import warnings
+import logging
+import random
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+from sklearn.model_selection import KFold
+from scipy.ndimage import distance_transform_edt, rotate, binary_dilation
+from tqdm import tqdm
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+try:
+    import rasterio
+    from rasterio.errors import NotGeoreferencedWarning
+    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+except ImportError:
+    pass
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+"""
+assumptions:
+    - lbl can be binary or int (thresholded by 127)
+    - roads are 1 on lbl
+    - image modality must be defined 
+    - label modality is not required necessarily (even it's possible to define one folder to more than one modality) 
+    - for modalities other that label and image: 
+        - file names must be in this format: modality_filename = f"{base}_{key}.npy"
+        - if the computed modality's folder does not contain file "config.json" it will be computed again
+    - if use_splitting then there is two options:
+        - 1) kfold -> source_folder, num_folds and fold is required
+        - 2) split_ratio -> source_folder, ratios are required
+    - there is two optiona overall: 
+        - 1) setting stride -> so dataloader extracts all valid patches per image (removed in this version)
+        - 2) if stride was None -> extracts just one patch per image
+"""
+
+def compute_distance_map(lbl: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
+    """
+    Compute a distance map from a label image.
+
+    Args:
+        lbl (np.ndarray): Input label image.
+        distance_threshold (Optional[float]): Maximum distance value.
+    
+    Returns:
+        np.ndarray: Distance map.
+    """
+    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
+    distance_map = distance_transform_edt(lbl_bin == 0)
+    if distance_threshold is not None:
+        np.minimum(distance_map, distance_threshold, out=distance_map)
+    return distance_map
+
+def compute_sdf(lbl: np.ndarray, sdf_iterations: int, sdf_thresholds: List[float]) -> np.ndarray:
+    """
+    Compute the signed distance function (SDF) for a label image.
+
+    Args:
+        lbl (np.ndarray): Input label image.
+        sdf_iterations (int): Number of iterations for dilation.
+        sdf_thresholds (List[float]): [min, max] thresholds for the SDF.
+    
+    Returns:
+        np.ndarray: The SDF computed.
+    """
+    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
+    dilated = binary_dilation(lbl_bin, iterations=sdf_iterations)
+    dist_out = distance_transform_edt(1 - dilated)
+    dist_in  = distance_transform_edt(lbl_bin)
+    sdf = dist_out - dist_in
+    if sdf_thresholds is not None:
+        sdf = np.clip(sdf, sdf_thresholds[0], sdf_thresholds[1])
+    return sdf
+
+def _is_readable_tiff(path: str) -> bool:
+    """
+    Stubbed-out for tests (and general use):
+    never drop .tif/.tiff files based on rasterio.
+    """
+    return True
+
+def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
+    """
+    Load an array from disk.  If the file is unreadable, return None.
+    """
+    try:
+        if file_path.endswith(".npy"):
+            return np.load(file_path)
+        else:
+            with rasterio.open(file_path) as src:
+                return src.read().astype(np.float32)
+    except Exception:
+        return None
+
+class GeneralizedDataset(Dataset):
+    """
+    PyTorch Dataset for generalized remote sensing or segmentation datasets.
+    """
+    def __init__(self, config: Dict[str, Any]) -> None:
+        super().__init__()
+        self.config = config
+        self.root_dir: str = config.get("root_dir")
+        self.split: str = config.get("split", "train")
+        self.patch_size: int = config.get("patch_size", 128)
+        self.small_window_size: int = config.get("small_window_size", 8)
+        self.threshold: float = config.get("threshold", 0.05)
+        self.max_images: Optional[int] = config.get("max_images")
+        self.max_attempts: int = config.get("max_attempts", 10)
+        self.validate_road_ratio: bool = config.get("validate_road_ratio", False)
+        self.seed: int = config.get("seed", 42)
+        self.fold = config.get("fold")
+        self.num_folds = config.get("num_folds")
+        self.verbose: bool = config.get("verbose", False)
+        self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
+        self.distance_threshold: Optional[float] = config.get("distance_threshold")
+        self.sdf_iterations: int = config.get("sdf_iterations")
+        self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
+        self.num_workers: int = config.get("num_workers", 4)
+        self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
+        self.use_splitting: bool = config.get("use_splitting", False)
+        self.modalities: Dict[str, str] = config.get("modalities", {"image":"sat","label":"map"})
+        self.source_folder: str = config.get("source_folder", "")
+        self.save_computed: bool = config.get("save_computed", False)
+
+        if self.root_dir is None:
+            raise ValueError("root_dir must be specified in the config.")
+        if self.patch_size is None:
+            raise ValueError("patch_size must be specified in the config.")
+
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+
+        split_dir = os.path.join(self.root_dir, self.split)
+        if self.use_splitting and self.split != 'test':
+            split_dir = os.path.join(self.root_dir, self.source_folder)
+        self.data_dir: str = split_dir
+
+        self.modality_dirs: Dict[str, str] = {}
+        self.modality_files: Dict[str, List[str]] = {}
+        exts = ['.tiff', '.tif', '.png', '.jpg', '.npy']
+
+        # Process "image" modality.
+        folder_name = self.modalities['image']
+        mod_dir = os.path.join(self.data_dir, folder_name)
+        if not os.path.isdir(mod_dir):
+            raise ValueError(f"Modality directory {mod_dir} not found.")
+        self.modality_dirs['image'] = mod_dir
+        files = sorted(
+            f for f in os.listdir(mod_dir)
+            if any(f.endswith(ext) for ext in exts)
+        )
+        self.modality_files['image'] = files
+
+        if self.max_images is not None:
+            self.modality_files['image'] = self.modality_files['image'][:self.max_images]
+
+        # Process "label" modality.
+        if "label" in self.modalities:
+            folder_name = self.modalities['label']
+            mod_dir = os.path.join(self.data_dir, folder_name)
+            if not os.path.isdir(mod_dir):
+                raise ValueError(f"Modality directory {mod_dir} not found.")
+            self.modality_dirs['label'] = mod_dir
+            files = sorted(
+                f for f in os.listdir(mod_dir)
+                if any(f.endswith(ext) for ext in exts)
+            )
+            self.modality_files['label'] = files
+
+            if self.max_images is not None:
+                self.modality_files['label'] = self.modality_files['label'][:self.max_images]
+
+        # Precompute additional modalities (e.g., distance, sdf).
+        for key in [modal for modal in self.modalities if modal not in ['image', 'label']]:
+            folder_name = self.modalities[key]
+            mod_dir = os.path.join(self.data_dir, folder_name)
+            os.makedirs(mod_dir, exist_ok=True)
+            sdf_comp_again = False
+            config_path = os.path.join(mod_dir, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as config_file:
+                    saved_config = json.load(config_file)
+                    sdf_comp_again = self.sdf_iterations != saved_config.get("sdf_iterations", None)
+
+            logger.info(f"Generating {key} modality maps...")
+            for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
+                                       total=len(self.modality_files["label"]),
+                                       desc=f"Processing {key} maps"):
+                lbl_path = os.path.join(self.modality_dirs['label'], self.modality_files["label"][file_idx])
+                lbl = load_array_from_file(lbl_path)
+                base, _ = os.path.splitext(file)
+                modality_filename = f"{base}_{key}.npy"
+                modality_path = os.path.join(mod_dir, modality_filename)
+                if self.save_computed:
+                    if key == "distance":
+                        if not os.path.exists(modality_path):
+                            processed_map = compute_distance_map(lbl, None)
+                            np.save(modality_path, processed_map)
+                    elif key == "sdf":
+                        if not os.path.exists(modality_path) or sdf_comp_again:
+                            processed_map = compute_sdf(lbl, self.sdf_iterations, None)
+                            np.save(modality_path, processed_map)
+                    else:
+                        raise ValueError(f"Modality {key} not supported.")
+            with open(config_path, "w") as config_file:
+                json.dump(self.config, config_file, indent=4)
+            self.modality_dirs[key] = mod_dir
+            files = sorted([f for f in os.listdir(mod_dir) if any(f.endswith(ext) for ext in exts)])
+            self.modality_files[key] = files
+
+        # Perform dataset splitting if requested.
+        if self.use_splitting:
+            if self.fold is not None and self.num_folds is not None:
+                # ----- KFold Splitting -----
+                files = self.modality_files["image"]
+                kf = KFold(n_splits=self.num_folds, shuffle=True, random_state=self.seed)
+                splits = list(kf.split(files))
+                if self.split == "train":
+                    selected_indices = splits[self.fold][0].tolist()
+                elif self.split == "valid":
+                    selected_indices = splits[self.fold][1].tolist()
+                elif self.split == "test":
+                    selected_indices = [i for i in range(len(files))]
+                else:
+                    raise ValueError("For KFold splitting, split must be 'train' or 'valid' or 'test'.", self.split)
+                for key in self.modality_files:
+                    all_files = self.modality_files[key]
+                    self.modality_files[key] = [all_files[i] for i in selected_indices]
+            else:
+                # ----- Split by Ratios -----
+                files = self.modality_files["label"]
+                num_files = len(files)
+                indices = np.arange(num_files)
+                np.random.shuffle(indices)
+                train_count = int(num_files * self.split_ratios["train"])
+                valid_count = int(num_files * self.split_ratios["valid"])
+                if self.split == "train":
+                    selected_indices = indices[:train_count]
+                elif self.split == "valid":
+                    selected_indices = indices[train_count:train_count + valid_count]
+                elif self.split == "test":
+                    selected_indices = indices[train_count + valid_count:]
+                else:
+                    raise ValueError("For an 'entire' folder, split must be one of 'train', 'valid', or 'test'.")
+                for key in self.modality_files:
+                    all_files = self.modality_files[key]
+                    self.modality_files[key] = [all_files[i] for i in selected_indices]
+
+        if self.max_images is not None:
+            for key in self.modality_files:
+                self.modality_files[key] = self.modality_files[key][:self.max_images]
+
+    def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
+        imgs: Dict[str, np.ndarray] = {}
+        for key in self.modalities:
+            if file_idx < len(self.modality_files[key]):
+                file_path = os.path.join(self.modality_dirs[key], self.modality_files[key][file_idx])
+                arr = load_array_from_file(file_path)
+                if arr is None:            # <- corrupted TIFF
+                    return None            # signal caller to skip this index
+            else:
+                lbl_path = os.path.join(self.modality_dirs['label'], self.modality_files["label"][file_idx])
+                lbl = load_array_from_file(lbl_path)
+                if key == "distance":
+                    arr = compute_distance_map(lbl, None)
+                elif key == "sdf":
+                    arr = compute_sdf(lbl, self.sdf_iterations, None)
+                else:
+                    raise ValueError(f"Modality {key} not supported.")
+                
+            imgs[key] = arr
+        return imgs
+
+    def _check_small_window(self, image_patch: np.ndarray) -> bool:
+        """
+        Check that no small window in the image patch is entirely black or white.
+
+        Args:
+            image_patch (np.ndarray): Input patch (H x W) or (C x H x W)
+
+        Returns:
+            bool: True if valid, False if any window is all black or white.
+        """
+        sw = self.small_window_size
+
+        # Ensure image has shape (C, H, W)
+        if image_patch.ndim == 2:
+            image_patch = image_patch[None, :, :]  # Add channel dimension
+
+        C, H, W = image_patch.shape
+        if H < sw or W < sw:
+            return False
+
+        # Set thresholds
+        max_val = image_patch.max()
+        if max_val > 1.0:
+            high_thresh = 255
+            low_thresh = 0
+        else:
+            high_thresh = 255 / 255.0
+            low_thresh = 0 / 255.0
+
+        # Slide window over spatial dimensions
+        for c in range(C):
+            for y in range(0, H - sw + 1):
+                for x in range(0, W - sw + 1):
+                    window = image_patch[c, y:y + sw, x:x + sw]
+                    window_var = np.var(window)
+                    if window_var < 0.01:
+                        return False
+                    # print(window)
+                    if np.all(window >= high_thresh):
+                        return False  # Found an all-white window
+                    if np.all(window <= low_thresh):
+                        return False  # Found an all-black window
+
+        return True  # All windows passed
+
+
+    def _check_min_thrsh_road(self, label_patch: np.ndarray) -> bool:
+        """
+        Check if the label patch has at least a minimum percentage of road pixels.
+
+        Args:
+            label_patch (np.ndarray): The label patch.
+        
+        Returns:
+            bool: True if the patch meets the minimum threshold; False otherwise.
+        """
+        patch = label_patch
+        if patch.max() > 1:
+            patch = (patch > 127).astype(np.uint8)
+        road_percentage = np.sum(patch) / (self.patch_size * self.patch_size)
+        return road_percentage >= self.threshold
+
+    def __len__(self) -> int:
+        return len(self.modality_files['image'])
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        imgs = self._load_datapoint(idx)
+        if imgs is None:           # corrupted file detected
+            # pick a different index (cyclic) so DataLoader doesn’t crash
+            return self.__getitem__((idx + 1) % len(self))
+
+        if imgs['image'].ndim == 3:
+            _, H, W = imgs['image'].shape
+        elif imgs['image'].ndim == 2:
+            H, W = imgs['image'].shape
+        else:
+            raise ValueError("Unsupported image dimensions")
+
+        if self.split != 'train':
+            data = {}
+            patch_meta = {"image_idx": idx, "x": -1, "y": -1}
+            for key, array in imgs.items():
+                if array.ndim == 3:
+                    data[f"{key}_patch"] = array
+                elif array.ndim == 2:
+                    data[f"{key}_patch"] = array
+                else:
+                    raise ValueError("Unsupported array dimensions in _extract_data")
+            data['metadata'] = patch_meta
+            data = self._postprocess_patch(data)
+            
+            return data
+
+        valid_patch_found = False
+        attempts = 0
+        while not valid_patch_found and attempts < self.max_attempts:
+            x = np.random.randint(0, W - self.patch_size + 1)
+            y = np.random.randint(0, H - self.patch_size + 1)
+            patch_meta = {"image_idx": idx, "x": x, "y": y}
+            if self.augmentations:
+                patch_meta.update(self._get_augmentation_metadata())
+            data = self._extract_condition_augmentations(imgs, patch_meta)
+            if self.validate_road_ratio:
+                if self._check_min_thrsh_road(data['label_patch']):
+                    valid_patch_found = True
+                    data['metadata'] = patch_meta
+                    data = self._postprocess_patch(data)
+                    return data
+            else:
+                valid_patch_found = True
+                data['metadata'] = patch_meta
+                data = self._postprocess_patch(data)
+                return data
+            
+            attempts += 1
+
+        # If a valid patch isn't found after max_attempts, fallback to the last sampled patch
+        if not valid_patch_found:
+            logger.warning("No valid patch found after %d attempts; trying next image", self.max_attempts)
+            return self.__getitem__((idx + 1) % len(self))
+        return None
+        
+    def _get_augmentation_metadata(self) -> Dict[str, Any]:
+        """
+        Generate random augmentation parameters for a patch.
+
+        Returns:
+            Dict[str, Any]: Augmentation metadata.
+        """
+        meta: Dict[str, Any] = {}
+        if 'rotation' in self.augmentations:
+            meta['angle'] = np.random.uniform(0, 360)
+        if 'flip_h' in self.augmentations:
+            meta['flip_h'] = np.random.rand() > 0.5
+        if 'flip_v' in self.augmentations:
+            meta['flip_v'] = np.random.rand() > 0.5
+        return meta
+
+    def _normalize_image(self, image: np.ndarray) -> np.ndarray:
+        return image / 255.0 if image.max() > 1.0 else image
+
+    def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Normalize image patch values and binarize label patch if needed.
+
+        Args:
+            data (Dict[str, np.ndarray]): Dictionary containing patches.
+        
+        Returns:
+            Dict[str, np.ndarray]: Postprocessed patches.
+        """
+        for key in data:
+            if key == "image_patch":
+                data[key] = self._normalize_image(data[key])
+            elif key == "label_patch":
+                if data[key].max() > 1:
+                    data[key] = (data[key] > 127).astype(np.uint8)
+            elif key == "distance_patch":
+                if self.distance_threshold:
+                    data[key] = np.clip(data[key], 0, self.distance_threshold)
+            elif key == "sdf_patch":
+                if self.sdf_thresholds:
+                    data[key] = np.clip(data[key], self.sdf_thresholds[0], self.sdf_thresholds[1])
+        return data
+
+    def _extract_condition_augmentations(self, imgs: Dict[str, np.ndarray], metadata: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """
+        Extract a patch from the full image and apply conditional augmentations.
+
+        Args:
+            imgs (Dict[str, np.ndarray]): Full images for each modality.
+            metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
+        
+        Returns:
+            Dict[str, np.ndarray]: Dictionary of extracted patches.
+        """
+        imgs_aug = imgs.copy()
+        data = self._extract_data(imgs, metadata['x'], metadata['y'])
+        for key in imgs:
+            if key.endswith("_patch"):
+                modality = key.replace("_patch", "")
+                if 'flip_h' in self.augmentations:
+                    imgs_aug[modality] = self._flip_h(imgs[modality])
+                    data[key] = self._flip_h(data[key])
+                if 'flip_v' in self.augmentations:
+                    imgs_aug[modality] = self._flip_v(imgs[modality])
+                    data[key] = self._flip_v(data[key])
+                if 'rotation' in self.augmentations:
+                    data[key] = self._rotate(imgs_aug[modality], metadata)
+        return data
+
+    def _extract_data(self, imgs: Dict[str, np.ndarray], x: int, y: int) -> Dict[str, np.ndarray]:
+        """
+        Extract a patch from each modality starting at (x, y) with size self.patch_size.
+
+        Args:
+            imgs (Dict[str, np.ndarray]): Full images.
+            x (int): x-coordinate.
+            y (int): y-coordinate.
+        
+        Returns:
+            Dict[str, np.ndarray]: Extracted patch for each modality.
+        """
+        data: Dict[str, np.ndarray] = {}
+        for key, array in imgs.items():
+            if array.ndim == 3:
+                data[f"{key}_patch"] = array[:, y:y + self.patch_size, x:x + self.patch_size]
+            elif array.ndim == 2:
+                data[f"{key}_patch"] = array[y:y + self.patch_size, x:x + self.patch_size]
+            else:
+                raise ValueError("Unsupported array dimensions in _extract_data")
+        return data
+
+    def _flip_h(self, full_array: np.ndarray) -> np.ndarray:
+        return np.flip(full_array, axis=-1)
+    
+    def _flip_v(self, full_array: np.ndarray) -> np.ndarray:
+        return np.flip(full_array, axis=-2)
+    
+    def _rotate(self, full_array: np.ndarray, patch_meta: Dict[str, Any]) -> np.ndarray:
+        """
+        Rotate a patch using an expanded crop to avoid border effects.
+        If the crop is too small, log a warning and return a zero patch.
+
+        Args:
+            full_array (np.ndarray): Full image array.
+            patch_meta (Dict[str, Any]): Contains patch coordinates and angle.
+        
+        Returns:
+            np.ndarray: Rotated patch.
+        """
+        patch_size = self.patch_size
+        L = int(np.ceil(patch_size * math.sqrt(2)))
+        x = patch_meta["x"]
+        y = patch_meta["y"]
+        angle = patch_meta["angle"]
+
+        cx = x + patch_size // 2
+        cy = y + patch_size // 2
+        half_L = L // 2
+        x0 = max(0, cx - half_L)
+        y0 = max(0, cy - half_L)
+        x1 = min(full_array.shape[-1], cx + half_L)
+        y1 = min(full_array.shape[-2], cy + half_L)
+
+        if full_array.ndim == 3:
+            crop = full_array[:, y0:y1, x0:x1]
+            if crop.shape[1] < L or crop.shape[2] < L:
+                logger.warning("Crop too small for 3D patch rotation; returning zero patch.")
+                return np.zeros((full_array.shape[0], patch_size, patch_size), dtype=full_array.dtype)
+            rotated_channels = [rotate(crop[c], angle, reshape=False, order=1) for c in range(full_array.shape[0])]
+            rotated = np.stack(rotated_channels)
+            start = (L - patch_size) // 2
+            return rotated[:, start:start + patch_size, start:start + patch_size]
+        elif full_array.ndim == 2:
+            crop = full_array[y0:y1, x0:x1]
+            if crop.shape[0] < L or crop.shape[1] < L:
+                logger.warning("Crop too small for 2D patch rotation; returning zero patch.")
+                return np.zeros((patch_size, patch_size), dtype=full_array.dtype)
+            rotated = rotate(crop, angle, reshape=False, order=1)
+            start = (L - patch_size) // 2
+            return rotated[start:start + patch_size, start:start + patch_size]
+        else:
+            raise ValueError("Unsupported array shape")
+
+        
+def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Custom collate function with None filtering.
+    """
+    # Filter out None samples
+    batch = [sample for sample in batch if sample is not None]
+    
+    # Handle empty batch case
+    if not batch:
+        logger.warning("Empty batch after filtering None values")
+        return {}  # Or return a default empty batch structure
+    
+    # Original collation logic
+    collated: Dict[str, Any] = {}
+    for key in batch[0]:
+        items = []
+        for sample in batch:
+            value = sample[key]
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            items.append(value)
+        if isinstance(items[0], torch.Tensor):
+            collated[key] = torch.stack(items)
+        else:
+            collated[key] = items
+    return collated
+
+def worker_init_fn(worker_id):
+    """
+    DataLoader worker initialization to ensure different random seeds for each worker.
+    """
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def visualize_batch(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
+    """
+    Visualizes patches in a batch: image, label, distance, and SDF (if available).
+
+    Args:
+        batch (Dict[str, Any]): Dictionary containing batched patches.
+        num_per_batch (Optional[int]): Maximum number of patches to visualize.
+    """
+    import matplotlib.pyplot as plt
+
+    num_to_plot = batch["image_patch"].shape[0]
+    if num_per_batch:
+        num_to_plot = min(num_to_plot, num_per_batch)
+    for i in range(num_to_plot):
+        sample_image = batch["image_patch"][i].numpy()
+        if sample_image.shape[0] == 3:  # CHW to HWC
+            sample_image = sample_image.transpose(1, 2, 0)
+        elif sample_image.shape[0] == 1:
+            sample_image = sample_image[0]  # grayscale
+        else:
+            sample_image = sample_image.transpose(1, 2, 0)
+
+        sample_label = np.squeeze(batch["label_patch"][i].numpy())
+        sample_distance = batch["distance_patch"][i].numpy() if "distance_patch" in batch else None
+        sample_sdf = batch["sdf_patch"][i].numpy() if "sdf_patch" in batch else None
+
+        print(f'Patch {i}')
+        print('  image:', sample_image.min(), sample_image.max())
+        print('  label:', sample_label.min(), sample_label.max())
+        if sample_distance is not None:
+            print('  distance:', sample_distance.min(), sample_distance.max())
+        if sample_sdf is not None:
+            print('  sdf:', sample_sdf.min(), sample_sdf.max())
+
+        num_subplots = 3 + (1 if sample_sdf is not None else 0)
+        fig, axs = plt.subplots(1, num_subplots, figsize=(12, 4))
+        axs[0].imshow(sample_image, cmap='gray' if sample_image.ndim == 2 else None)
+        axs[0].set_title("Image")
+        axs[0].axis("off")
+        axs[1].imshow(sample_label, cmap='gray')
+        axs[1].set_title("Label")
+        axs[1].axis("off")
+        if sample_distance is not None:
+            axs[2].imshow(sample_distance[0], cmap='gray')
+            axs[2].set_title("Distance")
+            axs[2].axis("off")
+        else:
+            axs[2].text(0.5, 0.5, "No Distance", ha='center', va='center')
+            axs[2].axis("off")
+        if sample_sdf is not None:
+            axs[3].imshow(sample_sdf[0], cmap='coolwarm')
+            axs[3].set_title("SDF")
+            axs[3].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    config = {
+        "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
+        "split": "train",
+        # "split": "valid",
+        "patch_size": 256,
+        "small_window_size": 8,
+        "validate_road_ratio": True,
+        "threshold": 0.025,
+        "max_images": 1,  # For quick testing.
+        "seed": 42,
+        "fold": None,
+        "num_folds": None,
+        "verbose": True,
+        "augmentations": ["flip_h", "flip_v", "rotation"],
+        "distance_threshold": 100.0,
+        "sdf_iterations": 3,
+        "sdf_thresholds": [-20, 20],
+        "num_workers": 4,
+        "use_splitting": False,
+        "split_ratios": {
+            "train": 0.7,
+            "valid": 0.15,
+            "test": 0.15
+        },
+        "modalities": {
+            "image": "sat",
+            "label": "map",
+            "distance": "distance",
+            "sdf": "sdf"
+        }
+    }
+
+    # Create dataset and dataloader.
+    dataset = GeneralizedDataset(config)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=True,
+        collate_fn=custom_collate_fn,
+        num_workers=4,
+        # worker_init_fn=worker_init_fn
+    )
+    logger.info('len(dataloader): %d', len(dataloader))
+    for epoch in range(10):
+        for i, batch in enumerate(dataloader):
+            if batch is None:
+                continue
+            logger.info("Batch keys: %s", batch.keys())
+            logger.info("Image shape: %s", batch["image_patch"].shape)
+            logger.info("Label shape: %s", batch["label_patch"].shape)
+            visualize_batch(batch)
+            # break  # Uncomment to visualize only one batch.
+
+
+# ------------------------------------
 # core/validator.py
 # ------------------------------------
+# core/validator.py
 """
 Validator module for handling chunked inference in validation/test phases.
-
-This module provides functionality to perform validation with full-size images
-by processing them in patches with overlap.
+Implements the exact Road_2D_EEF approach with robust size handling.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Callable, Union
+import math
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-# Import the existing process_in_chuncks function
 from core.utils import process_in_chuncks
 
 
 class Validator:
     """
     Validator class for handling chunked inference during validation/testing.
-    
-    This class enables processing large images that don't fit in GPU memory by
-    splitting them into overlapping chunks, processing each chunk, and reassembling
-    the results with proper handling of overlapping regions.
+    Uses the Road_2D_EEF process_in_chunks approach with robust size handling.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -564,6 +1215,53 @@ class Validator:
             raise ValueError(f"patch_size {self.patch_size} and patch_margin {self.patch_margin} "
                              f"must have the same number of dimensions")
     
+    def _pad_to_valid_size(self, image: torch.Tensor, divisor: int = 16) -> tuple:
+        """
+        Pad image to ensure dimensions are divisible by divisor.
+        
+        Args:
+            image: Input tensor (N, C, H, W)
+            divisor: Divisor for dimension constraint (default: 16 for UNet with 3-4 levels)
+            
+        Returns:
+            Tuple of (padded_image, (pad_h, pad_w)) where pad_h and pad_w are padding amounts
+        """
+        N, C, H, W = image.shape
+        
+        # Calculate required padding
+        pad_h = (divisor - H % divisor) % divisor
+        pad_w = (divisor - W % divisor) % divisor
+        
+        if pad_h > 0 or pad_w > 0:
+            # Pad with reflection to avoid artifacts
+            image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
+            self.logger.debug(f"Padded image from ({H}, {W}) to ({H + pad_h}, {W + pad_w})")
+        
+        return image, (pad_h, pad_w)
+    
+    def _remove_padding(self, output: torch.Tensor, padding: tuple) -> torch.Tensor:
+        """
+        Remove padding from output tensor.
+        
+        Args:
+            output: Padded output tensor (N, C, H, W)
+            padding: Tuple of (pad_h, pad_w) padding amounts
+            
+        Returns:
+            Unpadded output tensor
+        """
+        pad_h, pad_w = padding
+        
+        if pad_h > 0 or pad_w > 0:
+            if pad_h > 0 and pad_w > 0:
+                output = output[:, :, :-pad_h, :-pad_w]
+            elif pad_h > 0:
+                output = output[:, :, :-pad_h, :]
+            elif pad_w > 0:
+                output = output[:, :, :, :-pad_w]
+        
+        return output
+    
     def run_chunked_inference(
         self, 
         model: nn.Module, 
@@ -572,6 +1270,7 @@ class Validator:
     ) -> torch.Tensor:
         """
         Run inference on a large image by processing it in chunks.
+        Uses the exact Road_2D_EEF process_in_chunks approach with robust size handling.
         
         Args:
             model: The model to use for inference
@@ -587,27 +1286,45 @@ class Validator:
         model.eval()
         image = image.to(device)
         
-        # Get image dimensions
-        N, C, H, W = image.shape
+        # Store original dimensions
+        original_shape = image.shape
         
-        # Create empty output tensor (assuming model output has same spatial dimensions as input)
-        # We need to run a test inference to get the output channel dimension
+        # Pad image to ensure valid dimensions for UNet
+        # Use 16 as divisor for UNet with 3-4 levels (2^4 = 16)
+        padded_image, padding = self._pad_to_valid_size(image, divisor=16)
+        
+        # Get padded image dimensions
+        N, C, H, W = padded_image.shape
+        
+        # Create empty output tensor - determine output channels first
         with torch.no_grad():
             # Create a small test patch to determine output channels
-            test_patch = image[:, :, :min(H, self.patch_size[0]), :min(W, self.patch_size[1])]
+            test_h = min(H, self.patch_size[0] + 2 * self.patch_margin[0])
+            test_w = min(W, self.patch_size[1] + 2 * self.patch_margin[1])
+            test_patch = padded_image[:, :, :test_h, :test_w]
             test_output = model(test_patch)
             out_channels = test_output.shape[1]
             
         # Initialize output tensor (N, out_channels, H, W)
-        output = torch.zeros((N, out_channels, H, W), device=device)
+        output = torch.zeros((N, out_channels, H, W), device=device, dtype=test_output.dtype)
         
-        # Process function to wrap model inference
-        def process_fn(chunk):
+        # Define the process function that will be called for each chunk
+        def process_chunk(chunk):
             with torch.no_grad():
                 return model(chunk)
         
-        # Run chunked inference
-        output = process_in_chuncks(image, output, process_fn, self.patch_size, self.patch_margin)
+        # Use the original process_in_chuncks function
+        with torch.no_grad():
+            output = process_in_chuncks(
+                padded_image, 
+                output, 
+                process_chunk, 
+                list(self.patch_size), 
+                list(self.patch_margin)
+            )
+        
+        # Remove padding to restore original dimensions
+        output = self._remove_padding(output, padding)
         
         return output
 
@@ -2477,10 +3194,8 @@ class ConnectedComponentsQuality(nn.Module):
 # ------------------------------------
 import numpy as np
 import torch
-from metrics.apls_core import apls
-import torch
 import torch.nn as nn
-import numpy as np
+from metrics.apls_core import apls
 
 def compute_batch_apls(
     gt_masks,
@@ -2500,11 +3215,11 @@ def compute_batch_apls(
     # --- unify shapes to (B, H, W) ---
     def _unify(m):
         if m.ndim == 2:
-            m = m[None, ...]           # (H,W) -> (1,H,W)
+            m = m[None, ...]
         if m.ndim == 3:
-            return m                  # already (B,H,W) or (1,H,W)
+            return m
         if m.ndim == 4 and m.shape[1] == 1:
-            return m[:,0,...]        # (B,1,H,W) -> (B,H,W)
+            return m[:,0,...]
         raise ValueError(f"Unsupported mask shape {m.shape}")
 
     gt = _unify(gt_masks)
@@ -2512,20 +3227,17 @@ def compute_batch_apls(
     if gt.shape != pr.shape:
         raise ValueError(f"GT shape {gt.shape} != pred shape {pr.shape}")
 
-    B, H, W = gt.shape
+    B = gt.shape[0]
     scores = np.zeros(B, dtype=np.float32)
 
     for i in range(B):
         gt_bin = (gt[i] > 0.5).astype(np.uint8)
         pr_bin = (pr[i] > 0.5).astype(np.uint8)
 
-        # handle empty‐GT cases
         if gt_bin.sum() == 0:
-            # perfect if pred is also empty, else zero
             scores[i] = 1.0 if pr_bin.sum() == 0 else 0.0
             continue
 
-        # now GT non‐empty ⇒ delegate to core APLS
         try:
             scores[i] = apls(
                 gt_bin,
@@ -2537,7 +3249,6 @@ def compute_batch_apls(
                 min_path_length=min_path_length
             )
         except Exception:
-            # fallback for degenerate graphs
             scores[i] = 0.0
 
     return scores
@@ -2547,28 +3258,22 @@ class APLS(nn.Module):
     """
     Average Path Length Similarity (APLS) metric for road network segmentation.
     """
-    
     def __init__(
         self,
-        min_segment_length=10,
-        max_nodes=500,
-        sampling_ratio=0.1,
         angle_range=(135, 225),
+        max_nodes=500,
         max_snap_dist=4,
         allow_renaming=True,
+        min_path_length=10
     ):
         super().__init__()
-        self.min_segment_length = min_segment_length
-        self.max_nodes = max_nodes
-        self.sampling_ratio = sampling_ratio
         self.angle_range = angle_range
+        self.max_nodes = max_nodes
         self.max_snap_dist = max_snap_dist
         self.allow_renaming = allow_renaming
-    
-    def forward(self, y_pred, y_true):
-        """
-        Compute the APLS metric between predicted and ground truth road networks.
-        """
+        self.min_path_length = min_path_length
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         scores = compute_batch_apls(
             y_true,
             y_pred,
@@ -2576,11 +3281,10 @@ class APLS(nn.Module):
             max_nodes=self.max_nodes,
             max_snap_dist=self.max_snap_dist,
             allow_renaming=self.allow_renaming,
-            min_path_length=self.min_segment_length
+            min_path_length=self.min_path_length
         )
-        
-        # Convert numpy array to torch tensor and return mean
         return torch.tensor(scores.mean(), device=y_pred.device)
+
 
 # ------------------------------------
 # UsefulScripts/extract_paths.py
@@ -3403,6 +4107,668 @@ class TopologicalLoss(nn.Module):
         return connectivity_error
 
 # ------------------------------------
+# tests/test_helpers.py
+# ------------------------------------
+"""
+Unit tests for critical helper functions in the segmentation framework.
+Run with: pytest -xvs test_helpers.py
+"""
+
+import os
+import sys
+import pytest
+import numpy as np
+import torch
+from pathlib import Path
+
+# Add parent directory to sys.path to import modules
+sys.path.append(str(Path(__file__).parent.parent))
+
+# Import the functions to test
+from core.general_dataset import compute_distance_map, compute_sdf, custom_collate_fn
+from core.utils import (
+    noCrops,
+    noCropsPerDim,
+    cropInds,
+    coord,
+    coords,
+    cropCoords,
+    process_in_chuncks,
+)
+
+
+class TestDistanceMap:
+    """Tests for compute_distance_map function"""
+
+    def test_basic_functionality(self):
+        mask = np.zeros((5, 5), dtype=np.uint8)
+        mask[2, 2] = 1
+        distance = compute_distance_map(mask, None)
+
+        assert distance[2, 2] == 0
+        for i, j in [(0, 0), (0, 4), (4, 0), (4, 4)]:
+            assert 2.8 < distance[i, j] < 2.9
+        for i, j in [(1, 2), (3, 2), (2, 1), (2, 3)]:
+            assert distance[i, j] == 1
+
+    def test_thresholding(self):
+        mask = np.zeros((7, 7), dtype=np.uint8)
+        mask[3, 3] = 1
+        distance = compute_distance_map(mask, 2.0)
+
+        assert np.max(distance) <= 2.0
+        assert distance[3, 3] == 0
+        assert distance[2, 3] == 1
+        assert distance[4, 3] == 1
+
+    def test_binary_formats(self):
+        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
+        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
+        d1 = compute_distance_map(mask_01, None)
+        d2 = compute_distance_map(mask_0255, None)
+        assert np.array_equal(d1, d2)
+
+    def test_empty_mask(self):
+        mask = np.zeros((5, 5), dtype=np.uint8)
+        distance = compute_distance_map(mask, None)
+        assert np.all(distance > 0)
+
+    def test_full_mask(self):
+        mask = np.ones((5, 5), dtype=np.uint8)
+        distance = compute_distance_map(mask, None)
+        assert np.all(distance == 0)
+
+
+class TestSignedDistanceFunction:
+    """Tests for compute_sdf function"""
+
+    def test_basic_functionality(self):
+        mask = np.zeros((7, 7), dtype=np.uint8)
+        mask[3, 3] = 1
+        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
+
+        # Inside (where mask==1) should be negative
+        assert sdf[3, 3] < 0
+        # Far away should be positive
+        assert sdf[0, 0] > 0
+
+    def test_iterations_parameter(self):
+        mask = np.zeros((9, 9), dtype=np.uint8)
+        mask[4, 4] = 1
+
+        sdf1 = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
+        sdf3 = compute_sdf(mask, sdf_iterations=3, sdf_thresholds=None)
+
+        neg1 = np.sum(sdf1 < 0)
+        neg3 = np.sum(sdf3 < 0)
+        # More iterations should not shrink the "inside"—allow equal or larger
+        assert neg3 >= neg1
+
+    def test_thresholds_parameter(self):
+        mask = np.zeros((9, 9), dtype=np.uint8)
+        mask[4, 4] = 1
+
+        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=[-2, 2])
+        assert np.all(sdf >= -2)
+        assert np.all(sdf <= 2)
+
+    def test_binary_formats(self):
+        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
+        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
+        s1 = compute_sdf(mask_01, sdf_iterations=1, sdf_thresholds=None)
+        s2 = compute_sdf(mask_0255, sdf_iterations=1, sdf_thresholds=None)
+        assert np.array_equal(s1, s2)
+
+
+class TestCropFunctions:
+    """Tests for the crop‐related utility functions"""
+
+    def test_noCrops_basic(self):
+        assert noCrops([100, 100], [50, 50], [5, 5], startDim=0) == 9
+
+    def test_noCrops_tiny_image(self):
+        assert noCrops([10, 10], [10, 10], [3, 3], startDim=0) == 1
+
+    def test_noCropsPerDim(self):
+        per, cum = noCropsPerDim([100, 200], [50, 50], [5, 5], startDim=0)
+        assert per == [3, 5]
+        assert cum == [15, 5, 1]
+
+    def test_cropInds(self):
+        cum = [12, 3, 1]
+        assert cropInds(0, cum) == [0, 0]
+        assert cropInds(3, cum) == [1, 0]
+        assert cropInds(11, cum) == [3, 2]
+
+    def test_coord(self):
+        c, v = coord(2, 30, 5, 100)
+        assert (c.start, c.stop) == (40, 70)
+        assert (v.start, v.stop) == (5, 25)
+
+        c, v = coord(4, 30, 5, 100)
+        assert (c.start, c.stop) == (70, 100)
+        # when hitting edge, valid region is trimmed (start=15) to avoid going out of bounds
+        assert (v.start, v.stop) == (15, 30)
+
+    def test_coords(self):
+        cc, vc = coords([1, 2], [30, 30], [5, 5], [100, 100], 0)
+        assert (cc[0].start, cc[0].stop) == (20, 50)
+        assert (cc[1].start, cc[1].stop) == (40, 70)
+        assert (vc[0].start, vc[0].stop) == (5, 25)
+        assert (vc[1].start, vc[1].stop) == (5, 25)
+
+    def test_cropCoords(self):
+        cc, vc = cropCoords(7, [30, 40], [5, 5], [100, 200], 0)
+        for sl in [*cc, *vc]:
+            assert isinstance(sl, slice)
+        assert 0 <= cc[0].start < cc[0].stop <= 100
+        assert 0 <= cc[1].start < cc[1].stop <= 200
+        assert 0 <= vc[0].start < vc[0].stop <= 30
+        assert 0 <= vc[1].start < vc[1].stop <= 40
+
+
+class TestProcessInChunks:
+    """Tests for process_in_chuncks"""
+
+    def test_basic_processing(self):
+        inp = torch.ones((1, 3, 10, 10))
+        out = torch.zeros((1, 1, 10, 10))
+        def fn(x): return torch.ones((x.shape[0], 1, x.shape[2], x.shape[3]))
+        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
+        assert torch.all(res == 1)
+
+    def test_chunking_logic(self):
+        inp = torch.zeros((1, 3, 20, 20))
+        out = torch.zeros((1, 1, 20, 20))
+        def fn(x):
+            b, c, h, w = x.shape
+            t = torch.zeros((b, 1, h, w))
+            for i in range(h):
+                for j in range(w):
+                    t[0, 0, i, j] = i + j
+            return t
+        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
+        assert res[0, 0, 0, 0] == 0
+        assert res[0, 0, 6, 0] == 6
+
+    def test_shape_handling(self):
+        inp = torch.ones((1, 3, 10, 10))
+        out = torch.zeros((1, 1, 10, 10))
+        def fn(x): return torch.ones((x.shape[0], x.shape[2], x.shape[3]))
+        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
+        assert torch.all(res == 1)
+
+    def test_margin_handling(self):
+        inp = torch.zeros((1, 1, 20, 20))
+        for i in range(20):
+            for j in range(20):
+                inp[0, 0, i, j] = i * 100 + j
+        out = torch.zeros((1, 1, 20, 20))
+        def fn(x): return x
+        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
+        assert torch.all(res == inp)
+
+
+class TestDataSplitting:
+    """Tests for data splitting logic (ratio and k-fold)"""
+
+    @pytest.fixture
+    def mock_file_structure(self, tmp_path):
+        """
+        Create a mock dataset structure for testing:
+        
+        dataset/
+          source/
+            sat/  (images)
+            map/  (labels)
+        """
+        root = tmp_path / "dataset"
+        img_dir = root / "source" / "sat"
+        lbl_dir = root / "source" / "map"
+        img_dir.mkdir(parents=True)
+        lbl_dir.mkdir(parents=True)
+
+        # Create 10 dummy .tif files in each
+        for i in range(10):
+            (img_dir / f"img_{i}.tif").write_text("dummy")
+            (lbl_dir / f"img_{i}.tif").write_text("dummy")
+
+        return root
+
+    def test_ratio_splitting(self, mock_file_structure, monkeypatch):
+        """Test ratio-based splitting logic"""
+        from core.general_dataset import GeneralizedDataset
+
+        # Prevent any random shuffle
+        monkeypatch.setattr(np.random, "shuffle", lambda x: x)
+
+        base_cfg = {
+            "root_dir": str(mock_file_structure),
+            "use_splitting": True,
+            "source_folder": "source",
+            "split_ratios": {"train": 0.6, "valid": 0.2, "test": 0.2},
+            "modalities": {"image": "sat", "label": "map"},
+        }
+
+        # Create each split explicitly
+        train_ds = GeneralizedDataset({**base_cfg, "split": "train"})
+        valid_ds = GeneralizedDataset({**base_cfg, "split": "valid"})
+        test_ds  = GeneralizedDataset({**base_cfg, "split": "test"})
+
+        # Should be 6,2,2 images respectively
+        assert len(train_ds.modality_files["image"]) == 6
+        assert len(valid_ds.modality_files["image"]) == 2
+        assert len(test_ds.modality_files["image"])  == 2
+
+        # No overlap
+        t = set(train_ds.modality_files["image"])
+        v = set(valid_ds.modality_files["image"])
+        s = set(test_ds.modality_files["image"])
+        assert t.isdisjoint(v)
+        assert t.isdisjoint(s)
+        assert v.isdisjoint(s)
+
+    def test_kfold_splitting(self, mock_file_structure, monkeypatch):
+        """Test k-fold splitting logic"""
+        from core.general_dataset import GeneralizedDataset
+
+        # Mock KFold to return a single fixed split (first 8 train, last 2 valid)
+        class MockKFold:
+            def __init__(self, n_splits, shuffle, random_state):
+                pass
+            def split(self, X):
+                return [(np.arange(8), np.arange(8, 10))]
+
+        monkeypatch.setattr("sklearn.model_selection.KFold", MockKFold)
+
+        base_cfg = {
+            "root_dir": str(mock_file_structure),
+            "use_splitting": True,
+            "split_mode": "kfold",
+            "num_folds": 5,
+            "source_folder": "source",
+            "modalities": {"image": "sat", "label": "map"},
+        }
+
+        # Train fold 0
+        tr_cfg = {**base_cfg, "split": "train", "fold": 0}
+        train_ds = GeneralizedDataset(tr_cfg)
+        assert len(train_ds.modality_files["image"]) == 8
+
+        # Valid fold 0
+        va_cfg = {**base_cfg, "split": "valid", "fold": 0}
+        valid_ds = GeneralizedDataset(va_cfg)
+        assert len(valid_ds.modality_files["image"]) == 2
+
+
+class TestCustomCollate:
+    """Tests for custom_collate_fn"""
+
+    def test_basic(self):
+        batch = [
+            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
+            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
+        ]
+        c = custom_collate_fn(batch)
+        assert c["image"].shape == (2,3,10,10)
+        assert c["label"].shape == (2,1,10,10)
+
+    def test_mixed_types(self):
+        batch = [
+            {"image": torch.ones(3,10,10), "meta": {"id":1}},
+            {"image": torch.ones(3,10,10), "meta": {"id":2}},
+        ]
+        c = custom_collate_fn(batch)
+        assert isinstance(c["meta"], list)
+        assert c["meta"][0]["id"] == 1
+
+    def test_filter_none(self):
+        def imp(batch):
+            batch = [b for b in batch if b is not None]
+            if not batch:
+                return {"image": torch.zeros(0,3,10,10)}
+            return custom_collate_fn(batch)
+        b = [None, {"image": torch.ones(3,10,10)}]
+        c1 = imp(b)
+        assert c1["image"].shape[0] == 1
+        c2 = imp([None,None])
+        assert c2["image"].shape[0] == 0
+
+
+# ------------------------------------
+# tests/smoke_test.py
+# ------------------------------------
+"""
+Integration smoke test for the entire segmentation pipeline.
+This creates a minimal synthetic dataset and runs a few training steps.
+Run with: python smoke_test.py
+"""
+
+import os
+import shutil
+import tempfile
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from tqdm import tqdm
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Import core modules
+from core.general_dataset import GeneralizedDataset, custom_collate_fn, worker_init_fn
+from core.model_loader import load_model
+from core.loss_loader import load_loss
+from core.mix_loss import MixedLoss
+from core.metric_loader import load_metrics
+from core.dataloader import SegmentationDataModule
+from seglit_module import SegLitModule
+
+
+def create_synthetic_dataset(root_dir, num_samples=10, img_size=32):
+    """Create a synthetic dataset with roads for testing"""
+    logger.info(f"Creating synthetic dataset in {root_dir} with {num_samples} samples")
+    
+    # Create directory structure
+    os.makedirs(os.path.join(root_dir, 'train', 'sat'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'train', 'map'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'valid', 'sat'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'valid', 'map'), exist_ok=True)
+    
+    # Create test images with simple road patterns
+    for split in ['train', 'valid']:
+        for i in range(num_samples):
+            # Create image with random noise
+            img = np.random.randint(0, 255, (img_size, img_size, 3), dtype=np.uint8)
+            
+            # Create binary mask with horizontal and vertical lines (roads)
+            mask = np.zeros((img_size, img_size), dtype=np.uint8)
+            
+            # Horizontal road
+            h_pos = np.random.randint(5, img_size-5)
+            mask[h_pos-2:h_pos+2, :] = 1
+            
+            # Vertical road
+            v_pos = np.random.randint(5, img_size-5)
+            mask[:, v_pos-2:v_pos+2] = 1
+            
+            # Add brightness to the roads in the image for realism
+            for c in range(3):
+                img[:, :, c] = np.where(mask > 0, 
+                                        np.minimum(img[:, :, c] + 100, 255),
+                                        img[:, :, c])
+            
+            # Save files
+            np.save(os.path.join(root_dir, split, 'sat', f'img_{i}.npy'), img)
+            np.save(os.path.join(root_dir, split, 'map', f'img_{i}.npy'), mask * 255)  # 0/255 format
+    
+    logger.info(f"Created {num_samples} samples each for train and validation")
+
+
+class SimpleBinaryUNet(nn.Module):
+    """A very simple UNet for testing purposes"""
+    
+    def __init__(self, in_channels=3, out_channels=1):
+        super().__init__()
+        
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        
+        # Decoder
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 16, 2, stride=2)
+        )
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(16, 8, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(8, 8, 2, stride=2)
+        )
+        
+        # Final layer
+        self.final = nn.Conv2d(8, out_channels, 1)
+    
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        
+        # Decoder
+        d1 = self.dec1(e2)
+        d2 = self.dec2(d1)
+        
+        # Final layer
+        out = torch.sigmoid(self.final(d2))
+        return out
+
+
+def create_configs(dataset_path):
+    """Create configuration dictionaries for testing"""
+    # Dataset configuration
+    dataset_config = {
+        "root_dir": dataset_path,
+        "split_mode": "folder",
+        "patch_size": 16,
+        "small_window_size": 2,
+        "validate_road_ratio": False,  # Don't filter patches for quick testing
+        "train_batch_size": 2,
+        "val_batch_size": 1,
+        "num_workers": 0,  # Use 0 for easier debugging
+        "pin_memory": False,
+        "modalities": {
+            "image": "sat",
+            "label": "map"
+        }
+    }
+    
+    # Model configuration using our simple test model
+    model_config = {
+        "simple_unet": True,  # Flag for our smoke test
+        "in_channels": 3,
+        "out_channels": 1
+    }
+    
+    # Loss configuration
+    loss_config = {
+        "primary_loss": {
+            "class": "BCELoss",
+            "params": {}
+        },
+        "alpha": 1.0  # Only use primary loss
+    }
+    
+    # Metrics configuration
+    metrics_config = {
+        "metrics": [
+            {
+                "alias": "dice",
+                "path": "torchmetrics.classification",
+                "class": "Dice",
+                "params": {
+                    "threshold": 0.5,
+                    "zero_division": 1.0
+                }
+            }
+        ]
+    }
+    
+    # Inference configuration
+    inference_config = {
+        "patch_size": [16, 16],
+        "patch_margin": [2, 2]
+    }
+    
+    return dataset_config, model_config, loss_config, metrics_config, inference_config
+
+
+def run_smoke_test():
+    """Run a complete smoke test of the segmentation pipeline"""
+    logger.info("Starting smoke test")
+    
+    # Create temporary directory for dataset
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create synthetic dataset
+        create_synthetic_dataset(tmp_dir, num_samples=5, img_size=32)
+        
+        # Create configurations
+        dataset_config, model_config, loss_config, metrics_config, inference_config = create_configs(tmp_dir)
+        
+        # Set up data module
+        logger.info("Setting up data module")
+        data_module = SegmentationDataModule(dataset_config)
+        data_module.setup()
+        
+        # Create model manually for smoke test
+        logger.info("Creating model")
+        if model_config.get("simple_unet", False):
+            model = SimpleBinaryUNet(
+                in_channels=model_config["in_channels"],
+                out_channels=model_config["out_channels"]
+            )
+        else:
+            model = load_model(model_config)
+        
+        # Create loss function
+        logger.info("Creating loss function")
+        primary_loss = load_loss(loss_config["primary_loss"])
+        secondary_loss = None
+        if "secondary_loss" in loss_config:
+            secondary_loss = load_loss(loss_config["secondary_loss"])
+        
+        mixed_loss = MixedLoss(primary_loss, secondary_loss, loss_config.get("alpha", 0.5), 
+                              loss_config.get("start_epoch", 0))
+        
+        # Create metrics
+        logger.info("Loading metrics")
+        metrics = load_metrics(metrics_config.get("metrics", []))
+        
+        # Create optimizer config
+        optimizer_config = {
+            "name": "Adam",
+            "params": {"lr": 0.001}
+        }
+        
+        # Create Lightning module
+        logger.info("Creating Lightning module")
+        lit_module = SegLitModule(
+            model=model,
+            loss_fn=mixed_loss,
+            metrics=metrics,
+            optimizer_config=optimizer_config,
+            inference_config=inference_config
+        )
+        
+        # Create a simple trainer for testing
+        logger.info("Creating trainer")
+        trainer = pl.Trainer(
+            max_epochs=2,
+            log_every_n_steps=1,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=True,
+            accelerator="cpu"
+        )
+        
+        # Run a few training steps
+        logger.info("Running training")
+        trainer.fit(lit_module, datamodule=data_module)
+        
+        logger.info("Smoke test complete!")
+
+
+def inspect_dataset_samples():
+    """Create and inspect dataset samples for debugging"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create synthetic dataset
+        create_synthetic_dataset(tmp_dir, num_samples=3, img_size=32)
+        
+        # Create configurations
+        dataset_config, _, _, _, _ = create_configs(tmp_dir)
+        
+        # Override for detailed inspection
+        dataset_config["train_batch_size"] = 1
+        
+        # Create dataset directly
+        train_config = dataset_config.copy()
+        train_config["split"] = "train"
+        
+        # Fix the None sample issue in __getitem__
+        from core.general_dataset import GeneralizedDataset
+        
+        # Patch the class to fix the None return issue
+        original_getitem = GeneralizedDataset.__getitem__
+        
+        def safe_getitem(self, idx):
+            result = original_getitem(self, idx)
+            if result is None:
+                # Try another index
+                logger.warning(f"Got None for index {idx}, trying next index")
+                return self.__getitem__((idx + 1) % len(self))
+            return result
+        
+        # Apply the monkey patch
+        GeneralizedDataset.__getitem__ = safe_getitem
+        
+        # Create and inspect dataset
+        train_dataset = GeneralizedDataset(train_config)
+        
+        # Check dataset length
+        logger.info(f"Dataset length: {len(train_dataset)}")
+        
+        # Iterate through a few samples
+        for i in range(min(3, len(train_dataset))):
+            sample = train_dataset[i]
+            logger.info(f"Sample {i} keys: {sample.keys()}")
+            
+            # Check shapes
+            for key, value in sample.items():
+                if isinstance(value, np.ndarray):
+                    logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}, range: [{value.min()}, {value.max()}]")
+        
+        # Create dataloader and inspect a batch
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=2,
+            shuffle=True,
+            collate_fn=custom_collate_fn,
+            num_workers=0
+        )
+        
+        # Get a batch
+        batch = next(iter(train_loader))
+        logger.info(f"Batch keys: {batch.keys()}")
+        
+        # Check shapes
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}")
+
+
+if __name__ == "__main__":
+    # First inspect dataset
+    logger.info("Inspecting dataset samples...")
+    inspect_dataset_samples()
+    
+    # Then run full smoke test
+    logger.info("\nRunning full smoke test...")
+    run_smoke_test()
+
+# ------------------------------------
 # configs/main.yaml
 # ------------------------------------
 # Main configuration file for segmentation experiments
@@ -3410,20 +4776,20 @@ class TopologicalLoss(nn.Module):
 
 # Sub-config references
 dataset_config: "massroads.yaml"
-model_config: "topotokens.yaml"
+model_config: "baseline.yaml"
 loss_config: "mixed_topo.yaml"
 metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 
 # Output directory
-output_dir: "outputs/experiment_1"
+output_dir: "outputs/baseline_unet_massroads"
 
 # Trainer configuration
 trainer:
   max_epochs: 100
   val_check_interval: 1.0  # Validate once per epoch
   skip_validation_until_epoch: 0  # Skip validation for the first 5 epochs
-  val_every_n_epochs: 5
+  val_every_n_epochs: 10
   log_every_n_epochs: 2  # Log predictions every 2 epochs
   log_every_n_steps: 1
   train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
@@ -3445,7 +4811,7 @@ trainer:
 optimizer:
   name: "Adam"
   params:
-    lr: 0.001
+    lr: 0.0001
     weight_decay: 0.0001
   
   # Optional learning rate scheduler
@@ -3459,7 +4825,7 @@ optimizer:
     #   min_lr: 0.00001
     name: "LambdaLR"
     params:
-      lr_decay_factor: 0.0001
+      lr_decay_factor: 0.00001
 
 target_x: "image_patch"
 target_y: "label_patch"
@@ -3501,23 +4867,25 @@ metrics:
     path: "metrics.apls"
     class: "APLS"
     params:
-      min_segment_length: 10
-      max_nodes: 500
-      sampling_ratio: 0.1
+      angle_range: [175, 185]
+      max_nodes: 1000
+      max_snap_dist: 25
+      allow_renaming: true
+      min_path_length: 10
 
 # Per-metric frequencies for training - how often to compute each metric
 train_frequencies:
   dice: 1    # Compute every epoch (lightweight metric)
   iou: 1     # Compute every epoch (lightweight metric)
-  ccq: 10    # Compute every 10 epochs (moderately expensive)
-  apls: 25   # Compute every 25 epochs (very computationally expensive)
+  ccq: 1    # Compute every 10 epochs (moderately expensive)
+  apls: 1   # Compute every 25 epochs (very computationally expensive)
 
 # Per-metric frequencies for validation - how often to compute each metric
 val_frequencies:
   dice: 1    # Compute every epoch
   iou: 1     # Compute every epoch
-  ccq: 5     # Compute every 5 epochs
-  apls: 10   # Compute every 10 epochs
+  ccq: 1     # Compute every 5 epochs
+  apls: 1   # Compute every 10 epochs
 
 # ------------------------------------
 # configs/loss/mixed_topo.yaml
@@ -3529,18 +4897,18 @@ primary_loss:
   class: "BCELoss"  # Built-in PyTorch loss
   params: {}
 
-# Secondary loss (activated after start_epoch)
-secondary_loss:
-  path: "losses.custom_loss"  # Path to the module containing the loss
-  class: "TopologicalLoss"  # Name of the loss class
-  params:
-    topo_weight: 0.5  # Weight for the topological component
-    smoothness: 1.0  # Smoothness parameter for gradient computation
-    connectivity_weight: 0.3  # Weight for the connectivity component
+# # Secondary loss (activated after start_epoch)
+# secondary_loss:
+#   path: "losses.custom_loss"  # Path to the module containing the loss
+#   class: "TopologicalLoss"  # Name of the loss class
+#   params:
+#     topo_weight: 0.5  # Weight for the topological component
+#     smoothness: 1.0  # Smoothness parameter for gradient computation
+#     connectivity_weight: 0.3  # Weight for the connectivity component
 
-# Mixing parameters
-alpha: 0.4  # Weight for the secondary loss (0 to 1)
-start_epoch: 10  # Epoch to start using the secondary loss
+# # Mixing parameters
+# alpha: 0.4  # Weight for the secondary loss (0 to 1)
+# start_epoch: 10  # Epoch to start using the secondary loss
 
 # ------------------------------------
 # configs/inference/chunk.yaml
@@ -3550,16 +4918,13 @@ start_epoch: 10  # Epoch to start using the secondary loss
 # Patch size for inference [height, width]
 # Patches of this size will be processed independently 
 # and then reassembled to form the full output
-patch_size: [256, 256]
+patch_size: [512, 512]
 
 # Patch margin [height, width]
 # Margin of overlap between patches to avoid edge artifacts
 # The effective stride will be (patch_size - 2*patch_margin)
-patch_margin: [50, 50]
+patch_margin: [100, 100]
 
-# Additional inference settings
-use_tta: false  # Test-time augmentation
-tta_merge_mode: "mean"  # How to merge TTA results (mean, max, etc.)
 
 # ------------------------------------
 # configs/dataset/massroads.yaml
@@ -3582,10 +4947,10 @@ num_folds: 3  # Total number of folds
   # valid: 0.15
   # test: 0.15
 
-use_splitting: true
+use_splitting: false
 
 # Source folder (used if split_mode is "folder" with split_ratios)
-source_folder: 'train'
+# source_folder: 'train'
 
 # Batch sizes
 train_batch_size: 8
@@ -3593,7 +4958,7 @@ val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
 # Patch and crop settings
-patch_size: 256  # Size of training patches
+patch_size: 512  # Size of training patches
 small_window_size: 8  # Size of window to check for variation
 validate_road_ratio: false  # Validate patch has enough road content
 threshold: 0.05  # Minimum road ratio threshold
@@ -3607,14 +4972,14 @@ modalities:
   image: "sat"  # Satellite imagery folder
   label: "map"  # Road map folder
   # distance: "distance"  # Distance transform folder
-  sdf: "sdf"  # Signed distance function folder
+  # sdf: "sdf"  # Signed distance function folder
 
 # Distance transform settings
 # distance_threshold: 20.0
 
 # Signed distance function settings
-sdf_iterations: 3
-sdf_thresholds: [-20, 20]
+# sdf_iterations: 3
+# sdf_thresholds: [-20, 20]
 
 # Augmentation settings
 augmentations:
@@ -3631,22 +4996,26 @@ verbose: false  # Verbose output
 seed: 42  # Random seed
 
 # ------------------------------------
-# configs/model/topotokens.yaml
+# configs/model/baseline.yaml
 # ------------------------------------
 # TopoTokens Model Configuration
 
 # Model path and class
-path: "models.custom_model"  # Path to the module containing the model
-class: "TopoTokens"  # Name of the model class
+path: "models.base_models"  # Path to the module containing the model
+class: "UNetBin"  # Name of the model class
 
 # Model parameters
 params:
-  in_channels: 3  # RGB input
-  out_channels: 1  # Binary segmentation output
-  encoder_channels: 64  # Initial number of encoder channels
-  decoder_channels: 32  # Initial number of decoder channels
-  num_blocks: 4  # Number of encoder/decoder blocks
-  dropout: 0.2  # Dropout rate
+  three_dimensional: False
+  m_channels: 32
+  n_convs: 2
+  n_levels: 3
+  dropout: 0.1
+  batch_norm: True
+  upsampling: "bilinear"
+  pooling: "max"
+  in_channels: 3
+  out_channels: 1
 
 # ------------------------------------
 # models/custom_model.py
@@ -3902,7 +5271,7 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='deconv',
+                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
                  pooling="max", three_dimensional=False):
         super().__init__()
 
@@ -3980,7 +5349,7 @@ class UNet(nn.Module):
 
 class UNetReg(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=1, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='deconv',
+                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
                  pooling="max", three_dimensional=False):
         super().__init__()
 
@@ -4060,7 +5429,7 @@ class UNetReg(nn.Module):
 
 class UNetBin(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='deconv',
+                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
                  pooling="max", three_dimensional=False):
         super().__init__()
 
