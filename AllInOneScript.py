@@ -256,8 +256,22 @@ class SegLitModule(pl.LightningModule):
         self.val_metric_frequencies = val_metric_frequencies or {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+        """
+        During training, run the raw model on incoming patches.
+        During validation / testing / prediction, automatically
+        pad & chunk the input so that full-image inference
+        goes through your Validator (with proper 16-divisibility).
+        """
+        # if we're in train() mode, just do raw patch-based forward
+        if self.training:
+            return self.model(x)
 
+        # otherwise (val/test/predict), run full-image chunked inference
+        # (validator will pad to divisible-by-16 under the hood)
+        with torch.no_grad():
+            y_hat = self.validator.run_chunked_inference(self.model, x)
+        return y_hat
+    
     def on_train_epoch_start(self):
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
@@ -4918,12 +4932,12 @@ primary_loss:
 # Patch size for inference [height, width]
 # Patches of this size will be processed independently 
 # and then reassembled to form the full output
-patch_size: [512, 512]
+patch_size: [256, 256]
 
 # Patch margin [height, width]
 # Margin of overlap between patches to avoid edge artifacts
 # The effective stride will be (patch_size - 2*patch_margin)
-patch_margin: [100, 100]
+patch_margin: [50, 50]
 
 
 # ------------------------------------
@@ -4958,7 +4972,7 @@ val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
 # Patch and crop settings
-patch_size: 512  # Size of training patches
+patch_size: 256  # Size of training patches
 small_window_size: 8  # Size of window to check for variation
 validate_road_ratio: false  # Validate patch has enough road content
 threshold: 0.05  # Minimum road ratio threshold
@@ -4970,7 +4984,7 @@ pin_memory: true
 # Modality settings
 modalities:
   image: "sat"  # Satellite imagery folder
-  label: "map"  # Road map folder
+  label: "label"  # Road map folder
   # distance: "distance"  # Distance transform folder
   # sdf: "sdf"  # Signed distance function folder
 

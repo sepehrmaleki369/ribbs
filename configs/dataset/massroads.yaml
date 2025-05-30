@@ -27,7 +27,7 @@ val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
 # Patch and crop settings
-patch_size: 512  # Size of training patches
+patch_size: 256  # Size of training patches
 small_window_size: 8  # Size of window to check for variation
 validate_road_ratio: false  # Validate patch has enough road content
 threshold: 0.05  # Minimum road ratio threshold
@@ -39,7 +39,7 @@ pin_memory: true
 # Modality settings
 modalities:
   image: "sat"  # Satellite imagery folder
-  label: "map"  # Road map folder
+  label: "label"  # Road map folder
   # distance: "distance"  # Distance transform folder
   # sdf: "sdf"  # Signed distance function folder
 

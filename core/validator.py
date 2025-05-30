@@ -93,67 +93,59 @@ class Validator:
         return output
     
     def run_chunked_inference(
-        self, 
-        model: nn.Module, 
-        image: torch.Tensor, 
+        self,
+        model: nn.Module,
+        image: torch.Tensor,
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
         """
         Run inference on a large image by processing it in chunks.
-        Uses the exact Road_2D_EEF process_in_chunks approach with robust size handling.
-        
-        Args:
-            model: The model to use for inference
-            image: Input image tensor (N, C, H, W)
-            device: Device to run inference on (default: None, uses model's device)
-            
-        Returns:
-            Output tensor with predictions for the full image
+        Pads the full image up to a multiple of 16, then
+        splits into overlapping patches with margin, runs each
+        chunk through the model, and stitches back together.
         """
         if device is None:
             device = next(model.parameters()).device
-            
+
         model.eval()
         image = image.to(device)
-        
-        # Store original dimensions
-        original_shape = image.shape
-        
-        # Pad image to ensure valid dimensions for UNet
-        # Use 16 as divisor for UNet with 3-4 levels (2^4 = 16)
-        padded_image, padding = self._pad_to_valid_size(image, divisor=16)
-        
-        # Get padded image dimensions
+
+        # 1) pad the full image so H and W are divisible by 16
+        padded_image, (pad_h, pad_w) = self._pad_to_valid_size(image, divisor=16)
         N, C, H, W = padded_image.shape
-        
-        # Create empty output tensor - determine output channels first
+
+        # 2) figure out how many output channels the model produces
+        #    by running one patch—but *also* pad that patch to 16!
         with torch.no_grad():
-            # Create a small test patch to determine output channels
+            # define a “test patch” of size (patch_size + 2*margin)
             test_h = min(H, self.patch_size[0] + 2 * self.patch_margin[0])
             test_w = min(W, self.patch_size[1] + 2 * self.patch_margin[1])
             test_patch = padded_image[:, :, :test_h, :test_w]
-            test_output = model(test_patch)
-            out_channels = test_output.shape[1]
-            
-        # Initialize output tensor (N, out_channels, H, W)
-        output = torch.zeros((N, out_channels, H, W), device=device, dtype=test_output.dtype)
-        
-        # Define the process function that will be called for each chunk
-        def process_chunk(chunk):
+            # pad it so its dims are multiples of 16
+            test_patch, _ = self._pad_to_valid_size(test_patch, divisor=16)
+            test_out = model(test_patch)
+            out_channels = test_out.shape[1]
+
+        # 3) allocate a big “canvas” for all of our outputs
+        output = torch.zeros((N, out_channels, H, W), device=device, dtype=test_out.dtype)
+
+        # 4) define a helper that just calls the model
+        def _process(chunk: torch.Tensor) -> torch.Tensor:
             with torch.no_grad():
                 return model(chunk)
-        
-        # Use the original process_in_chuncks function
+
+        # 5) chunk & stitch
         with torch.no_grad():
             output = process_in_chuncks(
-                padded_image, 
-                output, 
-                process_chunk, 
-                list(self.patch_size), 
-                list(self.patch_margin)
+                padded_image,
+                output,
+                _process,
+                list(self.patch_size),
+                list(self.patch_margin),
             )
-        
-        # Remove padding to restore original dimensions
-        output = self._remove_padding(output, padding)
-        
+
+        # 6) remove exactly the same padding we added at the top
+        if pad_h > 0 or pad_w > 0:
+            output = output[:, :, : image.shape[2], : image.shape[3]]
+
         return output
