@@ -43,8 +43,22 @@ class SegLitModule(pl.LightningModule):
         self.val_metric_frequencies = val_metric_frequencies or {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+        """
+        During training, run the raw model on incoming patches.
+        During validation / testing / prediction, automatically
+        pad & chunk the input so that full-image inference
+        goes through your Validator (with proper 16-divisibility).
+        """
+        # if we're in train() mode, just do raw patch-based forward
+        if self.training:
+            return self.model(x)
 
+        # otherwise (val/test/predict), run full-image chunked inference
+        # (validator will pad to divisible-by-16 under the hood)
+        with torch.no_grad():
+            y_hat = self.validator.run_chunked_inference(self.model, x)
+        return y_hat
+    
     def on_train_epoch_start(self):
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
