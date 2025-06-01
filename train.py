@@ -40,7 +40,18 @@ logging.getLogger('rasterio.env').setLevel(logging.WARNING)
 logging.getLogger('rasterio._io').setLevel(logging.WARNING)
 logging.getLogger('rasterio._env').setLevel(logging.WARNING)
 logging.getLogger('rasterio._base').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
+logging.getLogger('tensorboard').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
+# I think you can remove lines 38-48
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger('core').setLevel(logging.DEBUG)
+logging.getLogger('__main__').setLevel(logging.DEBUG)
 
 def load_config(config_path: str) -> Dict[str, Any]:
     return yaml_read(config_path)
