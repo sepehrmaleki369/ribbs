@@ -32,7 +32,7 @@ metrics:
     path: "metrics.apls"
     class: "APLS"
     params:
-      angle_range: [175, 185]
+      angle_range: [135, 225]
       max_nodes: 1000
       max_snap_dist: 25
       allow_renaming: true

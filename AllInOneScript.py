@@ -187,7 +187,7 @@ def main():
         save_dir=pred_save_dir,
         save_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
         save_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
-        max_samples=trainer_cfg.get("save_gt_pred_max_samples", 4)
+        max_samples=trainer_cfg.get("save_gt_pred_max_samples", None)
     ))
 
     # --- trainer & logger ---
@@ -1273,7 +1273,7 @@ class Validator:
         if pad_h > 0 or pad_w > 0:
             # Pad with reflection to avoid artifacts
             image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
-            self.logger.debug(f"Padded image from ({H}, {W}) to ({H + pad_h}, {W + pad_w})")
+            # self.logger.debug(f"Padded image from ({H}, {W}) to ({H + pad_h}, {W + pad_w})")
         
         return image, (pad_h, pad_w)
     
@@ -1880,6 +1880,7 @@ class PredictionSaver(Callback):
     - Fixed buffer reset logic to prevent state corruption
     - Proper epoch state management
     - Early returns to avoid unnecessary processing
+    - Save ALL samples instead of limiting to max_samples
     """
     
     def __init__(
@@ -1887,7 +1888,7 @@ class PredictionSaver(Callback):
         save_dir: str,
         save_every_n_epochs: int = 5,
         save_after_epoch: int = 0,
-        max_samples: int = 4
+        max_samples: int = None  # None means save all samples
     ):
         """
         Initialize the PredictionSaver callback.
@@ -1896,13 +1897,13 @@ class PredictionSaver(Callback):
             save_dir: Directory to save prediction data
             save_every_n_epochs: How often to save (every N epochs)
             save_after_epoch: Only start saving after this epoch
-            max_samples: Maximum number of samples to save per epoch
+            max_samples: Maximum number of samples to save per epoch (None = save all)
         """
         super().__init__()
         self.save_dir = save_dir
         self.save_every_n_epochs = save_every_n_epochs
         self.save_after_epoch = save_after_epoch
-        self.max_samples = max_samples
+        self.max_samples = max_samples  # None means no limit
         self.logger = logging.getLogger(__name__)
         
         # Initialize state
@@ -1913,7 +1914,10 @@ class PredictionSaver(Callback):
         self.logger.info(f"  save_dir: {save_dir}")
         self.logger.info(f"  save_every_n_epochs: {save_every_n_epochs}")
         self.logger.info(f"  save_after_epoch: {save_after_epoch}")
-        self.logger.info(f"  max_samples: {max_samples}")
+        if max_samples is None:
+            self.logger.info(f"  max_samples: unlimited (save all)")
+        else:
+            self.logger.info(f"  max_samples: {max_samples}")
     
     def _reset_buffers(self):
         """Reset the internal buffers that collect samples."""
@@ -1965,28 +1969,48 @@ class PredictionSaver(Callback):
         if self._saved_this_epoch:
             return
             
-        if self._collected >= self.max_samples:
+        # Only check max_samples if it's set (not None)
+        if self.max_samples is not None and self._collected >= self.max_samples:
             return
         
         current_epoch = trainer.current_epoch
         if not self._should_save_this_epoch(current_epoch):
             return
         
-        # Extract data
+        # Extract data with additional safety checks
         try:
+            if outputs is None or not isinstance(outputs, dict):
+                return
+            if "predictions" not in outputs:
+                return
+                
             y_true = batch[pl_module.target_key]
             y_pred = outputs["predictions"]
-        except KeyError as e:
-            self.logger.warning(f"Missing key in batch or outputs: {e}")
+            
+            # Validate tensor shapes
+            if y_true.numel() == 0 or y_pred.numel() == 0:
+                return
+                
+        except (KeyError, AttributeError, RuntimeError) as e:
+            self.logger.debug(f"Skipping batch due to extraction error: {e}")
             return
         
         # Move to CPU and detach to prevent memory leaks
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
+        try:
+            y_true = y_true.detach().cpu()
+            y_pred = y_pred.detach().cpu()
+        except RuntimeError as e:
+            self.logger.debug(f"Error moving tensors to CPU: {e}")
+            return
         
         # Calculate how many samples to take
-        remaining = self.max_samples - self._collected
-        take = min(remaining, y_pred.shape[0])
+        if self.max_samples is None:
+            # Take all samples from the batch
+            take = y_pred.shape[0]
+        else:
+            # Take limited samples
+            remaining = self.max_samples - self._collected
+            take = min(remaining, y_pred.shape[0])
         
         if take > 0:
             # Append the slices
@@ -1994,8 +2018,16 @@ class PredictionSaver(Callback):
             self._preds.append(y_pred[:take])
             self._collected += take
             
-            self.logger.debug(f"Collected {take} samples from validation batch {batch_idx} "
-                            f"(total: {self._collected}/{self.max_samples})")
+            # Log progress periodically
+            if self.max_samples is None:
+                if batch_idx % 10 == 0:  # Log every 10 batches when saving all
+                    self.logger.debug(f"Collected {self._collected} samples so far (batch {batch_idx})")
+            else:
+                # Only log at INFO level when we reach max samples
+                if self._collected >= self.max_samples:
+                    self.logger.info(f"Collected maximum {self.max_samples} samples for epoch {current_epoch}")
+                else:
+                    self.logger.debug(f"Collected {take} samples from validation batch {batch_idx}")
     
     def on_test_batch_end(
         self,
@@ -2008,24 +2040,47 @@ class PredictionSaver(Callback):
     ):
         """Collect test batch results for later saving."""
         # Early returns
-        if self._saved_this_epoch or self._collected >= self.max_samples:
+        if self._saved_this_epoch:
+            return
+        
+        # Only check max_samples if it's set (not None)
+        if self.max_samples is not None and self._collected >= self.max_samples:
             return
         
         # Extract data
         try:
+            if outputs is None or not isinstance(outputs, dict):
+                return
+            if "predictions" not in outputs:
+                return
+                
             y_true = batch[pl_module.target_key]
             y_pred = outputs["predictions"]
-        except KeyError as e:
-            self.logger.warning(f"Missing key in batch or outputs: {e}")
+            
+            # Validate tensor shapes
+            if y_true.numel() == 0 or y_pred.numel() == 0:
+                return
+                
+        except (KeyError, AttributeError, RuntimeError) as e:
+            self.logger.debug(f"Skipping test batch due to extraction error: {e}")
             return
         
         # Move to CPU and detach
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
+        try:
+            y_true = y_true.detach().cpu()
+            y_pred = y_pred.detach().cpu()
+        except RuntimeError as e:
+            self.logger.debug(f"Error moving tensors to CPU: {e}")
+            return
         
         # Calculate how many samples to take
-        remaining = self.max_samples - self._collected
-        take = min(remaining, y_pred.shape[0])
+        if self.max_samples is None:
+            # Take all samples from the batch
+            take = y_pred.shape[0]
+        else:
+            # Take limited samples
+            remaining = self.max_samples - self._collected
+            take = min(remaining, y_pred.shape[0])
         
         if take > 0:
             self._gts.append(y_true[:take])
@@ -5023,7 +5078,7 @@ trainer:
 
   save_gt_pred_val_test_every_n_epochs: 10  # Save every 5 epochs
   save_gt_pred_val_test_after_epoch: 0    # Start saving after epoch 10
-  save_gt_pred_max_samples: 4              # Save up to 4 samples per epoch
+  save_gt_pred_max_samples: null              # Save up to 4 samples per epoch
   
   # Extra arguments passed directly to PyTorch Lightning Trainer
   extra_args:
@@ -5095,7 +5150,7 @@ metrics:
     path: "metrics.apls"
     class: "APLS"
     params:
-      angle_range: [175, 185]
+      angle_range: [135, 225]
       max_nodes: 1000
       max_snap_dist: 25
       allow_renaming: true

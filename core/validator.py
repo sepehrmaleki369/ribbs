@@ -65,7 +65,7 @@ class Validator:
         if pad_h > 0 or pad_w > 0:
             # Pad with reflection to avoid artifacts
             image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
-            self.logger.debug(f"Padded image from ({H}, {W}) to ({H + pad_h}, {W + pad_w})")
+            # self.logger.debug(f"Padded image from ({H}, {W}) to ({H + pad_h}, {W + pad_w})")
         
         return image, (pad_h, pad_w)
     
