@@ -15,12 +15,9 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-try:
-    import rasterio
-    from rasterio.errors import NotGeoreferencedWarning
-    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
-except ImportError:
-    pass
+import rasterio
+from rasterio.errors import NotGeoreferencedWarning
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

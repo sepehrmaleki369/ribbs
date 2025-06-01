@@ -35,6 +35,13 @@ from core.utils import yaml_read, mkdir
 from seglit_module import SegLitModule
 
 
+logging.getLogger('rasterio').setLevel(logging.WARNING)
+logging.getLogger('rasterio.env').setLevel(logging.WARNING)
+logging.getLogger('rasterio._io').setLevel(logging.WARNING)
+logging.getLogger('rasterio._env').setLevel(logging.WARNING)
+logging.getLogger('rasterio._base').setLevel(logging.WARNING)
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     return yaml_read(config_path)
 
@@ -129,6 +136,7 @@ def main():
         metric_names=list(metric_list.keys()),
         mode="max",
         save_last=True,
+        last_k=1,  # Save last checkpoint every epoch instead of every 5 epochs
     ))
     
     # Add PredictionLogger to visualize predictions
@@ -170,6 +178,8 @@ def main():
 
     # --- trainer & logger ---
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
+    
+    # Prepare trainer kwargs - FIXED: Remove resume_from_checkpoint
     trainer_kwargs = {
         "max_epochs": max_epochs,
         "callbacks": callbacks,
@@ -178,18 +188,28 @@ def main():
         "check_val_every_n_epoch": trainer_cfg.get("val_every_n_epochs", 1),  # Validate every N epochs
         **trainer_cfg.get("extra_args", {}),
     }
-    if args.resume:
-        trainer_kwargs["resume_from_checkpoint"] = args.resume
-
+    
+    # Don't add resume_from_checkpoint to trainer_kwargs anymore
     trainer = pl.Trainer(**trainer_kwargs)
 
     # --- run ---
     if args.test:
         logger.info("Running test...")
-        trainer.test(lit, datamodule=dm)
+        # For testing, load from checkpoint if provided
+        if args.resume:
+            logger.info(f"Loading checkpoint for testing: {args.resume}")
+            trainer.test(lit, datamodule=dm, ckpt_path=args.resume)
+        else:
+            trainer.test(lit, datamodule=dm)
     else:
         logger.info("Running training...")
-        trainer.fit(lit, datamodule=dm)
+        # For training, use ckpt_path parameter in fit() method
+        if args.resume:
+            logger.info(f"Resuming training from checkpoint: {args.resume}")
+            trainer.fit(lit, datamodule=dm, ckpt_path=args.resume)
+        else:
+            logger.info("Starting training from scratch...")
+            trainer.fit(lit, datamodule=dm)
 
         # test best checkpoint
         mgr = CheckpointManager(

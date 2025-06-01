@@ -22,7 +22,7 @@ use_splitting: false
 # source_folder: 'train'
 
 # Batch sizes
-train_batch_size: 8
+train_batch_size: 16
 val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
@@ -58,7 +58,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images: 10  # No limit (set a number to limit images loaded)
+# max_images: 10  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: false  # Save computed distance maps and SDFs
 verbose: false  # Verbose output

@@ -173,6 +173,8 @@ def main():
 
     # --- trainer & logger ---
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
+    
+    # Prepare trainer kwargs - FIXED: Remove resume_from_checkpoint
     trainer_kwargs = {
         "max_epochs": max_epochs,
         "callbacks": callbacks,
@@ -181,18 +183,28 @@ def main():
         "check_val_every_n_epoch": trainer_cfg.get("val_every_n_epochs", 1),  # Validate every N epochs
         **trainer_cfg.get("extra_args", {}),
     }
-    if args.resume:
-        trainer_kwargs["resume_from_checkpoint"] = args.resume
-
+    
+    # Don't add resume_from_checkpoint to trainer_kwargs anymore
     trainer = pl.Trainer(**trainer_kwargs)
 
     # --- run ---
     if args.test:
         logger.info("Running test...")
-        trainer.test(lit, datamodule=dm)
+        # For testing, load from checkpoint if provided
+        if args.resume:
+            logger.info(f"Loading checkpoint for testing: {args.resume}")
+            trainer.test(lit, datamodule=dm, ckpt_path=args.resume)
+        else:
+            trainer.test(lit, datamodule=dm)
     else:
         logger.info("Running training...")
-        trainer.fit(lit, datamodule=dm)
+        # For training, use ckpt_path parameter in fit() method
+        if args.resume:
+            logger.info(f"Resuming training from checkpoint: {args.resume}")
+            trainer.fit(lit, datamodule=dm, ckpt_path=args.resume)
+        else:
+            logger.info("Starting training from scratch...")
+            trainer.fit(lit, datamodule=dm)
 
         # test best checkpoint
         mgr = CheckpointManager(
@@ -1277,70 +1289,63 @@ class Validator:
         return output
     
     def run_chunked_inference(
-        self, 
-        model: nn.Module, 
-        image: torch.Tensor, 
+        self,
+        model: nn.Module,
+        image: torch.Tensor,
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
         """
         Run inference on a large image by processing it in chunks.
-        Uses the exact Road_2D_EEF process_in_chunks approach with robust size handling.
-        
-        Args:
-            model: The model to use for inference
-            image: Input image tensor (N, C, H, W)
-            device: Device to run inference on (default: None, uses model's device)
-            
-        Returns:
-            Output tensor with predictions for the full image
+        Pads the full image up to a multiple of 16, then
+        splits into overlapping patches with margin, runs each
+        chunk through the model, and stitches back together.
         """
         if device is None:
             device = next(model.parameters()).device
-            
+
         model.eval()
         image = image.to(device)
-        
-        # Store original dimensions
-        original_shape = image.shape
-        
-        # Pad image to ensure valid dimensions for UNet
-        # Use 16 as divisor for UNet with 3-4 levels (2^4 = 16)
-        padded_image, padding = self._pad_to_valid_size(image, divisor=16)
-        
-        # Get padded image dimensions
+
+        # 1) pad the full image so H and W are divisible by 16
+        padded_image, (pad_h, pad_w) = self._pad_to_valid_size(image, divisor=16)
         N, C, H, W = padded_image.shape
-        
-        # Create empty output tensor - determine output channels first
+
+        # 2) figure out how many output channels the model produces
+        #    by running one patch—but *also* pad that patch to 16!
         with torch.no_grad():
-            # Create a small test patch to determine output channels
+            # define a “test patch” of size (patch_size + 2*margin)
             test_h = min(H, self.patch_size[0] + 2 * self.patch_margin[0])
             test_w = min(W, self.patch_size[1] + 2 * self.patch_margin[1])
             test_patch = padded_image[:, :, :test_h, :test_w]
-            test_output = model(test_patch)
-            out_channels = test_output.shape[1]
-            
-        # Initialize output tensor (N, out_channels, H, W)
-        output = torch.zeros((N, out_channels, H, W), device=device, dtype=test_output.dtype)
-        
-        # Define the process function that will be called for each chunk
-        def process_chunk(chunk):
+            # pad it so its dims are multiples of 16
+            test_patch, _ = self._pad_to_valid_size(test_patch, divisor=16)
+            test_out = model(test_patch)
+            out_channels = test_out.shape[1]
+
+        # 3) allocate a big “canvas” for all of our outputs
+        output = torch.zeros((N, out_channels, H, W), device=device, dtype=test_out.dtype)
+
+        # 4) define a helper that just calls the model
+        def _process(chunk: torch.Tensor) -> torch.Tensor:
             with torch.no_grad():
                 return model(chunk)
-        
-        # Use the original process_in_chuncks function
+
+        # 5) chunk & stitch
         with torch.no_grad():
             output = process_in_chuncks(
-                padded_image, 
-                output, 
-                process_chunk, 
-                list(self.patch_size), 
-                list(self.patch_margin)
+                padded_image,
+                output,
+                _process,
+                list(self.patch_size),
+                list(self.patch_margin),
             )
-        
-        # Remove padding to restore original dimensions
-        output = self._remove_padding(output, padding)
-        
+
+        # 6) remove exactly the same padding we added at the top
+        if pad_h > 0 or pad_w > 0:
+            output = output[:, :, : image.shape[2], : image.shape[3]]
+
         return output
+
 
 # ------------------------------------
 # core/model_loader.py
@@ -1884,6 +1889,13 @@ class PredictionSaver(Callback):
         
         # Buffers to collect samples
         self._reset_buffers()
+        
+        # Debug info
+        self.logger.info(f"PredictionSaver initialized:")
+        self.logger.info(f"  save_dir: {save_dir}")
+        self.logger.info(f"  save_every_n_epochs: {save_every_n_epochs}")
+        self.logger.info(f"  save_after_epoch: {save_after_epoch}")
+        self.logger.info(f"  max_samples: {max_samples}")
     
     def _reset_buffers(self):
         """Reset the internal buffers that collect samples."""
@@ -1895,22 +1907,30 @@ class PredictionSaver(Callback):
     def _should_save_this_epoch(self, epoch):
         """Determine if we should save data for this epoch."""
         if epoch < self.save_after_epoch:
+            self.logger.debug(f"Epoch {epoch} < save_after_epoch {self.save_after_epoch}, not saving")
             return False
             
-        return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
+        should_save = (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
+        self.logger.debug(f"Epoch {epoch}: should_save = {should_save}")
+        return should_save
     
     def on_validation_epoch_start(self, trainer, pl_module):
         """Reset buffers at the start of a validation epoch."""
         current_epoch = trainer.current_epoch
+        self.logger.info(f"Validation epoch start: epoch {current_epoch}")
+        
         if self._should_save_this_epoch(current_epoch):
+            self.logger.info(f"Will save predictions this epoch ({current_epoch})")
             self._reset_buffers()
         else:
             # Mark as already done for non-saving epochs
+            self.logger.info(f"Not a saving epoch ({current_epoch}), skipping")
             self._saved_this_epoch = True
     
     def on_test_epoch_start(self, trainer, pl_module):
         """Reset buffers at the start of a test epoch."""
         # Always save during test
+        self.logger.info(f"Test epoch start: epoch {trainer.current_epoch}")
         self._reset_buffers()
     
     def on_validation_batch_end(
@@ -1923,17 +1943,28 @@ class PredictionSaver(Callback):
         dataloader_idx=0
     ):
         """Collect validation batch results for later saving."""
+        current_epoch = trainer.current_epoch
+        
         # Skip if we already collected enough samples this epoch or it's not a saving epoch
-        if self._saved_this_epoch or self._collected >= self.max_samples:
+        if self._saved_this_epoch:
+            self.logger.debug(f"Already saved this epoch {current_epoch}, skipping batch {batch_idx}")
+            return
+            
+        if self._collected >= self.max_samples:
+            self.logger.debug(f"Already collected {self._collected} samples (max: {self.max_samples}), skipping batch {batch_idx}")
             return
         
-        current_epoch = trainer.current_epoch
         if not self._should_save_this_epoch(current_epoch):
+            self.logger.debug(f"Not a saving epoch {current_epoch}, skipping batch {batch_idx}")
             return
+        
+        self.logger.info(f"Collecting batch {batch_idx} for epoch {current_epoch} (collected so far: {self._collected})")
         
         # Get ground truth and prediction
         y_true = batch[pl_module.target_key]
         y_pred = outputs["predictions"]
+        
+        self.logger.debug(f"  y_true shape: {y_true.shape}, y_pred shape: {y_pred.shape}")
         
         # Move to CPU and detach
         y_true = y_true.detach().cpu()
@@ -1943,10 +1974,14 @@ class PredictionSaver(Callback):
         remaining = self.max_samples - self._collected
         take = min(remaining, y_pred.shape[0])
         
+        self.logger.info(f"  Taking {take} samples from batch (remaining slots: {remaining})")
+        
         # Append the slices
         self._gts.append(y_true[:take])
         self._preds.append(y_pred[:take])
         self._collected += take
+        
+        self.logger.info(f"  Now collected {self._collected}/{self.max_samples} samples")
     
     def on_test_batch_end(
         self,
@@ -1961,6 +1996,8 @@ class PredictionSaver(Callback):
         # Skip if we already collected enough samples
         if self._saved_this_epoch or self._collected >= self.max_samples:
             return
+        
+        self.logger.info(f"Collecting test batch {batch_idx}")
         
         # Get ground truth and prediction
         y_true = batch[pl_module.target_key]
@@ -1982,13 +2019,17 @@ class PredictionSaver(Callback):
     def _save_data(self, trainer, phase="val"):
         """Save collected data as NumPy arrays."""
         if not self._collected:
+            self.logger.warning(f"No data collected to save for {phase}")
             return
             
         current_epoch = trainer.current_epoch
+        self.logger.info(f"Saving {self._collected} {phase} samples for epoch {current_epoch}")
         
         # Concatenate buffers
         gts = torch.cat(self._gts, dim=0)
         preds = torch.cat(self._preds, dim=0)
+        
+        self.logger.info(f"  Concatenated shapes: gts={gts.shape}, preds={preds.shape}")
         
         # Create output directory
         phase_dir = os.path.join(self.save_dir, phase)
@@ -2000,23 +2041,37 @@ class PredictionSaver(Callback):
         preds_numpy = preds.numpy()
         
         # Save as .npy files
-        np.save(os.path.join(epoch_dir, "ground_truth.npy"), gts_numpy)
-        np.save(os.path.join(epoch_dir, "predictions.npy"), preds_numpy)
+        gt_path = os.path.join(epoch_dir, "ground_truth.npy")
+        pred_path = os.path.join(epoch_dir, "predictions.npy")
+        
+        np.save(gt_path, gts_numpy)
+        np.save(pred_path, preds_numpy)
         
         self.logger.info(f"Saved {self._collected} {phase} tensors to {epoch_dir}")
+        self.logger.info(f"  Files: {gt_path}, {pred_path}")
         self._saved_this_epoch = True
     
     def on_validation_epoch_end(self, trainer, pl_module):
         """Save data at the end of the validation epoch if conditions are met."""
+        current_epoch = trainer.current_epoch
+        self.logger.info(f"Validation epoch end: epoch {current_epoch}, saved_this_epoch={self._saved_this_epoch}")
+        
         if not self._saved_this_epoch:
             self._save_data(trainer, "val")
-            self._reset_buffers()
+        
+        # Always reset buffers at the end
+        self._reset_buffers()
     
     def on_test_epoch_end(self, trainer, pl_module):
         """Save data at the end of the test epoch."""
+        current_epoch = trainer.current_epoch
+        self.logger.info(f"Test epoch end: epoch {current_epoch}")
+        
         if not self._saved_this_epoch:
             self._save_data(trainer, "test")
-            self._reset_buffers()
+        
+        # Always reset buffers at the end  
+        self._reset_buffers()
 
 # ------------------------------------
 # core/metric_loader.py
@@ -3984,6 +4039,129 @@ def toolong_tooshort_score(paths_gt, graph_pred, radius_match=5, length_deviatio
     return total, counter_correct/total, counter_tooshort/total, counter_toolong/total, counter_infeasible/total, res    
 
 # ------------------------------------
+# UsefulScripts/inspect_checkpoint.py
+# ------------------------------------
+#!/usr/bin/env python3
+"""
+Script to inspect the contents of a PyTorch Lightning checkpoint
+"""
+
+import torch
+import sys
+import os
+from pprint import pprint
+
+def inspect_checkpoint(checkpoint_path):
+    """Inspect the contents of a checkpoint file"""
+    
+    if not os.path.exists(checkpoint_path):
+        print(f"Error: Checkpoint file not found: {checkpoint_path}")
+        return
+    
+    print(f"Inspecting checkpoint: {checkpoint_path}")
+    print("=" * 60)
+    
+    try:
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Print top-level keys
+        print("Top-level keys in checkpoint:")
+        for key in sorted(checkpoint.keys()):
+            if isinstance(checkpoint[key], dict):
+                print(f"  {key}: dict with {len(checkpoint[key])} keys")
+            elif isinstance(checkpoint[key], list):
+                print(f"  {key}: list with {len(checkpoint[key])} items")
+            elif hasattr(checkpoint[key], 'shape'):
+                print(f"  {key}: tensor with shape {checkpoint[key].shape}")
+            else:
+                print(f"  {key}: {type(checkpoint[key]).__name__} = {checkpoint[key]}")
+        
+        print("\n" + "=" * 60)
+        
+        # Check training state
+        print("Training State:")
+        print(f"  Epoch: {checkpoint.get('epoch', 'NOT FOUND')}")
+        print(f"  Global Step: {checkpoint.get('global_step', 'NOT FOUND')}")
+        print(f"  PyTorch Lightning Version: {checkpoint.get('pytorch-lightning_version', 'NOT FOUND')}")
+        
+        # Check optimizer state
+        print(f"\nOptimizer State:")
+        if 'optimizer_states' in checkpoint:
+            opt_states = checkpoint['optimizer_states']
+            print(f"  Number of optimizers: {len(opt_states)}")
+            for i, opt_state in enumerate(opt_states):
+                if 'param_groups' in opt_state:
+                    param_groups = opt_state['param_groups']
+                    print(f"  Optimizer {i}:")
+                    for j, group in enumerate(param_groups):
+                        print(f"    Param group {j}: lr={group.get('lr', 'NOT FOUND')}")
+                else:
+                    print(f"  Optimizer {i}: No param_groups found")
+        else:
+            print("  NO OPTIMIZER STATES FOUND")
+        
+        # Check learning rate scheduler state
+        print(f"\nLR Scheduler State:")
+        if 'lr_schedulers' in checkpoint:
+            lr_schedulers = checkpoint['lr_schedulers']
+            print(f"  Number of LR schedulers: {len(lr_schedulers)}")
+            for i, scheduler_state in enumerate(lr_schedulers):
+                print(f"  Scheduler {i}:")
+                if isinstance(scheduler_state, dict):
+                    for key, value in scheduler_state.items():
+                        if key == 'state_dict' and isinstance(value, dict):
+                            print(f"    {key}:")
+                            for skey, svalue in value.items():
+                                print(f"      {skey}: {svalue}")
+                        else:
+                            print(f"    {key}: {value}")
+                else:
+                    print(f"    Type: {type(scheduler_state)}")
+                    print(f"    Value: {scheduler_state}")
+        else:
+            print("  NO LR SCHEDULER STATES FOUND")
+        
+        # Check model state dict
+        print(f"\nModel State:")
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            model_keys = [k for k in state_dict.keys() if not k.startswith('loss_fn.') and not k.startswith('metrics.')]
+            print(f"  Model parameters: {len(model_keys)} tensors")
+            if model_keys:
+                print(f"  Sample keys: {list(model_keys)[:3]}...")
+        else:
+            print("  NO MODEL STATE DICT FOUND")
+        
+        # Check hyperparameters
+        print(f"\nHyperparameters:")
+        if 'hyper_parameters' in checkpoint:
+            hparams = checkpoint['hyper_parameters']
+            print(f"  Found {len(hparams)} hyperparameters:")
+            for key, value in hparams.items():
+                if isinstance(value, dict):
+                    print(f"    {key}: dict with {len(value)} keys")
+                else:
+                    print(f"    {key}: {value}")
+        else:
+            print("  NO HYPERPARAMETERS FOUND")
+            
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python inspect_checkpoint.py <checkpoint_path>")
+        print("Example: python inspect_checkpoint.py outputs/baseline_unet_massroads/checkpoints/epoch=1559-step=109200.ckpt")
+        sys.exit(1)
+    
+    checkpoint_path = sys.argv[1]
+    inspect_checkpoint(checkpoint_path) 
+
+
+# ------------------------------------
 # losses/custom_loss.py
 # ------------------------------------
 """
@@ -4800,8 +4978,8 @@ output_dir: "outputs/baseline_unet_massroads"
 
 # Trainer configuration
 trainer:
-  max_epochs: 100
-  val_check_interval: 1.0  # Validate once per epoch
+  max_epochs: 5000
+  val_check_interval: 1  # Validate once per epoch
   skip_validation_until_epoch: 0  # Skip validation for the first 5 epochs
   val_every_n_epochs: 10
   log_every_n_epochs: 2  # Log predictions every 2 epochs
@@ -4809,16 +4987,16 @@ trainer:
   train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
   val_metrics_every_n_epochs: 1      # compute/log val   metrics once every epoch
 
-  save_gt_pred_val_test_every_n_epochs: 5  # Save every 5 epochs
-  save_gt_pred_val_test_after_epoch: 10    # Start saving after epoch 10
+  save_gt_pred_val_test_every_n_epochs: 10  # Save every 5 epochs
+  save_gt_pred_val_test_after_epoch: 0    # Start saving after epoch 10
   save_gt_pred_max_samples: 4              # Save up to 4 samples per epoch
   
   # Extra arguments passed directly to PyTorch Lightning Trainer
   extra_args:
     accelerator: "auto"  # Use GPU if available
     precision: 32  # Mixed precision training
-    gradient_clip_val: 1.0
-    accumulate_grad_batches: 1
+    # gradient_clip_val: 1.0
+    # accumulate_grad_batches: 1
     deterministic: false
 
 # Optimizer configuration
@@ -4967,7 +5145,7 @@ use_splitting: false
 # source_folder: 'train'
 
 # Batch sizes
-train_batch_size: 8
+train_batch_size: 16
 val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
@@ -5003,7 +5181,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images: 10  # No limit (set a number to limit images loaded)
+# max_images: 10  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: false  # Save computed distance maps and SDFs
 verbose: false  # Verbose output
