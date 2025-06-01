@@ -184,7 +184,7 @@ def main():
         save_dir=pred_save_dir,
         save_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
         save_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
-        max_samples=trainer_cfg.get("save_gt_pred_max_samples", 4)
+        max_samples=trainer_cfg.get("save_gt_pred_max_samples", None)
     ))
 
     # --- trainer & logger ---

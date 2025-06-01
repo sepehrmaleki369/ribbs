@@ -93,10 +93,6 @@ class SegLitModule(pl.LightningModule):
         with torch.no_grad():
             y_hat = self.validator.run_chunked_inference(self.model, x)
 
-        # resize if needed
-        if y_hat.shape[2:] != y.shape[2:]:
-            y_hat = F.interpolate(y_hat, size=y.shape[2:], mode='bilinear', align_corners=False)
-
         loss = self.loss_fn(y_hat, y)
         self.log("val_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=1)

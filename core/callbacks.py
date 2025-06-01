@@ -444,6 +444,13 @@ class PredictionSaver(Callback):
     """
     Callback to save ground truth and prediction tensors as NumPy arrays.
     Only saves after a specified starting epoch and at a specified frequency.
+    
+    Fixed issues:
+    - Reduced excessive logging (moved to DEBUG level)
+    - Fixed buffer reset logic to prevent state corruption
+    - Proper epoch state management
+    - Early returns to avoid unnecessary processing
+    - Save ALL samples instead of limiting to max_samples
     """
     
     def __init__(
@@ -451,7 +458,7 @@ class PredictionSaver(Callback):
         save_dir: str,
         save_every_n_epochs: int = 5,
         save_after_epoch: int = 0,
-        max_samples: int = 4
+        max_samples: int = None  # None means save all samples
     ):
         """
         Initialize the PredictionSaver callback.
@@ -460,60 +467,63 @@ class PredictionSaver(Callback):
             save_dir: Directory to save prediction data
             save_every_n_epochs: How often to save (every N epochs)
             save_after_epoch: Only start saving after this epoch
-            max_samples: Maximum number of samples to save per epoch
+            max_samples: Maximum number of samples to save per epoch (None = save all)
         """
         super().__init__()
         self.save_dir = save_dir
         self.save_every_n_epochs = save_every_n_epochs
         self.save_after_epoch = save_after_epoch
-        self.max_samples = max_samples
+        self.max_samples = max_samples  # None means no limit
         self.logger = logging.getLogger(__name__)
         
-        # Buffers to collect samples
+        # Initialize state
         self._reset_buffers()
         
-        # Debug info
+        # Log initialization once at INFO level
         self.logger.info(f"PredictionSaver initialized:")
         self.logger.info(f"  save_dir: {save_dir}")
         self.logger.info(f"  save_every_n_epochs: {save_every_n_epochs}")
         self.logger.info(f"  save_after_epoch: {save_after_epoch}")
-        self.logger.info(f"  max_samples: {max_samples}")
+        if max_samples is None:
+            self.logger.info(f"  max_samples: unlimited (save all)")
+        else:
+            self.logger.info(f"  max_samples: {max_samples}")
     
     def _reset_buffers(self):
         """Reset the internal buffers that collect samples."""
         self._gts = []
         self._preds = []
         self._collected = 0
-        self._saved_this_epoch = False
+        # Note: Don't reset _saved_this_epoch here - it's managed per epoch
     
     def _should_save_this_epoch(self, epoch):
         """Determine if we should save data for this epoch."""
         if epoch < self.save_after_epoch:
-            self.logger.debug(f"Epoch {epoch} < save_after_epoch {self.save_after_epoch}, not saving")
             return False
             
-        should_save = (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
-        self.logger.debug(f"Epoch {epoch}: should_save = {should_save}")
-        return should_save
+        return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
     
     def on_validation_epoch_start(self, trainer, pl_module):
-        """Reset buffers at the start of a validation epoch."""
+        """Reset state at the start of a validation epoch."""
         current_epoch = trainer.current_epoch
-        self.logger.info(f"Validation epoch start: epoch {current_epoch}")
         
+        # Always reset buffers and state for new epoch
+        self._reset_buffers()
+        self._saved_this_epoch = False
+        
+        # Check if we should save this epoch
         if self._should_save_this_epoch(current_epoch):
-            self.logger.info(f"Will save predictions this epoch ({current_epoch})")
-            self._reset_buffers()
+            self.logger.info(f"Will save predictions for epoch {current_epoch}")
         else:
-            # Mark as already done for non-saving epochs
-            self.logger.info(f"Not a saving epoch ({current_epoch}), skipping")
+            # Mark as done for non-saving epochs to skip processing
             self._saved_this_epoch = True
+            self.logger.debug(f"Skipping epoch {current_epoch} (not a saving epoch)")
     
     def on_test_epoch_start(self, trainer, pl_module):
         """Reset buffers at the start of a test epoch."""
-        # Always save during test
-        self.logger.info(f"Test epoch start: epoch {trainer.current_epoch}")
+        self.logger.info(f"Starting test prediction collection for epoch {trainer.current_epoch}")
         self._reset_buffers()
+        self._saved_this_epoch = False
     
     def on_validation_batch_end(
         self,
@@ -525,45 +535,69 @@ class PredictionSaver(Callback):
         dataloader_idx=0
     ):
         """Collect validation batch results for later saving."""
-        current_epoch = trainer.current_epoch
-        
-        # Skip if we already collected enough samples this epoch or it's not a saving epoch
+        # Early returns to avoid unnecessary processing
         if self._saved_this_epoch:
-            self.logger.debug(f"Already saved this epoch {current_epoch}, skipping batch {batch_idx}")
             return
             
-        if self._collected >= self.max_samples:
-            self.logger.debug(f"Already collected {self._collected} samples (max: {self.max_samples}), skipping batch {batch_idx}")
+        # Only check max_samples if it's set (not None)
+        if self.max_samples is not None and self._collected >= self.max_samples:
             return
         
+        current_epoch = trainer.current_epoch
         if not self._should_save_this_epoch(current_epoch):
-            self.logger.debug(f"Not a saving epoch {current_epoch}, skipping batch {batch_idx}")
             return
         
-        self.logger.info(f"Collecting batch {batch_idx} for epoch {current_epoch} (collected so far: {self._collected})")
+        # Extract data with additional safety checks
+        try:
+            if outputs is None or not isinstance(outputs, dict):
+                return
+            if "predictions" not in outputs:
+                return
+                
+            y_true = batch[pl_module.target_key]
+            y_pred = outputs["predictions"]
+            
+            # Validate tensor shapes
+            if y_true.numel() == 0 or y_pred.numel() == 0:
+                return
+                
+        except (KeyError, AttributeError, RuntimeError) as e:
+            self.logger.debug(f"Skipping batch due to extraction error: {e}")
+            return
         
-        # Get ground truth and prediction
-        y_true = batch[pl_module.target_key]
-        y_pred = outputs["predictions"]
+        # Move to CPU and detach to prevent memory leaks
+        try:
+            y_true = y_true.detach().cpu()
+            y_pred = y_pred.detach().cpu()
+        except RuntimeError as e:
+            self.logger.debug(f"Error moving tensors to CPU: {e}")
+            return
         
-        self.logger.debug(f"  y_true shape: {y_true.shape}, y_pred shape: {y_pred.shape}")
+        # Calculate how many samples to take
+        if self.max_samples is None:
+            # Take all samples from the batch
+            take = y_pred.shape[0]
+        else:
+            # Take limited samples
+            remaining = self.max_samples - self._collected
+            take = min(remaining, y_pred.shape[0])
         
-        # Move to CPU and detach
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
-        
-        # How many more samples we need
-        remaining = self.max_samples - self._collected
-        take = min(remaining, y_pred.shape[0])
-        
-        self.logger.info(f"  Taking {take} samples from batch (remaining slots: {remaining})")
-        
-        # Append the slices
-        self._gts.append(y_true[:take])
-        self._preds.append(y_pred[:take])
-        self._collected += take
-        
-        self.logger.info(f"  Now collected {self._collected}/{self.max_samples} samples")
+        if take > 0:
+            # Append the slices
+            self._gts.append(y_true[:take])
+            self._preds.append(y_pred[:take])
+            self._collected += take
+            
+            # Log progress periodically
+            if self.max_samples is None:
+                if batch_idx % 10 == 0:  # Log every 10 batches when saving all
+                    self.logger.debug(f"Collected {self._collected} samples so far (batch {batch_idx})")
+            else:
+                # Only log at INFO level when we reach max samples
+                if self._collected >= self.max_samples:
+                    self.logger.info(f"Collected maximum {self.max_samples} samples for epoch {current_epoch}")
+                else:
+                    self.logger.debug(f"Collected {take} samples from validation batch {batch_idx}")
     
     def on_test_batch_end(
         self,
@@ -575,82 +609,124 @@ class PredictionSaver(Callback):
         dataloader_idx=0
     ):
         """Collect test batch results for later saving."""
-        # Skip if we already collected enough samples
-        if self._saved_this_epoch or self._collected >= self.max_samples:
+        # Early returns
+        if self._saved_this_epoch:
             return
         
-        self.logger.info(f"Collecting test batch {batch_idx}")
+        # Only check max_samples if it's set (not None)
+        if self.max_samples is not None and self._collected >= self.max_samples:
+            return
         
-        # Get ground truth and prediction
-        y_true = batch[pl_module.target_key]
-        y_pred = outputs["predictions"]
+        # Extract data
+        try:
+            if outputs is None or not isinstance(outputs, dict):
+                return
+            if "predictions" not in outputs:
+                return
+                
+            y_true = batch[pl_module.target_key]
+            y_pred = outputs["predictions"]
+            
+            # Validate tensor shapes
+            if y_true.numel() == 0 or y_pred.numel() == 0:
+                return
+                
+        except (KeyError, AttributeError, RuntimeError) as e:
+            self.logger.debug(f"Skipping test batch due to extraction error: {e}")
+            return
         
         # Move to CPU and detach
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
+        try:
+            y_true = y_true.detach().cpu()
+            y_pred = y_pred.detach().cpu()
+        except RuntimeError as e:
+            self.logger.debug(f"Error moving tensors to CPU: {e}")
+            return
         
-        # How many more samples we need
-        remaining = self.max_samples - self._collected
-        take = min(remaining, y_pred.shape[0])
+        # Calculate how many samples to take
+        if self.max_samples is None:
+            # Take all samples from the batch
+            take = y_pred.shape[0]
+        else:
+            # Take limited samples
+            remaining = self.max_samples - self._collected
+            take = min(remaining, y_pred.shape[0])
         
-        # Append the slices
-        self._gts.append(y_true[:take])
-        self._preds.append(y_pred[:take])
-        self._collected += take
+        if take > 0:
+            self._gts.append(y_true[:take])
+            self._preds.append(y_pred[:take])
+            self._collected += take
+            
+            self.logger.debug(f"Collected {take} samples from test batch {batch_idx}")
     
     def _save_data(self, trainer, phase="val"):
         """Save collected data as NumPy arrays."""
-        if not self._collected:
-            self.logger.warning(f"No data collected to save for {phase}")
-            return
+        if self._collected == 0:
+            self.logger.debug(f"No data collected to save for {phase}")
+            return False
             
         current_epoch = trainer.current_epoch
-        self.logger.info(f"Saving {self._collected} {phase} samples for epoch {current_epoch}")
         
-        # Concatenate buffers
-        gts = torch.cat(self._gts, dim=0)
-        preds = torch.cat(self._preds, dim=0)
-        
-        self.logger.info(f"  Concatenated shapes: gts={gts.shape}, preds={preds.shape}")
-        
-        # Create output directory
-        phase_dir = os.path.join(self.save_dir, phase)
-        epoch_dir = os.path.join(phase_dir, f"epoch_{current_epoch:06d}")
-        os.makedirs(epoch_dir, exist_ok=True)
-        
-        # Convert to NumPy and save
-        gts_numpy = gts.numpy()
-        preds_numpy = preds.numpy()
-        
-        # Save as .npy files
-        gt_path = os.path.join(epoch_dir, "ground_truth.npy")
-        pred_path = os.path.join(epoch_dir, "predictions.npy")
-        
-        np.save(gt_path, gts_numpy)
-        np.save(pred_path, preds_numpy)
-        
-        self.logger.info(f"Saved {self._collected} {phase} tensors to {epoch_dir}")
-        self.logger.info(f"  Files: {gt_path}, {pred_path}")
-        self._saved_this_epoch = True
+        try:
+            # Concatenate buffers
+            gts = torch.cat(self._gts, dim=0)
+            preds = torch.cat(self._preds, dim=0)
+            
+            # Create output directory
+            phase_dir = os.path.join(self.save_dir, phase)
+            epoch_dir = os.path.join(phase_dir, f"epoch_{current_epoch:06d}")
+            os.makedirs(epoch_dir, exist_ok=True)
+            
+            # Convert to NumPy and save
+            gts_numpy = gts.numpy()
+            preds_numpy = preds.numpy()
+            
+            # Save as .npy files
+            gt_path = os.path.join(epoch_dir, "ground_truth.npy")
+            pred_path = os.path.join(epoch_dir, "predictions.npy")
+            
+            np.save(gt_path, gts_numpy)
+            np.save(pred_path, preds_numpy)
+            
+            self.logger.info(f"Saved {self._collected} {phase} samples for epoch {current_epoch} "
+                           f"(shapes: gt={gts_numpy.shape}, pred={preds_numpy.shape})")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save {phase} data for epoch {current_epoch}: {e}")
+            return False
     
     def on_validation_epoch_end(self, trainer, pl_module):
         """Save data at the end of the validation epoch if conditions are met."""
         current_epoch = trainer.current_epoch
-        self.logger.info(f"Validation epoch end: epoch {current_epoch}, saved_this_epoch={self._saved_this_epoch}")
         
-        if not self._saved_this_epoch:
-            self._save_data(trainer, "val")
+        # Only attempt to save if we haven't already saved and we collected data
+        if not self._saved_this_epoch and self._collected > 0:
+            success = self._save_data(trainer, "val")
+            if success:
+                self._saved_this_epoch = True
         
-        # Always reset buffers at the end
-        self._reset_buffers()
+        # Clean up buffers to free memory
+        self._gts.clear()
+        self._preds.clear()
+        self._collected = 0
+        
+        self.logger.debug(f"Validation epoch {current_epoch} end: "
+                         f"saved={self._saved_this_epoch}")
     
     def on_test_epoch_end(self, trainer, pl_module):
         """Save data at the end of the test epoch."""
         current_epoch = trainer.current_epoch
-        self.logger.info(f"Test epoch end: epoch {current_epoch}")
         
-        if not self._saved_this_epoch:
-            self._save_data(trainer, "test")
+        if not self._saved_this_epoch and self._collected > 0:
+            success = self._save_data(trainer, "test")
+            if success:
+                self._saved_this_epoch = True
         
-        # Always reset buffers at the end  
-        self._reset_buffers()
+        # Clean up buffers
+        self._gts.clear()
+        self._preds.clear()
+        self._collected = 0
+        
+        self.logger.debug(f"Test epoch {current_epoch} end")
