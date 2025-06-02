@@ -1875,12 +1875,7 @@ class PredictionSaver(Callback):
     Callback to save ground truth and prediction tensors as NumPy arrays.
     Only saves after a specified starting epoch and at a specified frequency.
     
-    Fixed issues:
-    - Reduced excessive logging (moved to DEBUG level)
-    - Fixed buffer reset logic to prevent state corruption
-    - Proper epoch state management
-    - Early returns to avoid unnecessary processing
-    - Save ALL samples instead of limiting to max_samples
+    Fixed to properly save ALL samples when max_samples=None.
     """
     
     def __init__(
@@ -1965,16 +1960,17 @@ class PredictionSaver(Callback):
         dataloader_idx=0
     ):
         """Collect validation batch results for later saving."""
-        # Early returns to avoid unnecessary processing
+        # Early return if we've already saved this epoch
         if self._saved_this_epoch:
-            return
-            
-        # Only check max_samples if it's set (not None)
-        if self.max_samples is not None and self._collected >= self.max_samples:
             return
         
         current_epoch = trainer.current_epoch
         if not self._should_save_this_epoch(current_epoch):
+            return
+        
+        # FIXED: Only check max_samples limit if it's actually set
+        # When max_samples is None, we want to collect ALL samples
+        if self.max_samples is not None and self._collected >= self.max_samples:
             return
         
         # Extract data with additional safety checks
@@ -2003,12 +1999,12 @@ class PredictionSaver(Callback):
             self.logger.debug(f"Error moving tensors to CPU: {e}")
             return
         
-        # Calculate how many samples to take
+        # FIXED: Calculate how many samples to take
         if self.max_samples is None:
-            # Take all samples from the batch
+            # Take ALL samples from the batch when max_samples is None
             take = y_pred.shape[0]
         else:
-            # Take limited samples
+            # Take limited samples when max_samples is set
             remaining = self.max_samples - self._collected
             take = min(remaining, y_pred.shape[0])
         
@@ -2018,16 +2014,16 @@ class PredictionSaver(Callback):
             self._preds.append(y_pred[:take])
             self._collected += take
             
-            # Log progress periodically
+            # FIXED: Improved logging for unlimited collection
             if self.max_samples is None:
-                if batch_idx % 10 == 0:  # Log every 10 batches when saving all
+                if batch_idx % 20 == 0:  # Log every 20 batches when saving all
                     self.logger.debug(f"Collected {self._collected} samples so far (batch {batch_idx})")
             else:
-                # Only log at INFO level when we reach max samples
+                # Log when we reach max samples for limited collection
                 if self._collected >= self.max_samples:
                     self.logger.info(f"Collected maximum {self.max_samples} samples for epoch {current_epoch}")
-                else:
-                    self.logger.debug(f"Collected {take} samples from validation batch {batch_idx}")
+                elif batch_idx % 10 == 0:  # Log progress every 10 batches
+                    self.logger.debug(f"Collected {self._collected}/{self.max_samples} samples (batch {batch_idx})")
     
     def on_test_batch_end(
         self,
@@ -2039,11 +2035,12 @@ class PredictionSaver(Callback):
         dataloader_idx=0
     ):
         """Collect test batch results for later saving."""
-        # Early returns
+        # Early return if we've already saved this epoch
         if self._saved_this_epoch:
             return
         
-        # Only check max_samples if it's set (not None)
+        # FIXED: Only check max_samples limit if it's actually set
+        # When max_samples is None, we want to collect ALL samples
         if self.max_samples is not None and self._collected >= self.max_samples:
             return
         
@@ -2073,12 +2070,12 @@ class PredictionSaver(Callback):
             self.logger.debug(f"Error moving tensors to CPU: {e}")
             return
         
-        # Calculate how many samples to take
+        # FIXED: Calculate how many samples to take
         if self.max_samples is None:
-            # Take all samples from the batch
+            # Take ALL samples from the batch when max_samples is None
             take = y_pred.shape[0]
         else:
-            # Take limited samples
+            # Take limited samples when max_samples is set
             remaining = self.max_samples - self._collected
             take = min(remaining, y_pred.shape[0])
         
@@ -2087,7 +2084,13 @@ class PredictionSaver(Callback):
             self._preds.append(y_pred[:take])
             self._collected += take
             
-            self.logger.debug(f"Collected {take} samples from test batch {batch_idx}")
+            # Log progress for test phase
+            if self.max_samples is None:
+                if batch_idx % 20 == 0:  # Log every 20 batches when saving all
+                    self.logger.debug(f"Collected {self._collected} test samples so far (batch {batch_idx})")
+            else:
+                if batch_idx % 10 == 0:  # Log progress every 10 batches
+                    self.logger.debug(f"Collected {self._collected}/{self.max_samples} test samples (batch {batch_idx})")
     
     def _save_data(self, trainer, phase="val"):
         """Save collected data as NumPy arrays."""
@@ -2118,7 +2121,9 @@ class PredictionSaver(Callback):
             np.save(gt_path, gts_numpy)
             np.save(pred_path, preds_numpy)
             
-            self.logger.info(f"Saved {self._collected} {phase} samples for epoch {current_epoch} "
+            # FIXED: Better logging message
+            samples_info = f"{self._collected} samples" if self.max_samples is None else f"{self._collected}/{self.max_samples} samples"
+            self.logger.info(f"Saved {samples_info} for {phase} epoch {current_epoch} "
                            f"(shapes: gt={gts_numpy.shape}, pred={preds_numpy.shape})")
             
             return True
@@ -2140,10 +2145,12 @@ class PredictionSaver(Callback):
         # Clean up buffers to free memory
         self._gts.clear()
         self._preds.clear()
+        
+        final_count = self._collected
         self._collected = 0
         
         self.logger.debug(f"Validation epoch {current_epoch} end: "
-                         f"saved={self._saved_this_epoch}")
+                         f"saved={self._saved_this_epoch}, collected={final_count} samples")
     
     def on_test_epoch_end(self, trainer, pl_module):
         """Save data at the end of the test epoch."""
@@ -2157,9 +2164,11 @@ class PredictionSaver(Callback):
         # Clean up buffers
         self._gts.clear()
         self._preds.clear()
+        
+        final_count = self._collected
         self._collected = 0
         
-        self.logger.debug(f"Test epoch {current_epoch} end")
+        self.logger.debug(f"Test epoch {current_epoch} end: collected={final_count} samples")
 
 # ------------------------------------
 # core/metric_loader.py

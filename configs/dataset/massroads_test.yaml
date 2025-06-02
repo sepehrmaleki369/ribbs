@@ -1,0 +1,65 @@
+# Massachusetts Roads Dataset Configuration
+
+# Dataset root directory
+root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+
+# Dataset split mode: "folder" or "kfold"
+split_mode: "folder"  # Uses folder structure for splits
+
+# K-fold configuration (used if split_mode is "kfold")
+fold: 0  # Current fold
+num_folds: 3  # Total number of folds
+
+# Split ratios (used if split_mode is "folder" with "source_folder")
+# split_ratios:
+  # train: 0.7
+  # valid: 0.15
+  # test: 0.15
+
+use_splitting: false
+
+# Source folder (used if split_mode is "folder" with split_ratios)
+# source_folder: 'train'
+
+# Batch sizes
+train_batch_size: 4
+val_batch_size: 1  # Usually 1 for full-image validation
+test_batch_size: 1  # Usually 1 for full-image testing
+
+# Patch and crop settings
+patch_size: 64  # Size of training patches
+small_window_size: 8  # Size of window to check for variation
+validate_road_ratio: false  # Validate patch has enough road content
+threshold: 0.05  # Minimum road ratio threshold
+
+# Data loading settings
+num_workers: 4
+pin_memory: true
+
+# Modality settings
+modalities:
+  image: "sat"  # Satellite imagery folder
+  label: "label"  # Road map folder
+  # distance: "distance"  # Distance transform folder
+  # sdf: "sdf"  # Signed distance function folder
+
+# Distance transform settings
+# distance_threshold: 20.0
+
+# Signed distance function settings
+# sdf_iterations: 3
+# sdf_thresholds: [-20, 20]
+
+# Augmentation settings
+augmentations:
+  - "flip_h"
+  - "flip_v"
+  - "rotation"
+
+# Misc settings
+# max_images: null  # No limit (set a number to limit images loaded)
+max_images: 4  # No limit (set a number to limit images loaded)
+# max_attempts: 10  # Maximum attempts for finding valid patches
+save_computed: false  # Save computed distance maps and SDFs
+verbose: false  # Verbose output
+seed: 42  # Random seed

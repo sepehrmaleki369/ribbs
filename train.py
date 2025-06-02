@@ -33,8 +33,8 @@ from core.checkpoint import CheckpointManager
 from core.utils import yaml_read, mkdir
 
 from seglit_module import SegLitModule
-
-
+# import torch
+# torch.set_float32_matmul_precision('medium' | 'high' | 'highest')
 logging.getLogger('rasterio').setLevel(logging.WARNING)
 logging.getLogger('rasterio.env').setLevel(logging.WARNING)
 logging.getLogger('rasterio._io').setLevel(logging.WARNING)

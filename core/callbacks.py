@@ -495,7 +495,7 @@ class PredictionSaver(Callback):
         """Determine if we should save data for this epoch."""
         if epoch < self.save_after_epoch:
             return False
-            
+        self.logger.debug(f'Line 498: + epoch:{epoch} save_after:{self.save_after_epoch} every:{self.save_every_n_epochs} check: {(epoch - self.save_after_epoch)}')
         return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
     
     def on_validation_epoch_start(self, trainer, pl_module):
