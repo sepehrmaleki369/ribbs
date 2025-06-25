@@ -2,7 +2,7 @@
 
 # Model path and class
 path: "models.base_models"  # Path to the module containing the model
-class: "UNetBin"  # Name of the model class
+class: "UNet"  # Name of the model class
 
 # Model parameters
 params:
@@ -13,6 +13,6 @@ params:
   dropout: 0.1
   batch_norm: True
   upsampling: "bilinear"
-  pooling: "max"
+  # pooling: "max"
   in_channels: 3
   out_channels: 1

@@ -7,8 +7,8 @@ root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
 split_mode: "folder"  # Uses folder structure for splits
 
 # K-fold configuration (used if split_mode is "kfold")
-fold: 0  # Current fold
-num_folds: 3  # Total number of folds
+# fold: 0  # Current fold
+# num_folds: 3  # Total number of folds
 
 # Split ratios (used if split_mode is "folder" with "source_folder")
 # split_ratios:
@@ -41,14 +41,14 @@ modalities:
   image: "sat"  # Satellite imagery folder
   label: "label"  # Road map folder
   # distance: "distance"  # Distance transform folder
-  # sdf: "sdf"  # Signed distance function folder
+  sdf: "sdf"  # Signed distance function folder
 
 # Distance transform settings
 # distance_threshold: 20.0
 
 # Signed distance function settings
-# sdf_iterations: 3
-# sdf_thresholds: [-20, 20]
+sdf_iterations: 3
+sdf_thresholds: [-20, 20]
 
 # Augmentation settings
 augmentations:
@@ -58,7 +58,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-# max_images: 10  # No limit (set a number to limit images loaded)
+max_images: 10  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: false  # Save computed distance maps and SDFs
 verbose: false  # Verbose output

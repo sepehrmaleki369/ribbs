@@ -2,7 +2,7 @@
 
 # Primary loss (used from the beginning)
 primary_loss:
-  class: "BCELoss"  # Built-in PyTorch loss
+  class: "MSELoss"  # Built-in PyTorch loss
   params: {}
 
 # # Secondary loss (activated after start_epoch)
@@ -17,3 +17,7 @@ primary_loss:
 # # Mixing parameters
 # alpha: 0.4  # Weight for the secondary loss (0 to 1)
 # start_epoch: 10  # Epoch to start using the secondary loss
+
+secondary_loss: null
+alpha: 0.0
+start_epoch: 0
