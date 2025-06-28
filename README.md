@@ -506,7 +506,6 @@ output_dir: "outputs/experiment_1"
 # Trainer configuration
 trainer:
   max_epochs: 100
-  val_check_interval: 1.0
   skip_validation_until_epoch: 5
   val_every_n_epochs: 1
   log_every_n_epochs: 2

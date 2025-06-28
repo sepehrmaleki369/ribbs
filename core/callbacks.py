@@ -20,7 +20,6 @@ from pytorch_lightning.callbacks import Callback
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 
-
 def _gather_from_outputs(batch, outputs, pl_module):
     """
     Extract input, gt, and prediction tensors from batch and outputs without re-running the model.
@@ -29,9 +28,7 @@ def _gather_from_outputs(batch, outputs, pl_module):
     y = batch[pl_module.target_key].float()
     if y.dim() == 3:
         y = y.unsqueeze(1)
-    preds = outputs.get("predictions")
-    # ensure shapes match
-    preds = preds.float()
+    preds = outputs.get("predictions").float()
     return x.cpu(), y.cpu(), preds.detach().cpu()
 
 class SamplePlotCallback(pl.Callback):
@@ -41,8 +38,7 @@ class SamplePlotCallback(pl.Callback):
       - train/samples: [input | ground-truth | prediction]
       - validation/samples: [input | ground-truth | prediction]
 
-    Uses the model’s stored `predictions` in the step outputs, avoiding a second forward pass.
-    Both ground-truth and prediction share a signed colormap range.
+    Now uses *separate* vmin/vmax for GT vs. prediction.
     """
     def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
         super().__init__()
@@ -83,31 +79,38 @@ class SamplePlotCallback(pl.Callback):
         gts   = torch.cat(self._gts,    0)
         preds = torch.cat(self._preds,  0)
         n = imgs.size(0)
-        # determine shared signed range
-        combined = torch.cat([gts.view(-1), preds.view(-1)], 0)
-        vlim = float(combined.abs().max())
+
+        # compute *separate* signed limits
+        vlim_gt   = float(gts.abs().max())
+        vlim_pred = float(preds.abs().max())
 
         fig, axes = plt.subplots(n, 3, figsize=(9, n*3), tight_layout=True)
         if n == 1:
             axes = axes[None, :]
+
         for i in range(n):
             img = imgs[i].permute(1,2,0)
             gt  = gts[i,0]
             pr  = preds[i,0]
 
+            # input
             axes[i,0].imshow(img, cmap='gray')
             axes[i,0].set_title("input")
             axes[i,0].axis("off")
 
-            axes[i,1].imshow(gt, cmap=self.cmap, vmin=-vlim, vmax=vlim)
+            # ground truth
+            axes[i,1].imshow(gt, cmap=self.cmap, vmin=-vlim_gt, vmax=vlim_gt)
             axes[i,1].set_title("gt (signed)")
             axes[i,1].axis("off")
 
-            axes[i,2].imshow(pr, cmap=self.cmap, vmin=-vlim, vmax=vlim)
+            # prediction
+            axes[i,2].imshow(pr, cmap=self.cmap, vmin=-vlim_pred, vmax=vlim_pred)
             axes[i,2].set_title("pred (signed)")
             axes[i,2].axis("off")
 
-        trainer.logger.experiment.add_figure(f"{tag}/samples", fig, global_step=trainer.current_epoch)
+        trainer.logger.experiment.add_figure(f"{tag}/samples",
+                                             fig,
+                                             global_step=trainer.current_epoch)
         plt.close(fig)
 
     def on_train_epoch_end(self, trainer, pl_module):
@@ -121,16 +124,20 @@ class SamplePlotCallback(pl.Callback):
 
 class PredictionLogger(Callback):
     """
-    Callback to log input/prediction/ground truth visualization during validation.
-    Accumulates up to `max_samples` across batches and saves one grid per epoch.
+    Validation‐only: accumulates up to `max_samples` and writes one PNG per epoch.
+    Now uses *separate* vmin/vmax for GT vs. prediction.
     """
-    def __init__(self, log_dir: str, log_every_n_epochs: int = 1, max_samples: int = 4, cmap: str = "coolwarm"):
+    def __init__(self,
+                 log_dir: str,
+                 log_every_n_epochs: int = 1,
+                 max_samples: int = 4,
+                 cmap: str = "coolwarm"):
         super().__init__()
         self.log_dir = log_dir
         self.log_every_n_epochs = log_every_n_epochs
         self.max_samples = max_samples
         self.cmap = cmap
-        self.logger = logging.getLogger(__name__)
+        self.logger = pl.utilities.logger.get_logs_dir_logger()
         self._reset_buffers()
 
     def _reset_buffers(self):
@@ -146,64 +153,82 @@ class PredictionLogger(Callback):
         else:
             self._logged_this_epoch = True
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        if self._logged_this_epoch or (trainer.current_epoch % self.log_every_n_epochs != 0):
+    def on_validation_batch_end(self,
+                                trainer,
+                                pl_module,
+                                outputs,
+                                batch,
+                                batch_idx,
+                                dataloader_idx=0):
+        if self._logged_this_epoch \
+           or (trainer.current_epoch % self.log_every_n_epochs != 0):
             return
 
-        x = batch[pl_module.input_key].detach().cpu()
-        y_true = batch[pl_module.target_key].detach().cpu()
-        y_pred = outputs["predictions"].detach().cpu()
+        x       = batch[pl_module.input_key].detach().cpu()
+        y_true  = batch[pl_module.target_key].detach().cpu()
+        y_pred  = outputs["predictions"].detach().cpu()
 
-        remaining = self.max_samples - self._collected
-        take = min(remaining, x.shape[0])
-
+        take = min(self.max_samples - self._collected, x.shape[0])
         self._images.append(x[:take])
-        self._gts.append(y_true[:take])
-        self._preds.append(y_pred[:take])
+        self._gts   .append(y_true[:take])
+        self._preds .append(y_pred[:take])
         self._collected += take
 
-        if self._collected >= self.max_samples:
-            imgs = torch.cat(self._images, dim=0)
-            gts  = torch.cat(self._gts,    dim=0)
-            preds= torch.cat(self._preds,  dim=0)
+        if self._collected < self.max_samples:
+            return
 
-            # compute symmetric range
-            all_vals = torch.cat([gts.view(-1), preds.view(-1)], 0)
-            m = float(all_vals.abs().max())
+        imgs  = torch.cat(self._images, dim=0)
+        gts   = torch.cat(self._gts,    dim=0)
+        preds = torch.cat(self._preds,  dim=0)
 
-            os.makedirs(self.log_dir, exist_ok=True)
-            filename = os.path.join(self.log_dir, f"pred_epoch_{trainer.current_epoch:06d}.png")
+        # separate signed limits
+        vlim_gt   = float(gts.abs().max())
+        vlim_pred = float(preds.abs().max())
 
-            fig, axes = plt.subplots(self.max_samples, 3, figsize=(12, 4 * self.max_samples))
-            for i in range(self.max_samples):
-                # Input
-                ax = axes[i, 0]
-                if imgs.shape[1] == 1:
-                    ax.imshow(imgs[i, 0], cmap=self.cmap, vmin=-m, vmax=m)
-                else:
-                    im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
-                    ax.imshow(im)
-                ax.set_title('Input')
-                ax.axis('off')
+        os.makedirs(self.log_dir, exist_ok=True)
+        filename = os.path.join(
+            self.log_dir,
+            f"pred_epoch_{trainer.current_epoch:06d}.png"
+        )
 
-                # Ground truth
-                ax = axes[i, 1]
-                ax.imshow(gts[i, 0], cmap=self.cmap, vmin=-m, vmax=m)
-                ax.set_title('Ground Truth')
-                ax.axis('off')
+        fig, axes = plt.subplots(self.max_samples, 3,
+                                 figsize=(12, 4 * self.max_samples),
+                                 tight_layout=True)
 
-                # Prediction
-                ax = axes[i, 2]
-                ax.imshow(preds[i, 0], cmap=self.cmap, vmin=-m, vmax=m)
-                ax.set_title('Prediction')
-                ax.axis('off')
+        for i in range(self.max_samples):
+            # Input
+            ax = axes[i, 0]
+            if imgs.shape[1] == 1:
+                ax.imshow(imgs[i, 0], cmap='gray')
+            else:
+                im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
+                ax.imshow(im)
+            ax.set_title('Input')
+            ax.axis('off')
 
-            plt.tight_layout()
-            plt.savefig(filename, dpi=150)
-            plt.close(fig)
+            # Ground truth
+            ax = axes[i, 1]
+            ax.imshow(gts[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_gt,
+                      vmax=vlim_gt)
+            ax.set_title('Ground Truth')
+            ax.axis('off')
 
-            self.logger.info(f"Saved prediction visualization: {filename}")
-            self._logged_this_epoch = True
+            # Prediction
+            ax = axes[i, 2]
+            ax.imshow(preds[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_pred,
+                      vmax=vlim_pred)
+            ax.set_title('Prediction')
+            ax.axis('off')
+
+        plt.savefig(filename, dpi=150)
+        plt.close(fig)
+
+        self.logger.info(f"Saved prediction visualization: {filename}")
+        self._logged_this_epoch = True
 
 class BestMetricCheckpoint(Callback):
     """
@@ -433,17 +458,10 @@ class SkipValidation(Callback):
                     f"Resuming validation from epoch {trainer.current_epoch}"
                 )
 
-
-
 class PredictionSaver(pl.Callback):
     """
-    Save model predictions and ground truths on validation and test.
-
-    Args:
-        save_dir: Base directory under which to write files.
-        save_every_n_epochs: Interval (in epochs) at which to save.
-        save_after_epoch: Don’t save until this epoch (inclusive).
-        max_samples: Max number of samples to save per epoch; None→save all.
+    Save model predictions and ground truths on train, validation, and test.
+    Works with Lightning 2.x using *_batch_end hooks.
     """
     def __init__(
         self,
@@ -457,77 +475,114 @@ class PredictionSaver(pl.Callback):
         self.every = save_every_n_epochs
         self.after = save_after_epoch
         self.max_samples = max_samples
+        self._counter = 0
 
     def _should_save(self, epoch: int) -> bool:
         return epoch >= self.after and (epoch - self.after) % self.every == 0
 
-    def _save_split(
+    def _save_tensor(
         self,
+        array: np.ndarray,
         split: str,
         epoch: int,
-        outputs: List[Dict[str, Any]]
+        batch_idx: int,
+        sample_idx: int,
+        which: str
     ):
-        if not outputs or not isinstance(outputs, (list, tuple)):
-            return
-
+        fname = f"{split}_e{epoch}_b{batch_idx}_i{sample_idx}_{which}.npy"
         folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
         os.makedirs(folder, exist_ok=True)
+        np.save(os.path.join(folder, fname), array)
 
-        count = 0
-        for batch_idx, batch_out in enumerate(outputs):
-            if not isinstance(batch_out, dict):
-                continue
+    # ——— TRAINING HOOKS ———
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._counter = 0
 
-            preds = batch_out.get("predictions")
-            gts   = batch_out.get("gts")
-            if preds is None or gts is None:
-                continue
-
-            preds = preds.detach().cpu().numpy()
-            gts   = gts.detach().cpu().numpy()
-
-            for i in range(preds.shape[0]):
-                if self.max_samples is not None and count >= self.max_samples:
-                    return
-                np.save(
-                    os.path.join(folder, f"{split}_e{epoch}_b{batch_idx}_i{i}_pred.npy"),
-                    preds[i]
-                )
-                np.save(
-                    os.path.join(folder, f"{split}_e{epoch}_b{batch_idx}_i{i}_gt.npy"),
-                    gts[i]
-                )
-                count += 1
-
-    # Lightning <=1.x signature: on_validation_epoch_end(self, trainer, pl_module, outputs)
-    def on_validation_epoch_end(
+    def on_train_batch_end(
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: Optional[List[Dict[str, Any]]] = None
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
     ):
         epoch = trainer.current_epoch
         if not self._should_save(epoch):
             return
 
-        # PL 2.x sometimes omits `outputs`, so we bail if it's None
-        if outputs is None:
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
             return
 
-        self._save_split("val", epoch, outputs)
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
+            self._counter += 1
 
-    # Lightning <=1.x signature: on_test_epoch_end(self, trainer, pl_module, outputs)
-    def on_test_epoch_end(
+    # ——— VALIDATION HOOKS ———
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_validation_batch_end(
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: Optional[List[Dict[str, Any]]] = None
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
     ):
         epoch = trainer.current_epoch
         if not self._should_save(epoch):
             return
 
-        if outputs is None:
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
             return
 
-        self._save_split("test", epoch, outputs)
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "val", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "val", epoch, batch_idx, i, "gt")
+            self._counter += 1
+
+    # ——— TEST HOOKS ———
+    def on_test_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_test_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "test", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "test", epoch, batch_idx, i, "gt")
+            self._counter += 1
