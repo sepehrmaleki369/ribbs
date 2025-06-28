@@ -46,6 +46,7 @@ metrics:
     params:
       min_size: 5
       tolerance: 2
+      threshold: 0
 
   # Average Path Length Similarity
   - alias: "apls"
@@ -57,6 +58,7 @@ metrics:
       max_snap_dist: 25
       allow_renaming: true
       min_path_length: 10
+      threshold: 0
 
 # Per-metric frequencies for training - how often to compute each metric
 train_frequencies:

@@ -191,6 +191,7 @@ def main():
         save_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
         max_samples=trainer_cfg.get("save_gt_pred_max_samples", None)
     ))
+    logging.getLogger("core.callbacks.PredictionSaver").setLevel(logging.DEBUG)
 
     # --- trainer & logger ---
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")

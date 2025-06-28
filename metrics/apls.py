@@ -3,9 +3,11 @@ import torch
 import torch.nn as nn
 from metrics.apls_core import apls
 
+
 def compute_batch_apls(
     gt_masks,
     pred_masks,
+    threshold: float = 0.5,
     angle_range=(135, 225),
     max_nodes=500,
     max_snap_dist=4,
@@ -37,9 +39,11 @@ def compute_batch_apls(
     scores = np.zeros(B, dtype=np.float32)
 
     for i in range(B):
-        gt_bin = (gt[i] > 0.5).astype(np.uint8)
-        pr_bin = (pr[i] > 0.5).astype(np.uint8)
+        # Binarize with threshold
+        gt_bin = (gt[i] > threshold).astype(np.uint8)
+        pr_bin = (pr[i] > threshold).astype(np.uint8)
 
+        # Skip empty ground truth
         if gt_bin.sum() == 0:
             scores[i] = 1.0 if pr_bin.sum() == 0 else 0.0
             continue
@@ -66,6 +70,7 @@ class APLS(nn.Module):
     """
     def __init__(
         self,
+        threshold: float = 0.5,
         angle_range=(135, 225),
         max_nodes=500,
         max_snap_dist=4,
@@ -73,6 +78,7 @@ class APLS(nn.Module):
         min_path_length=10
     ):
         super().__init__()
+        self.threshold = threshold
         self.angle_range = angle_range
         self.max_nodes = max_nodes
         self.max_snap_dist = max_snap_dist
@@ -83,6 +89,7 @@ class APLS(nn.Module):
         scores = compute_batch_apls(
             y_true,
             y_pred,
+            threshold=self.threshold,
             angle_range=self.angle_range,
             max_nodes=self.max_nodes,
             max_snap_dist=self.max_snap_dist,
