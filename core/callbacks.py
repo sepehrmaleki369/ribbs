@@ -467,14 +467,17 @@ class PredictionSaver(pl.Callback):
         epoch: int,
         outputs: List[Dict[str, Any]]
     ):
-        """
-        Write out predictions and gts from an epoch’s outputs.
-        """
+        if not outputs or not isinstance(outputs, (list, tuple)):
+            return
+
         folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
         os.makedirs(folder, exist_ok=True)
 
         count = 0
         for batch_idx, batch_out in enumerate(outputs):
+            if not isinstance(batch_out, dict):
+                continue
+
             preds = batch_out.get("predictions")
             gts   = batch_out.get("gts")
             if preds is None or gts is None:
@@ -486,7 +489,6 @@ class PredictionSaver(pl.Callback):
             for i in range(preds.shape[0]):
                 if self.max_samples is not None and count >= self.max_samples:
                     return
-                # filenames
                 np.save(
                     os.path.join(folder, f"{split}_e{epoch}_b{batch_idx}_i{i}_pred.npy"),
                     preds[i]
@@ -497,24 +499,35 @@ class PredictionSaver(pl.Callback):
                 )
                 count += 1
 
+    # Lightning <=1.x signature: on_validation_epoch_end(self, trainer, pl_module, outputs)
     def on_validation_epoch_end(
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: List[Dict[str, Any]]
+        outputs: Optional[List[Dict[str, Any]]] = None
     ):
         epoch = trainer.current_epoch
         if not self._should_save(epoch):
             return
+
+        # PL 2.x sometimes omits `outputs`, so we bail if it's None
+        if outputs is None:
+            return
+
         self._save_split("val", epoch, outputs)
 
+    # Lightning <=1.x signature: on_test_epoch_end(self, trainer, pl_module, outputs)
     def on_test_epoch_end(
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        outputs: List[Dict[str, Any]]
+        outputs: Optional[List[Dict[str, Any]]] = None
     ):
         epoch = trainer.current_epoch
         if not self._should_save(epoch):
             return
+
+        if outputs is None:
+            return
+
         self._save_split("test", epoch, outputs)
