@@ -3134,12 +3134,12 @@ trainer:
   max_epochs: 10000
   # val_check_interval: 1.0         # Validate once per epoch
   check_val_every_n_epoch: 10      # Validate every N epochs (this is redundant with val_check_interval=1.0)
-  skip_validation_until_epoch: 10  # Skip validation until this epoch
+  skip_validation_until_epoch: 0  # Skip validation until this epoch
   log_every_n_steps: 1            # log metrics every step
-  train_metrics_every_n_epochs: 10 # compute/log train metrics every epoch
-  val_metrics_every_n_epochs: 10  # compute/log val   metrics every epoch
+  train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
+  val_metrics_every_n_epochs: 1  # compute/log val   metrics every epoch
   save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
-  save_gt_pred_val_test_after_epoch: 10      # Start saving after epoch 0
+  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
   save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
   
   num_samples_plot: 5
