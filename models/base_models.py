@@ -121,7 +121,7 @@ class UpBlock(nn.Module):
 class UNet(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
                  n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
-                 pooling="max", three_dimensional=False):
+                 pooling="max", three_dimensional=False, apply_final_relu=True):
         super().__init__()
 
         assert n_levels>=1
@@ -138,6 +138,7 @@ class UNet(nn.Module):
         self.pooling = pooling
         self.three_dimensional = three_dimensional
         _3d = three_dimensional
+        self.apply_final_relu = apply_final_relu
 
         channels = [2**x*m_channels for x in range(0, self.n_levels+1)]
 
@@ -184,7 +185,9 @@ class UNet(nn.Module):
 
             # === Last ===
             x = self.last_layer(x)
-            x = F.relu(x)
+
+            if self.apply_final_relu:
+                x = F.relu(x)
             
         except Exception as e:
             for i,dim in enumerate(input.shape[2:]):

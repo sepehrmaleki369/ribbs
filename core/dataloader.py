@@ -115,7 +115,8 @@ class SegmentationDataModule((pl.LightningDataModule)):
             num_workers=self.num_workers,
             collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True,
         )
     
     def val_dataloader(self) -> DataLoader:
@@ -132,7 +133,8 @@ class SegmentationDataModule((pl.LightningDataModule)):
             num_workers=self.num_workers,
             collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True,
         )
     
     def test_dataloader(self) -> DataLoader:
@@ -149,5 +151,6 @@ class SegmentationDataModule((pl.LightningDataModule)):
             num_workers=self.num_workers,
             collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True,
         )

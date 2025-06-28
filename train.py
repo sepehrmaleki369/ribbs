@@ -115,6 +115,9 @@ def main():
     logger.info("Setting up data module...")
     dm = SegmentationDataModule(dataset_cfg)
     dm.setup()
+    logger.info(f"Train set size:      {len(dm.train_dataset)} samples")
+    logger.info(f"Validation set size: {len(dm.val_dataset)} samples")
+    logger.info(f"Test set size:       {len(dm.test_dataset)} samples")
 
     # --- dynamic batch keys ---
     input_key  = main_cfg.get("target_x", "image_patch")
@@ -151,12 +154,12 @@ def main():
     ))
     
     # Add PredictionLogger to visualize predictions
-    callbacks.append(PredictionLogger(
-        log_dir=os.path.join(output_dir, "predictions"),
-        log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
-        max_samples=trainer_cfg.get("num_samples_plot", 4),
-        cmap=trainer_cfg.get("cmap_plot", 'gray')
-    ))
+    # callbacks.append(PredictionLogger(
+    #     log_dir=os.path.join(output_dir, "predictions"),
+    #     log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
+    #     max_samples=trainer_cfg.get("num_samples_plot", 4),
+    #     cmap=trainer_cfg.get("cmap_plot", 'gray')
+    # ))
     
     # Add SamplePlotCallback to monitor sample predictions during training
     callbacks.append(SamplePlotCallback(
@@ -193,14 +196,56 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
     
     # Prepare trainer kwargs - FIXED: Remove resume_from_checkpoint
-    trainer_kwargs = {
-        "max_epochs": max_epochs,
-        "callbacks": callbacks,
-        "logger": tb_logger,
-        "val_check_interval": val_check_interval,
-        "check_val_every_n_epoch": trainer_cfg.get("val_every_n_epochs", 1),  # Validate every N epochs
-        **trainer_cfg.get("extra_args", {}),
-    }
+    # First: copy anything in extra_args straight through
+    trainer_kwargs = dict(trainer_cfg.get("extra_args", {}))
+
+    # Core training loop controls
+    trainer_kwargs.update({
+        "max_epochs":                     trainer_cfg.get("max_epochs"),
+        "min_epochs":                     trainer_cfg.get("min_epochs"),
+        "max_steps":                      trainer_cfg.get("max_steps", -1),
+        "min_steps":                      trainer_cfg.get("min_steps"),
+        "max_time":                       trainer_cfg.get("max_time"),
+        "limit_train_batches":            trainer_cfg.get("limit_train_batches"),
+        "limit_val_batches":              trainer_cfg.get("limit_val_batches"),
+        "limit_test_batches":             trainer_cfg.get("limit_test_batches"),
+        "limit_predict_batches":          trainer_cfg.get("limit_predict_batches"),
+        "overfit_batches":                trainer_cfg.get("overfit_batches", 0.0),
+        "val_check_interval":             trainer_cfg.get("val_check_interval"),
+        "check_val_every_n_epoch":        trainer_cfg.get("val_every_n_epochs", 1),
+        "num_sanity_val_steps":           trainer_cfg.get("num_sanity_val_steps"),
+    })
+
+    # Logging & checkpointing toggles
+    trainer_kwargs.update({
+        "log_every_n_steps":              trainer_cfg.get("log_every_n_steps"),
+        "enable_checkpointing":           trainer_cfg.get("enable_checkpointing", True),
+        "enable_progress_bar":            trainer_cfg.get("enable_progress_bar", True),
+        "enable_model_summary":           trainer_cfg.get("enable_model_summary", True),
+    })
+
+    # Gradient & precision controls
+    trainer_kwargs.update({
+        "accumulate_grad_batches":        trainer_cfg.get("accumulate_grad_batches", 1),
+        "gradient_clip_val":              trainer_cfg.get("gradient_clip_val"),
+        "gradient_clip_algorithm":        trainer_cfg.get("gradient_clip_algorithm"),
+        "deterministic":                  trainer_cfg.get("deterministic"),
+        "benchmark":                      trainer_cfg.get("benchmark"),
+    })
+
+    # Distributed/accelerator options (if not already in extra_args)
+    # these will be overridden by extra_args if present
+    for key in ("accelerator","strategy","devices","num_nodes","plugins","sync_batchnorm"):
+        if key in trainer_cfg:
+            trainer_kwargs[key] = trainer_cfg[key]
+
+    # Callbacks & logger
+    trainer_kwargs["callbacks"] = callbacks
+    trainer_kwargs["logger"] = tb_logger
+
+    # Finally: put back any default-root-dir if you want logs/ckpts under output_dir
+    if "default_root_dir" not in trainer_kwargs:
+        trainer_kwargs["default_root_dir"] = output_dir
     
     # Don't add resume_from_checkpoint to trainer_kwargs anymore
     trainer = pl.Trainer(**trainer_kwargs)

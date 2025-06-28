@@ -36,8 +36,8 @@ from core.checkpoint import CheckpointManager
 from core.utils import yaml_read, mkdir
 
 from seglit_module import SegLitModule
-
-
+# import torch
+# torch.set_float32_matmul_precision('medium' | 'high' | 'highest')
 logging.getLogger('rasterio').setLevel(logging.WARNING)
 logging.getLogger('rasterio.env').setLevel(logging.WARNING)
 logging.getLogger('rasterio._io').setLevel(logging.WARNING)
@@ -154,15 +154,17 @@ def main():
     ))
     
     # Add PredictionLogger to visualize predictions
-    callbacks.append(PredictionLogger(
-        log_dir=os.path.join(output_dir, "predictions"),
-        log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
-        max_samples=4
-    ))
+    # callbacks.append(PredictionLogger(
+    #     log_dir=os.path.join(output_dir, "predictions"),
+    #     log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
+    #     max_samples=trainer_cfg.get("num_samples_plot", 4),
+    #     cmap=trainer_cfg.get("cmap_plot", 'gray')
+    # ))
     
     # Add SamplePlotCallback to monitor sample predictions during training
     callbacks.append(SamplePlotCallback(
-        num_samples=trainer_cfg.get("num_samples_plot", 3)
+        num_samples=trainer_cfg.get("num_samples_plot", 3),
+        cmap=trainer_cfg.get("cmap_plot", 'gray')
     ))
     
     # Add LearningRateMonitor to track learning rate changes
@@ -194,14 +196,56 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
     
     # Prepare trainer kwargs - FIXED: Remove resume_from_checkpoint
-    trainer_kwargs = {
-        "max_epochs": max_epochs,
-        "callbacks": callbacks,
-        "logger": tb_logger,
-        "val_check_interval": val_check_interval,
-        "check_val_every_n_epoch": trainer_cfg.get("val_every_n_epochs", 1),  # Validate every N epochs
-        **trainer_cfg.get("extra_args", {}),
-    }
+    # First: copy anything in extra_args straight through
+    trainer_kwargs = dict(trainer_cfg.get("extra_args", {}))
+
+    # Core training loop controls
+    trainer_kwargs.update({
+        "max_epochs":                     trainer_cfg.get("max_epochs"),
+        "min_epochs":                     trainer_cfg.get("min_epochs"),
+        "max_steps":                      trainer_cfg.get("max_steps", -1),
+        "min_steps":                      trainer_cfg.get("min_steps"),
+        "max_time":                       trainer_cfg.get("max_time"),
+        "limit_train_batches":            trainer_cfg.get("limit_train_batches"),
+        "limit_val_batches":              trainer_cfg.get("limit_val_batches"),
+        "limit_test_batches":             trainer_cfg.get("limit_test_batches"),
+        "limit_predict_batches":          trainer_cfg.get("limit_predict_batches"),
+        "overfit_batches":                trainer_cfg.get("overfit_batches", 0.0),
+        "val_check_interval":             trainer_cfg.get("val_check_interval"),
+        "check_val_every_n_epoch":        trainer_cfg.get("val_every_n_epochs", 1),
+        "num_sanity_val_steps":           trainer_cfg.get("num_sanity_val_steps"),
+    })
+
+    # Logging & checkpointing toggles
+    trainer_kwargs.update({
+        "log_every_n_steps":              trainer_cfg.get("log_every_n_steps"),
+        "enable_checkpointing":           trainer_cfg.get("enable_checkpointing", True),
+        "enable_progress_bar":            trainer_cfg.get("enable_progress_bar", True),
+        "enable_model_summary":           trainer_cfg.get("enable_model_summary", True),
+    })
+
+    # Gradient & precision controls
+    trainer_kwargs.update({
+        "accumulate_grad_batches":        trainer_cfg.get("accumulate_grad_batches", 1),
+        "gradient_clip_val":              trainer_cfg.get("gradient_clip_val"),
+        "gradient_clip_algorithm":        trainer_cfg.get("gradient_clip_algorithm"),
+        "deterministic":                  trainer_cfg.get("deterministic"),
+        "benchmark":                      trainer_cfg.get("benchmark"),
+    })
+
+    # Distributed/accelerator options (if not already in extra_args)
+    # these will be overridden by extra_args if present
+    for key in ("accelerator","strategy","devices","num_nodes","plugins","sync_batchnorm"):
+        if key in trainer_cfg:
+            trainer_kwargs[key] = trainer_cfg[key]
+
+    # Callbacks & logger
+    trainer_kwargs["callbacks"] = callbacks
+    trainer_kwargs["logger"] = tb_logger
+
+    # Finally: put back any default-root-dir if you want logs/ckpts under output_dir
+    if "default_root_dir" not in trainer_kwargs:
+        trainer_kwargs["default_root_dir"] = output_dir
     
     # Don't add resume_from_checkpoint to trainer_kwargs anymore
     trainer = pl.Trainer(**trainer_kwargs)
@@ -325,7 +369,7 @@ class SegLitModule(pl.LightningModule):
             if self.current_epoch % freq == 0:
                 self.log(f"train_{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-        return loss
+        return {"loss": loss, "predictions": y_hat, "gts": y}
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
@@ -348,7 +392,7 @@ class SegLitModule(pl.LightningModule):
                 self.log(f"val_{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        return {"predictions": y_hat, "val_loss": loss}
+        return {"predictions": y_hat, "val_loss": loss, "gts": y}
 
     def test_step(self, batch, batch_idx):
         # same as validation but logs under test_
@@ -369,7 +413,7 @@ class SegLitModule(pl.LightningModule):
             self.log(f"test_{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        return {"predictions": y_hat, "test_loss": loss}
+        return {"predictions": y_hat, "test_loss": loss, "gts": y}
 
     def configure_optimizers(self):
         Opt = getattr(torch.optim, self.opt_cfg["name"])
@@ -693,12 +737,12 @@ class GeneralizedDataset(Dataset):
             folder_name = self.modalities[key]
             mod_dir = os.path.join(self.data_dir, folder_name)
             os.makedirs(mod_dir, exist_ok=True)
-            sdf_comp_again = False
+            sdf_comp_again = True
             config_path = os.path.join(mod_dir, "config.json")
-            if os.path.exists(config_path):
-                with open(config_path, "r") as config_file:
-                    saved_config = json.load(config_file)
-                    sdf_comp_again = self.sdf_iterations != saved_config.get("sdf_iterations", None)
+            # if os.path.exists(config_path):
+            #     with open(config_path, "r") as config_file:
+            #         saved_config = json.load(config_file)
+            #         sdf_comp_again = self.sdf_iterations != saved_config.get("sdf_iterations", None)
 
             logger.info(f"Generating {key} modality maps...")
             for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
@@ -1426,751 +1470,6 @@ def load_model(config: Dict[str, Any]) -> nn.Module:
         raise Exception(f"Error instantiating model {model_class_name} from {model_path}: {e}")
 
 # ------------------------------------
-# core/callbacks.py
-# ------------------------------------
-"""
-Callbacks module for PyTorch Lightning training.
-
-This module provides custom callbacks for checkpointing, visualization, 
-code archiving, and validation control.
-"""
-
-import os
-import io
-import logging
-import shutil
-import zipfile
-from glob import glob
-from typing import Any, Dict, List, Optional, Union
-
-import numpy as np
-import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
-import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
-
-class SamplePlotCallback(pl.Callback):
-    """
-    After each training & validation epoch, log up to `num_samples`
-    examples as figures:
-      - train/samples: [input | ground-truth | prediction]
-      - val/samples:   [input | ground-truth | prediction]
-    """
-    def __init__(self, num_samples: int = 5):
-        super().__init__()
-        self.num_samples = num_samples
-        self._reset_buffers()
-
-    def _reset_buffers(self):
-        self._images   = []   # list of torch.Tensor batches
-        self._gts      = []
-        self._preds    = []
-        self._collected = 0
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        self._reset_buffers()
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        self._reset_buffers()
-
-    def _capture(self, batch, pl_module):
-        x = batch[pl_module.input_key].float().to(pl_module.device)
-        y = batch[pl_module.target_key].float().to(pl_module.device)
-        if y.ndim == 3:
-            y = y.unsqueeze(1)
-        with torch.no_grad():
-            logits = pl_module(x)
-            preds = torch.sigmoid(logits)
-        return x.cpu(), y.cpu(), preds.cpu()
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
-        if self._collected >= self.num_samples:
-            return
-        x, y, preds = self._capture(batch, pl_module)
-        remaining = self.num_samples - self._collected
-        take = min(remaining, x.size(0))
-        self._images.append(x[:take])
-        self._gts.append(y[:take])
-        self._preds.append(preds[:take])
-        self._collected += take
-
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
-        if self._collected >= self.num_samples:
-            return
-        x, y, preds = self._capture(batch, pl_module)
-        remaining = self.num_samples - self._collected
-        take = min(remaining, x.size(0))
-        self._images.append(x[:take])
-        self._gts.append(y[:take])
-        self._preds.append(preds[:take])
-        self._collected += take
-
-    def _plot_and_log(self, tag, trainer):
-        # concatenate everything we gathered
-        imgs  = torch.cat(self._images, 0)
-        gts   = torch.cat(self._gts,    0)
-        preds = torch.cat(self._preds,  0)
-        n = imgs.size(0)
-
-        fig, axes = plt.subplots(n, 3, figsize=(3*3, n*3), tight_layout=True)
-        if n == 1:
-            axes = axes[None, :]
-
-        for i in range(n):
-            img = imgs[i].permute(1,2,0)
-            gt  = gts[i,0]
-            pr  = preds[i,0]
-
-            axes[i,0].imshow(img); axes[i,0].set_title("input"); axes[i,0].axis("off")
-            axes[i,1].imshow(gt,  cmap="gray");       axes[i,1].set_title("gt");    axes[i,1].axis("off")
-            axes[i,2].imshow(pr,  cmap="gray");       axes[i,2].set_title("pred");  axes[i,2].axis("off")
-
-        trainer.logger.experiment.add_figure(f"{tag}/samples", fig, global_step=trainer.current_epoch)
-        plt.close(fig)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        if self._collected > 0:
-            self._plot_and_log("train", trainer)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if self._collected > 0:
-            self._plot_and_log("val", trainer)
-
-
-class PredictionLogger(Callback):
-    """
-    Callback to log input/prediction/ground truth visualization during validation.
-    Accumulates up to `max_samples` across batches and saves one grid per epoch.
-    """
-    def __init__(self, log_dir: str, log_every_n_epochs: int = 1, max_samples: int = 4):
-        super().__init__()
-        self.log_dir = log_dir
-        self.log_every_n_epochs = log_every_n_epochs
-        self.max_samples = max_samples
-        self.logger = logging.getLogger(__name__)
-        self._reset_buffers()
-
-    def _reset_buffers(self):
-        self._images = []
-        self._gts = []
-        self._preds = []
-        self._collected = 0
-        self._logged_this_epoch = False
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        if trainer.current_epoch % self.log_every_n_epochs == 0:
-            self._reset_buffers()
-        else:
-            self._logged_this_epoch = True
-
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        if self._logged_this_epoch:
-            return
-        if trainer.current_epoch % self.log_every_n_epochs != 0:
-            return
-
-        # Pull images and labels by dynamic key:
-        x = batch[pl_module.input_key]
-        y_true = batch[pl_module.target_key]
-        y_pred = outputs["predictions"]
-
-        x = x.detach().cpu()
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
-
-        remaining = self.max_samples - self._collected
-        take = min(remaining, x.shape[0])
-
-        self._images.append(x[:take])
-        self._gts.append(y_true[:take])
-        self._preds.append(y_pred[:take])
-        self._collected += take
-
-        if self._collected >= self.max_samples:
-            imgs = torch.cat(self._images, dim=0)
-            gts  = torch.cat(self._gts,    dim=0)
-            preds= torch.cat(self._preds,  dim=0)
-
-            os.makedirs(self.log_dir, exist_ok=True)
-            filename = os.path.join(
-                self.log_dir,
-                f"pred_epoch_{trainer.current_epoch:06d}.png"
-            )
-
-            fig, axes = plt.subplots(
-                self.max_samples, 3,
-                figsize=(12, 4 * self.max_samples)
-            )
-
-            for i in range(self.max_samples):
-                # Input
-                ax = axes[i, 0]
-                if imgs.shape[1] == 1:
-                    ax.imshow(imgs[i, 0], cmap='gray')
-                else:
-                    im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
-                    ax.imshow(im)
-                ax.set_title('Input')
-                ax.axis('off')
-
-                # Ground truth
-                ax = axes[i, 1]
-                if gts.shape[1] == 1:
-                    ax.imshow(gts[i, 0], cmap='gray')
-                else:
-                    mask = torch.argmax(gts[i], dim=0)
-                    ax.imshow(mask, cmap='tab20')
-                ax.set_title('Ground Truth')
-                ax.axis('off')
-
-                # Prediction
-                ax = axes[i, 2]
-                if preds.shape[1] == 1:
-                    ax.imshow(preds[i, 0], cmap='gray')
-                else:
-                    pmask = torch.argmax(preds[i], dim=0)
-                    ax.imshow(pmask, cmap='tab20')
-                ax.set_title('Prediction')
-                ax.axis('off')
-
-            plt.tight_layout()
-            plt.savefig(filename, dpi=150)
-            plt.close(fig)
-
-            self.logger.info(f"Saved prediction visualization: {filename}")
-            self._logged_this_epoch = True
-
-
-class BestMetricCheckpoint(Callback):
-    """
-    Callback to save checkpoints for the best value of each metric.
-    """
-    
-    def __init__(
-        self, 
-        dirpath: str, 
-        metric_names: List[str],
-        mode: Union[str, Dict[str, str]] = "min",
-        save_last: bool = True,
-        last_k: int = 5,  # Save last checkpoint every k epochs
-        filename_template: str = "best_{metric}"
-    ):
-        """
-        Initialize the BestMetricCheckpoint callback.
-        
-        Args:
-            dirpath: Directory to save checkpoints to
-            metric_names: List of metrics to monitor
-            mode: Either "min", "max", or a dict mapping metric names to "min"/"max"
-            save_last: Whether to save the last checkpoint
-            last_k: Save last checkpoint every k epochs (reduce I/O)
-            filename_template: Template for checkpoint filenames
-        """
-        super().__init__()
-        self.dirpath = dirpath
-        self.metric_names = metric_names
-        self.last_k = last_k
-        
-        # Setup mode for each metric (min or max)
-        self.mode = {}
-        if isinstance(mode, str):
-            for metric in metric_names:
-                self.mode[metric] = mode
-        else:
-            self.mode = mode
-            # Ensure all metrics have a mode
-            for metric in metric_names:
-                if metric not in self.mode:
-                    self.mode[metric] = "min"
-                    
-        self.save_last = save_last
-        self.filename_template = filename_template
-        self.best_values = {}
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize best values
-        for metric in metric_names:
-            if self.mode[metric] == "min":
-                self.best_values[metric] = float('inf')
-            else:
-                self.best_values[metric] = float('-inf')
-    
-    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """
-        Check metrics at the end of validation and save checkpoint if needed.
-        
-        Args:
-            trainer: PyTorch Lightning trainer
-            pl_module: PyTorch Lightning module
-        """
-        # Create checkpoint directory if it doesn't exist
-        os.makedirs(self.dirpath, exist_ok=True)
-        
-        # Check each metric
-        for metric in self.metric_names:
-            metric_key = f"val_{metric}"
-            if metric_key in trainer.callback_metrics:
-                current_value = trainer.callback_metrics[metric_key].item()
-                
-                is_better = False
-                if self.mode[metric] == "min" and current_value < self.best_values[metric]:
-                    is_better = True
-                    self.best_values[metric] = current_value
-                elif self.mode[metric] == "max" and current_value > self.best_values[metric]:
-                    is_better = True
-                    self.best_values[metric] = current_value
-                
-                if is_better:
-                    filename = f"{self.filename_template.format(metric=metric)}.ckpt"
-                    filepath = os.path.join(self.dirpath, filename)
-                    self.logger.info(f"Saving best {metric} checkpoint: {filepath}")
-                    trainer.save_checkpoint(filepath)
-        
-        # Save last checkpoint if requested (with reduced frequency)
-        if self.save_last and (
-            trainer.current_epoch % self.last_k == 0 or  # Every k epochs
-            trainer.current_epoch == trainer.max_epochs - 1  # Last epoch
-        ):
-            filename = "last.ckpt"
-            filepath = os.path.join(self.dirpath, filename)
-            trainer.save_checkpoint(filepath)
-            self.logger.info(f"Saved last checkpoint at epoch {trainer.current_epoch}")
-
-
-
-
-class ConfigArchiver(Callback):
-    """
-    Callback to archive configuration files and source code at the start of training.
-    
-    This callback creates a zip file containing:
-    - All configuration files
-    - Source code files (train.py, core/, models/, losses/, metrics/)
-    """
-    
-    def __init__(
-        self,
-        output_dir: str,
-        project_root: str
-    ):
-        """
-        Initialize the ConfigArchiver callback.
-        
-        Args:
-            output_dir: Directory to save the archive to
-            project_root: Root directory of the project containing the code to archive
-        """
-        super().__init__()
-        self.output_dir = output_dir
-        self.project_root = project_root
-        self.logger = logging.getLogger(__name__)
-    
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """
-        Archive configuration and source code at the start of training.
-        
-        Args:
-            trainer: PyTorch Lightning trainer
-            pl_module: PyTorch Lightning module
-        """
-        os.makedirs(self.output_dir, exist_ok=True)
-        timestamp = pl_module.current_epoch
-        archive_name = os.path.join(self.output_dir, f"code_snapshot_{timestamp}.zip")
-        
-        self.logger.info(f"Creating code archive: {archive_name}")
-        
-        with zipfile.ZipFile(archive_name, 'w') as zipf:
-            # Archive configurations
-            config_dir = os.path.join(self.project_root, 'configs')
-            for root, _, files in os.walk(config_dir):
-                for file in files:
-                    if file.endswith('.yaml'):
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, self.project_root)
-                        zipf.write(file_path, arcname)
-            
-            # Archive source code
-            # train.py
-            train_path = os.path.join(self.project_root, 'train.py')
-            if os.path.exists(train_path):
-                zipf.write(train_path, 'train.py')
-            
-            # Core modules
-            core_dir = os.path.join(self.project_root, 'core')
-            for root, _, files in os.walk(core_dir):
-                for file in files:
-                    if file.endswith('.py'):
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, self.project_root)
-                        zipf.write(file_path, arcname)
-            
-            # Models
-            models_dir = os.path.join(self.project_root, 'models')
-            if os.path.exists(models_dir):
-                for root, _, files in os.walk(models_dir):
-                    for file in files:
-                        if file.endswith('.py'):
-                            file_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_path, self.project_root)
-                            zipf.write(file_path, arcname)
-            
-            # Losses
-            losses_dir = os.path.join(self.project_root, 'losses')
-            if os.path.exists(losses_dir):
-                for root, _, files in os.walk(losses_dir):
-                    for file in files:
-                        if file.endswith('.py'):
-                            file_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_path, self.project_root)
-                            zipf.write(file_path, arcname)
-            
-            # Metrics
-            metrics_dir = os.path.join(self.project_root, 'metrics')
-            if os.path.exists(metrics_dir):
-                for root, _, files in os.walk(metrics_dir):
-                    for file in files:
-                        if file.endswith('.py'):
-                            file_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_path, self.project_root)
-                            zipf.write(file_path, arcname)
-        
-        self.logger.info(f"Code archive created: {archive_name}")
-
-
-class SkipValidation(Callback):
-    """
-    Skip the entire validation loop until a given epoch by zeroing out
-    `trainer.limit_val_batches`. Restores the original setting once the
-    epoch threshold is reached.
-    """
-    def __init__(self, skip_until_epoch: int = 0):
-        super().__init__()
-        self.skip_until_epoch = skip_until_epoch
-        self._original_limit_val_batches = None
-        self.logger = logging.getLogger(__name__)
-
-    def on_fit_start(self, trainer, pl_module):
-        # Capture the user's configured limit_val_batches
-        self._original_limit_val_batches = trainer.limit_val_batches
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        if trainer.current_epoch < self.skip_until_epoch:
-            if trainer.limit_val_batches != 0:
-                self.logger.info(
-                    f"Skipping validation until epoch {self.skip_until_epoch} "
-                    f"(current: {trainer.current_epoch})"
-                )
-                trainer.limit_val_batches = 0
-        else:
-            # Restore the original setting once we've reached the target epoch
-            if trainer.limit_val_batches == 0:
-                trainer.limit_val_batches = self._original_limit_val_batches
-                self.logger.info(
-                    f"Resuming validation from epoch {trainer.current_epoch}"
-                )
-
-class PredictionSaver(Callback):
-    """
-    Callback to save ground truth and prediction tensors as NumPy arrays.
-    Only saves after a specified starting epoch and at a specified frequency.
-    
-    Fixed to properly save ALL samples when max_samples=None.
-    """
-    
-    def __init__(
-        self,
-        save_dir: str,
-        save_every_n_epochs: int = 5,
-        save_after_epoch: int = 0,
-        max_samples: int = None  # None means save all samples
-    ):
-        """
-        Initialize the PredictionSaver callback.
-        
-        Args:
-            save_dir: Directory to save prediction data
-            save_every_n_epochs: How often to save (every N epochs)
-            save_after_epoch: Only start saving after this epoch
-            max_samples: Maximum number of samples to save per epoch (None = save all)
-        """
-        super().__init__()
-        self.save_dir = save_dir
-        self.save_every_n_epochs = save_every_n_epochs
-        self.save_after_epoch = save_after_epoch
-        self.max_samples = max_samples  # None means no limit
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize state
-        self._reset_buffers()
-        
-        # Log initialization once at INFO level
-        self.logger.info(f"PredictionSaver initialized:")
-        self.logger.info(f"  save_dir: {save_dir}")
-        self.logger.info(f"  save_every_n_epochs: {save_every_n_epochs}")
-        self.logger.info(f"  save_after_epoch: {save_after_epoch}")
-        if max_samples is None:
-            self.logger.info(f"  max_samples: unlimited (save all)")
-        else:
-            self.logger.info(f"  max_samples: {max_samples}")
-    
-    def _reset_buffers(self):
-        """Reset the internal buffers that collect samples."""
-        self._gts = []
-        self._preds = []
-        self._collected = 0
-        # Note: Don't reset _saved_this_epoch here - it's managed per epoch
-    
-    def _should_save_this_epoch(self, epoch):
-        """Determine if we should save data for this epoch."""
-        if epoch < self.save_after_epoch:
-            return False
-            
-        return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
-    
-    def on_validation_epoch_start(self, trainer, pl_module):
-        """Reset state at the start of a validation epoch."""
-        current_epoch = trainer.current_epoch
-        
-        # Always reset buffers and state for new epoch
-        self._reset_buffers()
-        self._saved_this_epoch = False
-        
-        # Check if we should save this epoch
-        if self._should_save_this_epoch(current_epoch):
-            self.logger.info(f"Will save predictions for epoch {current_epoch}")
-        else:
-            # Mark as done for non-saving epochs to skip processing
-            self._saved_this_epoch = True
-            self.logger.debug(f"Skipping epoch {current_epoch} (not a saving epoch)")
-    
-    def on_test_epoch_start(self, trainer, pl_module):
-        """Reset buffers at the start of a test epoch."""
-        self.logger.info(f"Starting test prediction collection for epoch {trainer.current_epoch}")
-        self._reset_buffers()
-        self._saved_this_epoch = False
-    
-    def on_validation_batch_end(
-        self,
-        trainer,
-        pl_module,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx=0
-    ):
-        """Collect validation batch results for later saving."""
-        # Early return if we've already saved this epoch
-        if self._saved_this_epoch:
-            return
-        
-        current_epoch = trainer.current_epoch
-        if not self._should_save_this_epoch(current_epoch):
-            return
-        
-        # FIXED: Only check max_samples limit if it's actually set
-        # When max_samples is None, we want to collect ALL samples
-        if self.max_samples is not None and self._collected >= self.max_samples:
-            return
-        
-        # Extract data with additional safety checks
-        try:
-            if outputs is None or not isinstance(outputs, dict):
-                return
-            if "predictions" not in outputs:
-                return
-                
-            y_true = batch[pl_module.target_key]
-            y_pred = outputs["predictions"]
-            
-            # Validate tensor shapes
-            if y_true.numel() == 0 or y_pred.numel() == 0:
-                return
-                
-        except (KeyError, AttributeError, RuntimeError) as e:
-            self.logger.debug(f"Skipping batch due to extraction error: {e}")
-            return
-        
-        # Move to CPU and detach to prevent memory leaks
-        try:
-            y_true = y_true.detach().cpu()
-            y_pred = y_pred.detach().cpu()
-        except RuntimeError as e:
-            self.logger.debug(f"Error moving tensors to CPU: {e}")
-            return
-        
-        # FIXED: Calculate how many samples to take
-        if self.max_samples is None:
-            # Take ALL samples from the batch when max_samples is None
-            take = y_pred.shape[0]
-        else:
-            # Take limited samples when max_samples is set
-            remaining = self.max_samples - self._collected
-            take = min(remaining, y_pred.shape[0])
-        
-        if take > 0:
-            # Append the slices
-            self._gts.append(y_true[:take])
-            self._preds.append(y_pred[:take])
-            self._collected += take
-            
-            # FIXED: Improved logging for unlimited collection
-            if self.max_samples is None:
-                if batch_idx % 20 == 0:  # Log every 20 batches when saving all
-                    self.logger.debug(f"Collected {self._collected} samples so far (batch {batch_idx})")
-            else:
-                # Log when we reach max samples for limited collection
-                if self._collected >= self.max_samples:
-                    self.logger.info(f"Collected maximum {self.max_samples} samples for epoch {current_epoch}")
-                elif batch_idx % 10 == 0:  # Log progress every 10 batches
-                    self.logger.debug(f"Collected {self._collected}/{self.max_samples} samples (batch {batch_idx})")
-    
-    def on_test_batch_end(
-        self,
-        trainer,
-        pl_module,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx=0
-    ):
-        """Collect test batch results for later saving."""
-        # Early return if we've already saved this epoch
-        if self._saved_this_epoch:
-            return
-        
-        # FIXED: Only check max_samples limit if it's actually set
-        # When max_samples is None, we want to collect ALL samples
-        if self.max_samples is not None and self._collected >= self.max_samples:
-            return
-        
-        # Extract data
-        try:
-            if outputs is None or not isinstance(outputs, dict):
-                return
-            if "predictions" not in outputs:
-                return
-                
-            y_true = batch[pl_module.target_key]
-            y_pred = outputs["predictions"]
-            
-            # Validate tensor shapes
-            if y_true.numel() == 0 or y_pred.numel() == 0:
-                return
-                
-        except (KeyError, AttributeError, RuntimeError) as e:
-            self.logger.debug(f"Skipping test batch due to extraction error: {e}")
-            return
-        
-        # Move to CPU and detach
-        try:
-            y_true = y_true.detach().cpu()
-            y_pred = y_pred.detach().cpu()
-        except RuntimeError as e:
-            self.logger.debug(f"Error moving tensors to CPU: {e}")
-            return
-        
-        # FIXED: Calculate how many samples to take
-        if self.max_samples is None:
-            # Take ALL samples from the batch when max_samples is None
-            take = y_pred.shape[0]
-        else:
-            # Take limited samples when max_samples is set
-            remaining = self.max_samples - self._collected
-            take = min(remaining, y_pred.shape[0])
-        
-        if take > 0:
-            self._gts.append(y_true[:take])
-            self._preds.append(y_pred[:take])
-            self._collected += take
-            
-            # Log progress for test phase
-            if self.max_samples is None:
-                if batch_idx % 20 == 0:  # Log every 20 batches when saving all
-                    self.logger.debug(f"Collected {self._collected} test samples so far (batch {batch_idx})")
-            else:
-                if batch_idx % 10 == 0:  # Log progress every 10 batches
-                    self.logger.debug(f"Collected {self._collected}/{self.max_samples} test samples (batch {batch_idx})")
-    
-    def _save_data(self, trainer, phase="val"):
-        """Save collected data as NumPy arrays."""
-        if self._collected == 0:
-            self.logger.debug(f"No data collected to save for {phase}")
-            return False
-            
-        current_epoch = trainer.current_epoch
-        
-        try:
-            # Concatenate buffers
-            gts = torch.cat(self._gts, dim=0)
-            preds = torch.cat(self._preds, dim=0)
-            
-            # Create output directory
-            phase_dir = os.path.join(self.save_dir, phase)
-            epoch_dir = os.path.join(phase_dir, f"epoch_{current_epoch:06d}")
-            os.makedirs(epoch_dir, exist_ok=True)
-            
-            # Convert to NumPy and save
-            gts_numpy = gts.numpy()
-            preds_numpy = preds.numpy()
-            
-            # Save as .npy files
-            gt_path = os.path.join(epoch_dir, "ground_truth.npy")
-            pred_path = os.path.join(epoch_dir, "predictions.npy")
-            
-            np.save(gt_path, gts_numpy)
-            np.save(pred_path, preds_numpy)
-            
-            # FIXED: Better logging message
-            samples_info = f"{self._collected} samples" if self.max_samples is None else f"{self._collected}/{self.max_samples} samples"
-            self.logger.info(f"Saved {samples_info} for {phase} epoch {current_epoch} "
-                           f"(shapes: gt={gts_numpy.shape}, pred={preds_numpy.shape})")
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to save {phase} data for epoch {current_epoch}: {e}")
-            return False
-    
-    def on_validation_epoch_end(self, trainer, pl_module):
-        """Save data at the end of the validation epoch if conditions are met."""
-        current_epoch = trainer.current_epoch
-        
-        # Only attempt to save if we haven't already saved and we collected data
-        if not self._saved_this_epoch and self._collected > 0:
-            success = self._save_data(trainer, "val")
-            if success:
-                self._saved_this_epoch = True
-        
-        # Clean up buffers to free memory
-        self._gts.clear()
-        self._preds.clear()
-        
-        final_count = self._collected
-        self._collected = 0
-        
-        self.logger.debug(f"Validation epoch {current_epoch} end: "
-                         f"saved={self._saved_this_epoch}, collected={final_count} samples")
-    
-    def on_test_epoch_end(self, trainer, pl_module):
-        """Save data at the end of the test epoch."""
-        current_epoch = trainer.current_epoch
-        
-        if not self._saved_this_epoch and self._collected > 0:
-            success = self._save_data(trainer, "test")
-            if success:
-                self._saved_this_epoch = True
-        
-        # Clean up buffers
-        self._gts.clear()
-        self._preds.clear()
-        
-        final_count = self._collected
-        self._collected = 0
-        
-        self.logger.debug(f"Test epoch {current_epoch} end: collected={final_count} samples")
-
-# ------------------------------------
 # core/metric_loader.py
 # ------------------------------------
 """
@@ -2549,7 +1848,8 @@ class SegmentationDataModule((pl.LightningDataModule)):
             num_workers=self.num_workers,
             collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True,
         )
     
     def val_dataloader(self) -> DataLoader:
@@ -2566,7 +1866,8 @@ class SegmentationDataModule((pl.LightningDataModule)):
             num_workers=self.num_workers,
             collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True,
         )
     
     def test_dataloader(self) -> DataLoader:
@@ -2583,7 +1884,8 @@ class SegmentationDataModule((pl.LightningDataModule)):
             num_workers=self.num_workers,
             collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True,
         )
 
 # ------------------------------------
@@ -3356,6 +2658,156 @@ class ConnectedComponentsQuality(nn.Module):
         return matches
 
 # ------------------------------------
+# metrics/dice.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class ThresholdedDiceMetric(nn.Module):
+    """
+    Threshold each channel into a binary mask, then compute standard Dice.
+
+    Args:
+        threshold (float or str): cut‐off for binarization.
+        eps (float or str): small constant to avoid zero‐division.
+        multiclass (bool or str): if True, macro‐average over channels.
+        zero_division (float or str): returned value when both pred & GT empty.
+    """
+    def __init__(
+        self,
+        threshold=0.5,
+        eps=1e-6,
+        multiclass=False,
+        zero_division=1.0,
+    ):
+        super().__init__()
+        # Force numerical types
+        self.threshold     = float(threshold)
+        self.eps           = float(eps)
+        self.multiclass    = bool(multiclass)
+        self.zero_division = float(zero_division)
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # ensure (N, C, H, W)
+        if y_pred.dim() == 3:
+            y_pred = y_pred.unsqueeze(1)
+        if y_true.dim() == 3:
+            y_true = y_true.unsqueeze(1)
+
+        N, C, *_ = y_pred.shape
+        if not self.multiclass and C != 1:
+            raise ValueError(f"[ThresholdedDiceMetric] Binary mode expects 1 channel, got {C}")
+
+        # binarize
+        y_pred_bin = (y_pred > self.threshold).float()
+        y_true_bin = (y_true > self.threshold).float()
+
+        # flatten
+        y_pred_flat = y_pred_bin.view(N, C, -1)
+        y_true_flat = y_true_bin.view(N, C, -1)
+
+        # intersection and sums
+        inter = (y_pred_flat * y_true_flat).sum(-1)           # (N, C)
+        sums  = y_pred_flat.sum(-1) + y_true_flat.sum(-1)     # (N, C)
+
+        # build eps and zero_division as tensors
+        device = y_pred.device
+        eps_tensor = torch.tensor(self.eps, device=device, dtype=inter.dtype)
+        zd_tensor = torch.tensor(self.zero_division, device=device, dtype=inter.dtype)
+
+        # dice per sample/class with ε for stability
+        dice = (2 * inter + eps_tensor) / (sums + eps_tensor)     # (N, C)
+
+        # override exact-zero cases
+        zero_mask = (sums == 0)
+        if zero_mask.any():
+            dice = torch.where(zero_mask, zd_tensor, dice)
+
+        # mean over batch → (C,)
+        dice_per_class = dice.mean(0)
+
+        if not self.multiclass or C == 1:
+            return dice_per_class.squeeze(0)
+
+        return dice_per_class.mean()
+
+
+# ------------------------------------
+# metrics/iou.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class ThresholdedIoUMetric(nn.Module):
+    """
+    Threshold each channel into binary masks, then compute Intersection-over-Union.
+
+    Args:
+        threshold (float): cut-off for binarization.
+        eps (float): small constant to stabilize non-zero cases.
+        multiclass (bool): if True, macro-average over channels.
+        zero_division (float): value to return when both pred and true are empty (union=0).
+    """
+    def __init__(
+        self,
+        threshold = 0.5,
+        eps = 1e-6,
+        multiclass = False,
+        zero_division = 1.0,
+    ):
+        super().__init__()
+        self.threshold     = float(threshold)
+        self.eps           = float(eps)
+        self.multiclass    = bool(multiclass)
+        self.zero_division = float(zero_division)
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # Ensure shape (N, C, H, W)
+        if y_pred.dim() == 3:
+            y_pred = y_pred.unsqueeze(1)
+        if y_true.dim() == 3:
+            y_true = y_true.unsqueeze(1)
+
+        N, C, *_ = y_pred.shape
+        if not self.multiclass and C != 1:
+            raise ValueError(f"[ThresholdedIoUMetric] Binary mode expects 1 channel, got {C}")
+
+        # Binarize
+        y_pred_bin = (y_pred > self.threshold).float()
+        y_true_bin = (y_true > self.threshold).float()
+
+        # Flatten
+        y_pred_flat = y_pred_bin.view(N, C, -1)
+        y_true_flat = y_true_bin.view(N, C, -1)
+
+        # Intersection and union
+        inter = (y_pred_flat * y_true_flat).sum(-1)                    # (N, C)
+        sum_pred = y_pred_flat.sum(-1)
+        sum_true = y_true_flat.sum(-1)
+        union = sum_pred + sum_true - inter                           # (N, C)
+
+        # IoU per sample/class with ε for stability
+        iou = (inter + self.eps) / (union + self.eps)                  # (N, C)
+
+        # Handle zero-union explicitly: when union == 0, set to zero_division
+        zero_mask = (union == 0)
+        if zero_mask.any():
+            iou = torch.where(zero_mask,
+                              torch.tensor(self.zero_division, device=iou.device),
+                              iou)
+
+        # Mean over batch → (C,)
+        iou_per_class = iou.mean(0)
+
+        if not self.multiclass or C == 1:
+            # Binary: return scalar
+            return iou_per_class.squeeze(0)
+
+        # Multiclass: macro-average
+        return iou_per_class.mean()
+
+
+# ------------------------------------
 # metrics/apls.py
 # ------------------------------------
 import numpy as np
@@ -3450,812 +2902,6 @@ class APLS(nn.Module):
             min_path_length=self.min_path_length
         )
         return torch.tensor(scores.mean(), device=y_pred.device)
-
-
-# ------------------------------------
-# UsefulScripts/extract_paths.py
-# ------------------------------------
-import os
-import pickle
-import networkx as nx
-import numpy as np
-import itertools
-import tempfile
-import time
-from multiprocessing import Pool, cpu_count
-
-def mkdir(directory):
-    directory = os.path.abspath(directory)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-def load_graph_txt(filename):
-    G = nx.Graph()
-    nodes = []
-    edges = []
-    i = 0
-    switch = True
-    with open(filename, "r") as f:
-        for line in f:
-            line = line.strip()
-            if len(line) == 0 and switch:
-                switch = False
-                continue
-            if switch:
-                x, y = line.split(' ')
-                G.add_node(i, pos=(float(x), float(y)))
-                i += 1
-            else:
-                idx_node1, idx_node2 = line.split(' ')
-                G.add_edge(int(idx_node1), int(idx_node2))
-    return G
-
-def save_graph_txt(G, filename):
-    mkdir(os.path.dirname(filename))
-    nodes = list(G.nodes())
-    with open(filename, "w+") as file:
-        for n in nodes:
-            file.write("{:.6f} {:.6f}\r\n".format(G.nodes[n]['pos'][0], G.nodes[n]['pos'][1]))
-        file.write("\r\n")
-        for s, t in G.edges():
-            file.write("{} {}\r\n".format(nodes.index(s), nodes.index(t)))
-
-def txt_to_graph(filecontent):
-    G = nx.Graph()
-    lines = filecontent.strip().splitlines()
-    switch = True  
-    node_index = 0
-    
-    for line in lines:
-        line = line.strip()
-        if len(line) == 0 and switch:
-            switch = False
-            continue
-        
-        if switch:
-            try:
-                x, y = line.split()
-                G.add_node(node_index, pos=(float(x), float(y)))
-                node_index += 1
-            except ValueError:
-                raise ValueError(f"Error parsing node line: {line}")
-        else:
-            try:
-                idx_node1, idx_node2 = line.split()
-                G.add_edge(int(idx_node1), int(idx_node2))
-            except ValueError:
-                raise ValueError(f"Error parsing edge line: {line}")
-    
-    return G
-
-def process_single_graph(graph_file, graphs_folder, temp_dir):
-    start_time = time.time()  # Start time for each graph
-    temp_file = os.path.join(temp_dir, f"{graph_file}.pkl")
-
-    if os.path.exists(temp_file):
-        with open(temp_file, "rb") as f:
-            result = pickle.load(f)
-        elapsed_time = time.time() - start_time
-        print(f"Loaded cached graph {graph_file} in {elapsed_time:.2f} seconds.")
-        return result
-
-    graph_path = os.path.join(graphs_folder, graph_file)
-    G = load_graph_txt(graph_path)
-
-    for n, data in G.nodes(data=True):
-        if 'pos' not in data and 'x' in data and 'y' in data:
-            data['pos'] = (data['x'], data['y'])
-
-    paths = []
-    nodes = list(G.nodes())
-    for s, t in itertools.combinations(nodes, 2):
-        try:
-            sp = nx.shortest_path(G, source=s, target=t, weight='length')
-            s_coords = np.array(G.nodes[s].get('pos', (G.nodes[s].get('x'), G.nodes[s].get('y'))))
-            t_coords = np.array(G.nodes[t].get('pos', (G.nodes[t].get('x'), G.nodes[t].get('y'))))
-            paths.append({
-                's_gt': s_coords,
-                't_gt': t_coords,
-                'shortest_path_gt': sp
-            })
-        except nx.NetworkXNoPath:
-            continue
-
-    result = (graph_file, paths)
-    with open(temp_file, "wb") as f:
-        pickle.dump(result, f)
-
-    elapsed_time = time.time() - start_time
-    print(f"Processed {graph_file} in {elapsed_time:.2f} seconds.")
-
-    return result
-
-def handle_graph_processing(dataset_name, base_dir, num_cores=4):
-    start_total_time = time.time()  # Start measuring total time
-
-    dataset_path = os.path.join(base_dir, dataset_name)
-    graphs_folder = os.path.join(dataset_path, "graphs")
-    output_path = os.path.join(dataset_path, f"{dataset_name}_gt_paths.pkl")
-    temp_dir = os.path.join(tempfile.gettempdir(), f"{dataset_name}_temp")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    if not os.path.exists(graphs_folder):
-        print(f"Graphs folder not found at {graphs_folder}.")
-        return
-
-    graph_files = [f for f in os.listdir(graphs_folder) if f.endswith('.txt')]
-    processed_files = {f for f in os.listdir(temp_dir) if f.endswith('.pkl')}
-    remaining_files = [f for f in graph_files if f"{f}.pkl" not in processed_files]
-
-    print(f"Processing {len(remaining_files)} remaining graphs in parallel using {num_cores} CPU cores...")
-
-    gt_paths_dict = {}
-    with Pool(processes=num_cores) as pool:
-        results = pool.starmap(process_single_graph, [(gf, graphs_folder, temp_dir) for gf in remaining_files])
-
-    for gf, paths in results:
-        gt_paths_dict[gf] = paths
-
-    with open(output_path, "wb") as f:
-        pickle.dump(gt_paths_dict, f)
-
-    total_elapsed_time = time.time() - start_total_time
-    print(f"Saved all processed ground truth paths to {output_path}")
-    print(f"Total processing time: {total_elapsed_time:.2f} seconds.")
-
-# Usage with limited CPU cores
-BaseDirDataset = '/home/ri/Desktop/Projects/ProcessedDatasets'
-Dataset_name = 'CREMI'
-handle_graph_processing(Dataset_name, BaseDirDataset, num_cores=4)
-
-# Uncomment to process DRIVE dataset as well
-# Dataset_name = 'DRIVE'
-# handle_graph_processing(Dataset_name, BaseDirDataset, num_cores=4)
-
-
-# ------------------------------------
-# UsefulScripts/mass_clean_labels.py
-# ------------------------------------
-import os
-import numpy as np
-from tqdm import tqdm
-import warnings
-
-try:
-    import rasterio
-    from rasterio.errors import NotGeoreferencedWarning
-    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
-    RASTERIO_AVAILABLE = True
-except ImportError:
-    from PIL import Image
-    RASTERIO_AVAILABLE = False
-
-
-def read_image(path):
-    if RASTERIO_AVAILABLE:
-        with rasterio.open(path) as src:
-            img = src.read()  # (C, H, W)
-            img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
-    else:
-        img = np.array(Image.open(path).convert("RGB"))
-    return img
-
-
-def read_label(path):
-    if RASTERIO_AVAILABLE:
-        with rasterio.open(path) as src:
-            lbl = src.read(1)  # read first band as label
-    else:
-        lbl = np.array(Image.open(path))
-    return lbl
-
-
-def save_label(label_array, out_path):
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    if RASTERIO_AVAILABLE:
-        height, width = label_array.shape
-        profile = {
-            'driver': 'GTiff',
-            'height': height,
-            'width': width,
-            'count': 1,
-            'dtype': str(label_array.dtype),
-        }
-        with rasterio.open(out_path, 'w', **profile) as dst:
-            dst.write(label_array, 1)
-    else:
-        from PIL import Image
-        Image.fromarray(label_array).save(out_path)
-
-
-def clean_labels(image_dir, label_dir, output_dir, window_size=8, white_threshold=250):
-    """
-    For each label pixel block (window_size x window_size),
-    if the corresponding image block is 'white' (above white_threshold),
-    set those label pixels to 0.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Gather image and label files by base name, ignoring extension differences
-    image_files = {os.path.splitext(f)[0]: os.path.join(image_dir, f)
-                   for f in os.listdir(image_dir)
-                   if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg'))}
-
-    label_files = {os.path.splitext(f)[0]: os.path.join(label_dir, f)
-                   for f in os.listdir(label_dir)
-                   if f.lower().endswith(('.tif', '.tiff', '.png', '.jpg'))}
-
-    common_keys = sorted(set(image_files.keys()) & set(label_files.keys()))
-
-    for key in tqdm(common_keys, desc=f"Cleaning labels from {image_dir}"):
-        image_path = image_files[key]
-        label_path = label_files[key]
-        output_path = os.path.join(output_dir, f"{key}.tif")  # force .tif output
-
-        try:
-            image = read_image(image_path)
-            label = read_label(label_path)
-        except Exception as e:
-            print(f"Failed to load {key}: {e}")
-            continue
-
-        # If you have an alpha channel, ignore it
-        if image.shape[-1] == 4:
-            image = image[..., :3]
-
-        H, W = image.shape[:2]
-        cleaned = label.copy()
-
-        for y in range(0, H, window_size):
-            for x in range(0, W, window_size):
-                y1 = min(y + window_size, H)
-                x1 = min(x + window_size, W)
-                patch = image[y:y1, x:x1]  # shape ~ (8, 8, 3)
-
-                # is_every_pixel_white? => (pixel_value > white_threshold) in all channels
-                if np.all(patch > white_threshold):
-                    cleaned[y:y1, x:x1] = 0
-
-        save_label(cleaned, output_path)
-
-    print(f"Finished cleaning {len(common_keys)} matched label-image pairs.")
-
-
-if __name__ == "__main__":
-    # Example usage:
-    clean_labels(
-        image_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/train/sat",
-        label_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/train/map",
-        output_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/train/label",
-        window_size=8,
-        white_threshold=250  # can tune to ~240-255
-    )
-
-    clean_labels(
-        image_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/valid/sat",
-        label_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/valid/map",
-        output_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/valid/label",
-        window_size=8,
-        white_threshold=250
-    )
-
-    clean_labels(
-        image_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/test/sat",
-        label_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/test/map",
-        output_dir="/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/test/label",
-        window_size=8,
-        white_threshold=250
-    )
-
-
-# ------------------------------------
-# UsefulScripts/mass_roads_dataset_downloader.py
-# ------------------------------------
-import os
-import requests
-def download_file(url, save_path):
-    if not os.path.exists(save_path):
-        print(f"Downloading: {url}")
-        response = requests.get(url, stream=True)
-        if response.status_code == 200:
-            with open(save_path, 'wb') as file:
-                for chunk in response.iter_content(chunk_size=1024):
-                    file.write(chunk)
-            print(f"Downloaded: {save_path}")
-        else:
-            print(f"Failed to download: {url}")
-    else:
-        print(f"File already exists: {save_path}")
-
-from bs4 import BeautifulSoup
-
-def extract_hrefs_from_html(html_file):
-    """
-    Extracts all href attributes from <a> tags in an HTML file.
-    
-    Args:
-        html_file (str): Path to the HTML file.
-        output_file (str, optional): Path to save the extracted hrefs. If None, no file is saved.
-    
-    Returns:
-        list: A list of href strings extracted from the HTML file.
-    """
-    # Load the HTML file
-    with open(html_file, 'r', encoding='utf-8') as file:
-        content = file.read()
-
-    # Parse the HTML content with BeautifulSoup
-    soup = BeautifulSoup(content, 'html.parser')
-
-    # Extract all href attributes from <a> tags
-    hrefs = [a['href'] for a in soup.find_all('a', href=True)]
-
-    return hrefs
-    
-dataset = {
-    ("train","sat"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/train/sat/index.html',
-    ("train","map"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/train/map/index.html',
-    ("valid","sat"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/valid/sat/index.html',
-    ("valid","map"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/valid/map/index.html',
-    ("test", "sat"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/test/sat/index.html',
-    ("test", "map"):'https://www.cs.toronto.edu/~vmnih/data/mass_roads/test/map/index.html',
-  
-} 
-BASE = "dataset"
-for folders, url in dataset.items():
-  os.makedirs(BASE, exist_ok=True)
-  f1 = os.path.join(BASE, folders[0]) 
-  f2 = os.path.join(f1, folders[1])
-  os.makedirs(f1, exist_ok=True) 
-  os.makedirs(f2, exist_ok=True)
-  index = os.path.join(f2, "index.html")
-  download_file(url, index)
-  hrefs = extract_hrefs_from_html(index)
-  for href in hrefs:
-    download_file(href, os.path.join(f2, href.split('/')[-1]))
-
-
-# ------------------------------------
-# UsefulScripts/tlts.py
-# ------------------------------------
-import numpy as np
-import networkx as nx
-import queue
-import itertools
-from scipy.spatial.distance import euclidean
-
-def find_connectivity(img, x, y, stop=None):
-    
-    _img = img.copy()   
-    _img2 = img.copy()
-    
-    dy = [0, 0, 1, 1, 1, -1, -1, -1]
-    dx = [1, -1, 0, 1, -1, 0, 1, -1]
-    xs = []
-    ys = []
-    cs = []
-    q = queue.Queue()
-    if _img[y,x] == True:
-        q.put((y,x))
-    i = 0
-    while q.empty() == False:
-        i+=1
-        v,u = q.get()
-        xs.append(u)
-        ys.append(v)
-        adjacent = [(u,v)]
-        if stop is not None and i==stop:
-            return xs, ys, cs
-        for k in range(8):
-            yy = v + dy[k]
-            xx = u + dx[k]            
-            if _img[yy, xx] == True:
-                _img[yy, xx] = False
-                q.put((yy, xx))               
-            if _img2[yy, xx] == True:
-                adjacent.append((xx,yy))
-        cs.append(adjacent)
-    return xs, ys, cs 
-
-def find_connectivity_3d(img, x, y, z, stop=None):
-    
-    _img = img.copy()   
-    _img2 = img.copy()
-    
-    dx = [-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-    dy = [-1, -1, -1, 0, 0, 0, 1, 1, 1, -1, -1, -1, 0, 0, 1, 1, 1, -1, -1, -1, 0, 0, 0, 1, 1, 1]
-    dz = [-1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1]     
-    xs = []
-    ys = []
-    zs = []
-    cs = []
-    q = queue.Queue()
-    if _img[y,x,z] == True:
-        q.put((x,y,z))
-    i = 0
-    while q.empty() == False:
-        i+=1
-        u,v,w = q.get()
-        xs.append(u)
-        ys.append(v)
-        zs.append(w)
-        adjacent = [(u,v,w)]
-        if stop is not None and i==stop:
-            return xs, ys, zs, cs
-        for k in range(26):            
-            xx = u + dx[k]  
-            yy = v + dy[k]
-            zz = w + dz[k]            
-            if _img[yy, xx, zz] == True:
-                _img[yy, xx, zz] = False
-                q.put((xx,yy,zz))               
-            if _img2[yy, xx, zz] == True:
-                adjacent.append((xx,yy,zz))
-        cs.append(adjacent)
-    return xs, ys, zs, cs
-    
-def create_graph(skeleton):
-    
-    _skeleton = skeleton.copy()>0
-
-    # make sure no pixel are active on the borders
-    _skeleton[ 0, :] = False
-    _skeleton[-1, :] = False
-    _skeleton[ :, 0] = False
-    _skeleton[ :,-1] = False
-
-    css = []
-    while True:
-        ys, xs = np.where(_skeleton)
-        if len(ys)==0:
-            break
-        _xs, _ys, _cs = find_connectivity(_skeleton, xs[0], ys[0], stop=None)
-        css += _cs
-        _skeleton[_ys,_xs] = False       
-    
-    graph = nx.Graph()
-
-    for cs in css:
-        for pos in cs:
-            if not graph.has_node(pos):
-                graph.add_node(pos, pos=np.array(pos))  
-        '''   
-        if len(cs)==2:
-            us,vs = [cs[0]],[cs[1]]
-            distances = [euclidean(cs[0],cs[1])]
-        elif len(cs)==3:
-            d1 = euclidean(cs[0],cs[1])
-            d2 = euclidean(cs[1],cs[2])
-            d3 = euclidean(cs[0],cs[2])
-            if d1>d2 and d1>d3:
-                us,vs = [cs[1],cs[0]],[cs[2],cs[2]] 
-                distances = [d2,d3]
-            if d2>d1 and d2>d3:
-                us,vs = [cs[0],cs[0]],[cs[1],cs[2]]  
-                distances = [d1,d3]
-            if d3>d1 and d3>d2:
-                us,vs = [cs[0],cs[1]],[cs[1],cs[2]]
-                distances = [d1,d2]
-        else:
-        '''
-        us,vs = [],[]
-        for u,v in itertools.combinations(cs, 2):
-            us += [u]
-            vs += [v]                    
-        distances = [euclidean(u,v) for u,v in zip(us,vs)] 
-
-        for u,v,d in zip(us,vs,distances):
-            if not graph.has_edge(u,v):
-                '''
-                if False:
-                    try:
-                        length = nx.shortest_path_length(graph,u,v)
-                        if length>5:
-                            graph.add_edge(u,v)
-                    except:
-                        graph.add_edge(u,v)      
-                else:
-                '''
-                if d<1.42:
-                    graph.add_edge(u,v)
-
-    return graph
-
-def create_graph_3d(skeleton):
-    
-    _skeleton = skeleton.copy()>0
-    
-    # make sure no pixel are active on the borders
-    _skeleton[ 0, :, :] = False
-    _skeleton[-1, :, :] = False
-    _skeleton[ :, 0, :] = False
-    _skeleton[ :,-1, :] = False   
-    _skeleton[ :, :, 0] = False
-    _skeleton[ :, :,-1] = False     
-
-    css = []
-    while True:
-        ys, xs, zs = np.where(_skeleton)
-        if len(ys)==0:
-            break
-        _xs, _ys, _zs, _cs = find_connectivity_3d(_skeleton, xs[0], ys[0], zs[0], stop=None)
-        css += _cs
-        _skeleton[_ys,_xs,_zs] = False       
-    
-    graph = nx.Graph()
-
-    for cs in css:
-        for pos in cs:
-            if not graph.has_node(pos):
-                graph.add_node(pos, pos=np.array(pos))  
-
-        us,vs = [],[]
-        for u,v in itertools.combinations(cs, 2):
-            us += [u]
-            vs += [v]                    
-        distances = [euclidean(u,v) for u,v in zip(us,vs)] 
-
-        for u,v,d in zip(us,vs,distances):
-            if not graph.has_edge(u,v):
-                if d<2.1:
-                    graph.add_edge(u,v)
-
-    return graph
-
-def extract_gt_paths(graph_gt, N=100, min_path_length=10):
-
-    cc_graphs = list(graph_gt.subgraph(c) for c in nx.connected_components(graph_gt))
-    n_subgraph = len(cc_graphs)  
-    
-    total = 0
-
-    paths = []
-    for _ in range(N*1000):
-        
-        idx_sub = np.random.choice(np.arange(n_subgraph), 1)[0]
-        graph = cc_graphs[idx_sub]
-        
-        nodes_gt = list(graph.nodes()) 
-        n_nodes = len(nodes_gt)
-        if n_nodes < 2:
-            continue
-    
-        # randomly pick two node in the GT
-        idx_s,idx_t = np.random.choice(np.arange(n_nodes), 2, replace=False)
-        s_gt, t_gt = nodes_gt[idx_s], nodes_gt[idx_t]
-        
-        # search shortest path in GT
-        try:
-            shortest_path_gt = list(nx.shortest_path(graph, tuple(s_gt), tuple(t_gt)))
-            #shortest_path_gt = list(nx.astar_path(graph, tuple(s_gt), tuple(t_gt)))
-            length_line_gt = len(shortest_path_gt)
-        except:
-            # path not found
-            continue 
-            
-        if length_line_gt<min_path_length:
-            continue
-            
-        paths.append({"s_gt":s_gt, "t_gt":t_gt, "shortest_path_gt":shortest_path_gt})
-        
-        total += 1
-        
-        if total==N:
-            break
-
-    return paths
-    
-def toolong_tooshort_score(paths_gt, graph_pred, radius_match=5, length_deviation=0.05):
-    """
-    A higher-order CRF model for road network extraction
-    Jan D. Wegner, Javier A. Montoya-Zegarra, Konrad Schindler
-    2013
-    
-    These are
-    computed in the following way: we randomly sample two
-    points which lie both on the true and the estimated road
-    network, and check whether the shortest path between the
-    two points has the same length in both networks (up to a
-    deviation of 5% to account for geometric uncertainty). We
-    then keep repeating this procedure with different random
-    points and record the percentages of correct, too short, too
-    long and infeasible paths, until these percentages have converged. 
-    Infeasible and too long paths indicate missing links,
-    whereas too short ones indicate hallucinated connections.  
-    
-    """
-      
-    nodes_pred = np.array(graph_pred.nodes())
-    idxs_pred = np.arange(len(nodes_pred))     
-
-    counter_correct = 0
-    counter_toolong = 0
-    counter_tooshort = 0
-    counter_infeasible = 0
-    
-    res = []  
-    for path in paths_gt:
-    
-        # unpack GT path
-        s_gt, t_gt = np.array(path["s_gt"]), np.array(path["t_gt"])
-        shortest_path_gt = path["shortest_path_gt"]
-        length_line_gt = len(shortest_path_gt)
-
-        # match GT nodes in prediction
-        nodes_radius_s = nodes_pred[np.linalg.norm(nodes_pred-s_gt[None], axis=1)<radius_match]
-        nodes_radius_t = nodes_pred[np.linalg.norm(nodes_pred-t_gt[None], axis=1)<radius_match]
-        if len(nodes_radius_s)==0 or len(nodes_radius_t)==0:
-            counter_infeasible += 1
-            res.append({"line_gt":shortest_path_gt, 
-                        "line_pred":None,
-                        "s_gt":s_gt,"t_gt":t_gt,
-                        "s_pred":None, "t_pred":None,
-                        "tooshort":False, "toolong":False,
-                        "correct":False, "infeasible":True})
-            continue
-        s_pred = nodes_radius_s[np.linalg.norm(nodes_radius_s-s_gt[None], axis=1).argmin()]
-        t_pred = nodes_radius_t[np.linalg.norm(nodes_radius_t-t_gt[None], axis=1).argmin()]
-        
-        # find shortest path in prediction
-        try:
-            shortest_path_pred = list(nx.shortest_path(graph_pred, tuple(s_pred), tuple(t_pred)))
-            #shortest_path_pred = list(nx.astar_path(graph_pred, tuple(s_pred), tuple(t_pred)))
-            length_line_pred = len(shortest_path_pred)
-        except:
-            # path not found
-            counter_infeasible += 1
-            res.append({"line_gt":shortest_path_gt, 
-                        "line_pred":None,
-                        "s_gt":s_gt,"t_gt":t_gt,
-                        "s_pred":s_pred, "t_pred":t_pred,
-                        "tooshort":False, "toolong":False,
-                        "correct":False, "infeasible":True})            
-            continue 
-
-        # compare path lengths
-        toolong, tooshort, correct = False,False,False        
-        if length_line_pred>length_line_gt*(1+length_deviation):
-            toolong = True
-            counter_toolong += 1
-        elif length_line_pred<length_line_gt*(1-length_deviation): 
-            tooshort = True
-            counter_tooshort += 1                   
-        else:
-            correct = True
-            counter_correct += 1
-            
-        res.append({"line_gt":shortest_path_gt, 
-                    "line_pred":shortest_path_pred,
-                    "s_gt":s_gt,"t_gt":t_gt,
-                    "s_pred":s_pred, "t_pred":t_pred,
-                    "tooshort":tooshort, "toolong":toolong,
-                    "correct":correct, "infeasible":False}) 
-            
-    total = len(paths_gt)
-        
-    return total, counter_correct/total, counter_tooshort/total, counter_toolong/total, counter_infeasible/total, res    
-
-# ------------------------------------
-# UsefulScripts/inspect_checkpoint.py
-# ------------------------------------
-#!/usr/bin/env python3
-"""
-Script to inspect the contents of a PyTorch Lightning checkpoint
-"""
-
-import torch
-import sys
-import os
-from pprint import pprint
-
-def inspect_checkpoint(checkpoint_path):
-    """Inspect the contents of a checkpoint file"""
-    
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: Checkpoint file not found: {checkpoint_path}")
-        return
-    
-    print(f"Inspecting checkpoint: {checkpoint_path}")
-    print("=" * 60)
-    
-    try:
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        # Print top-level keys
-        print("Top-level keys in checkpoint:")
-        for key in sorted(checkpoint.keys()):
-            if isinstance(checkpoint[key], dict):
-                print(f"  {key}: dict with {len(checkpoint[key])} keys")
-            elif isinstance(checkpoint[key], list):
-                print(f"  {key}: list with {len(checkpoint[key])} items")
-            elif hasattr(checkpoint[key], 'shape'):
-                print(f"  {key}: tensor with shape {checkpoint[key].shape}")
-            else:
-                print(f"  {key}: {type(checkpoint[key]).__name__} = {checkpoint[key]}")
-        
-        print("\n" + "=" * 60)
-        
-        # Check training state
-        print("Training State:")
-        print(f"  Epoch: {checkpoint.get('epoch', 'NOT FOUND')}")
-        print(f"  Global Step: {checkpoint.get('global_step', 'NOT FOUND')}")
-        print(f"  PyTorch Lightning Version: {checkpoint.get('pytorch-lightning_version', 'NOT FOUND')}")
-        
-        # Check optimizer state
-        print(f"\nOptimizer State:")
-        if 'optimizer_states' in checkpoint:
-            opt_states = checkpoint['optimizer_states']
-            print(f"  Number of optimizers: {len(opt_states)}")
-            for i, opt_state in enumerate(opt_states):
-                if 'param_groups' in opt_state:
-                    param_groups = opt_state['param_groups']
-                    print(f"  Optimizer {i}:")
-                    for j, group in enumerate(param_groups):
-                        print(f"    Param group {j}: lr={group.get('lr', 'NOT FOUND')}")
-                else:
-                    print(f"  Optimizer {i}: No param_groups found")
-        else:
-            print("  NO OPTIMIZER STATES FOUND")
-        
-        # Check learning rate scheduler state
-        print(f"\nLR Scheduler State:")
-        if 'lr_schedulers' in checkpoint:
-            lr_schedulers = checkpoint['lr_schedulers']
-            print(f"  Number of LR schedulers: {len(lr_schedulers)}")
-            for i, scheduler_state in enumerate(lr_schedulers):
-                print(f"  Scheduler {i}:")
-                if isinstance(scheduler_state, dict):
-                    for key, value in scheduler_state.items():
-                        if key == 'state_dict' and isinstance(value, dict):
-                            print(f"    {key}:")
-                            for skey, svalue in value.items():
-                                print(f"      {skey}: {svalue}")
-                        else:
-                            print(f"    {key}: {value}")
-                else:
-                    print(f"    Type: {type(scheduler_state)}")
-                    print(f"    Value: {scheduler_state}")
-        else:
-            print("  NO LR SCHEDULER STATES FOUND")
-        
-        # Check model state dict
-        print(f"\nModel State:")
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-            model_keys = [k for k in state_dict.keys() if not k.startswith('loss_fn.') and not k.startswith('metrics.')]
-            print(f"  Model parameters: {len(model_keys)} tensors")
-            if model_keys:
-                print(f"  Sample keys: {list(model_keys)[:3]}...")
-        else:
-            print("  NO MODEL STATE DICT FOUND")
-        
-        # Check hyperparameters
-        print(f"\nHyperparameters:")
-        if 'hyper_parameters' in checkpoint:
-            hparams = checkpoint['hyper_parameters']
-            print(f"  Found {len(hparams)} hyperparameters:")
-            for key, value in hparams.items():
-                if isinstance(value, dict):
-                    print(f"    {key}: dict with {len(value)} keys")
-                else:
-                    print(f"    {key}: {value}")
-        else:
-            print("  NO HYPERPARAMETERS FOUND")
-            
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        import traceback
-        traceback.print_exc()
-
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python inspect_checkpoint.py <checkpoint_path>")
-        print("Example: python inspect_checkpoint.py outputs/baseline_unet_massroads/checkpoints/epoch=1559-step=109200.ckpt")
-        sys.exit(1)
-    
-    checkpoint_path = sys.argv[1]
-    inspect_checkpoint(checkpoint_path) 
 
 
 # ------------------------------------
@@ -4394,920 +3040,6 @@ class TopologicalLoss(nn.Module):
         connectivity_error = F.mse_loss(dilated_pred, dilated_true)
         
         return connectivity_error
-
-# ------------------------------------
-# tests/test_helpers.py
-# ------------------------------------
-"""
-Unit tests for critical helper functions in the segmentation framework.
-Run with: pytest -xvs test_helpers.py
-"""
-
-import os
-import sys
-import pytest
-import numpy as np
-import torch
-from pathlib import Path
-
-# Add parent directory to sys.path to import modules
-sys.path.append(str(Path(__file__).parent.parent))
-
-# Import the functions to test
-from core.general_dataset import compute_distance_map, compute_sdf, custom_collate_fn
-from core.utils import (
-    noCrops,
-    noCropsPerDim,
-    cropInds,
-    coord,
-    coords,
-    cropCoords,
-    process_in_chuncks,
-)
-
-
-class TestDistanceMap:
-    """Tests for compute_distance_map function"""
-
-    def test_basic_functionality(self):
-        mask = np.zeros((5, 5), dtype=np.uint8)
-        mask[2, 2] = 1
-        distance = compute_distance_map(mask, None)
-
-        assert distance[2, 2] == 0
-        for i, j in [(0, 0), (0, 4), (4, 0), (4, 4)]:
-            assert 2.8 < distance[i, j] < 2.9
-        for i, j in [(1, 2), (3, 2), (2, 1), (2, 3)]:
-            assert distance[i, j] == 1
-
-    def test_thresholding(self):
-        mask = np.zeros((7, 7), dtype=np.uint8)
-        mask[3, 3] = 1
-        distance = compute_distance_map(mask, 2.0)
-
-        assert np.max(distance) <= 2.0
-        assert distance[3, 3] == 0
-        assert distance[2, 3] == 1
-        assert distance[4, 3] == 1
-
-    def test_binary_formats(self):
-        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
-        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
-        d1 = compute_distance_map(mask_01, None)
-        d2 = compute_distance_map(mask_0255, None)
-        assert np.array_equal(d1, d2)
-
-    def test_empty_mask(self):
-        mask = np.zeros((5, 5), dtype=np.uint8)
-        distance = compute_distance_map(mask, None)
-        assert np.all(distance > 0)
-
-    def test_full_mask(self):
-        mask = np.ones((5, 5), dtype=np.uint8)
-        distance = compute_distance_map(mask, None)
-        assert np.all(distance == 0)
-
-
-class TestSignedDistanceFunction:
-    """Tests for compute_sdf function"""
-
-    def test_basic_functionality(self):
-        mask = np.zeros((7, 7), dtype=np.uint8)
-        mask[3, 3] = 1
-        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
-
-        # Inside (where mask==1) should be negative
-        assert sdf[3, 3] < 0
-        # Far away should be positive
-        assert sdf[0, 0] > 0
-
-    def test_iterations_parameter(self):
-        mask = np.zeros((9, 9), dtype=np.uint8)
-        mask[4, 4] = 1
-
-        sdf1 = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
-        sdf3 = compute_sdf(mask, sdf_iterations=3, sdf_thresholds=None)
-
-        neg1 = np.sum(sdf1 < 0)
-        neg3 = np.sum(sdf3 < 0)
-        # More iterations should not shrink the "inside"—allow equal or larger
-        assert neg3 >= neg1
-
-    def test_thresholds_parameter(self):
-        mask = np.zeros((9, 9), dtype=np.uint8)
-        mask[4, 4] = 1
-
-        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=[-2, 2])
-        assert np.all(sdf >= -2)
-        assert np.all(sdf <= 2)
-
-    def test_binary_formats(self):
-        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
-        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
-        s1 = compute_sdf(mask_01, sdf_iterations=1, sdf_thresholds=None)
-        s2 = compute_sdf(mask_0255, sdf_iterations=1, sdf_thresholds=None)
-        assert np.array_equal(s1, s2)
-
-
-class TestCropFunctions:
-    """Tests for the crop‐related utility functions"""
-
-    def test_noCrops_basic(self):
-        assert noCrops([100, 100], [50, 50], [5, 5], startDim=0) == 9
-
-    def test_noCrops_tiny_image(self):
-        assert noCrops([10, 10], [10, 10], [3, 3], startDim=0) == 1
-
-    def test_noCropsPerDim(self):
-        per, cum = noCropsPerDim([100, 200], [50, 50], [5, 5], startDim=0)
-        assert per == [3, 5]
-        assert cum == [15, 5, 1]
-
-    def test_cropInds(self):
-        cum = [12, 3, 1]
-        assert cropInds(0, cum) == [0, 0]
-        assert cropInds(3, cum) == [1, 0]
-        assert cropInds(11, cum) == [3, 2]
-
-    def test_coord(self):
-        c, v = coord(2, 30, 5, 100)
-        assert (c.start, c.stop) == (40, 70)
-        assert (v.start, v.stop) == (5, 25)
-
-        c, v = coord(4, 30, 5, 100)
-        assert (c.start, c.stop) == (70, 100)
-        # when hitting edge, valid region is trimmed (start=15) to avoid going out of bounds
-        assert (v.start, v.stop) == (15, 30)
-
-    def test_coords(self):
-        cc, vc = coords([1, 2], [30, 30], [5, 5], [100, 100], 0)
-        assert (cc[0].start, cc[0].stop) == (20, 50)
-        assert (cc[1].start, cc[1].stop) == (40, 70)
-        assert (vc[0].start, vc[0].stop) == (5, 25)
-        assert (vc[1].start, vc[1].stop) == (5, 25)
-
-    def test_cropCoords(self):
-        cc, vc = cropCoords(7, [30, 40], [5, 5], [100, 200], 0)
-        for sl in [*cc, *vc]:
-            assert isinstance(sl, slice)
-        assert 0 <= cc[0].start < cc[0].stop <= 100
-        assert 0 <= cc[1].start < cc[1].stop <= 200
-        assert 0 <= vc[0].start < vc[0].stop <= 30
-        assert 0 <= vc[1].start < vc[1].stop <= 40
-
-
-class TestProcessInChunks:
-    """Tests for process_in_chuncks"""
-
-    def test_basic_processing(self):
-        inp = torch.ones((1, 3, 10, 10))
-        out = torch.zeros((1, 1, 10, 10))
-        def fn(x): return torch.ones((x.shape[0], 1, x.shape[2], x.shape[3]))
-        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
-        assert torch.all(res == 1)
-
-    def test_chunking_logic(self):
-        inp = torch.zeros((1, 3, 20, 20))
-        out = torch.zeros((1, 1, 20, 20))
-        def fn(x):
-            b, c, h, w = x.shape
-            t = torch.zeros((b, 1, h, w))
-            for i in range(h):
-                for j in range(w):
-                    t[0, 0, i, j] = i + j
-            return t
-        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
-        assert res[0, 0, 0, 0] == 0
-        assert res[0, 0, 6, 0] == 6
-
-    def test_shape_handling(self):
-        inp = torch.ones((1, 3, 10, 10))
-        out = torch.zeros((1, 1, 10, 10))
-        def fn(x): return torch.ones((x.shape[0], x.shape[2], x.shape[3]))
-        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
-        assert torch.all(res == 1)
-
-    def test_margin_handling(self):
-        inp = torch.zeros((1, 1, 20, 20))
-        for i in range(20):
-            for j in range(20):
-                inp[0, 0, i, j] = i * 100 + j
-        out = torch.zeros((1, 1, 20, 20))
-        def fn(x): return x
-        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
-        assert torch.all(res == inp)
-
-
-class TestDataSplitting:
-    """Tests for data splitting logic (ratio and k-fold)"""
-
-    @pytest.fixture
-    def mock_file_structure(self, tmp_path):
-        """
-        Create a mock dataset structure for testing:
-        
-        dataset/
-          source/
-            sat/  (images)
-            map/  (labels)
-        """
-        root = tmp_path / "dataset"
-        img_dir = root / "source" / "sat"
-        lbl_dir = root / "source" / "map"
-        img_dir.mkdir(parents=True)
-        lbl_dir.mkdir(parents=True)
-
-        # Create 10 dummy .tif files in each
-        for i in range(10):
-            (img_dir / f"img_{i}.tif").write_text("dummy")
-            (lbl_dir / f"img_{i}.tif").write_text("dummy")
-
-        return root
-
-    def test_ratio_splitting(self, mock_file_structure, monkeypatch):
-        """Test ratio-based splitting logic"""
-        from core.general_dataset import GeneralizedDataset
-
-        # Prevent any random shuffle
-        monkeypatch.setattr(np.random, "shuffle", lambda x: x)
-
-        base_cfg = {
-            "root_dir": str(mock_file_structure),
-            "use_splitting": True,
-            "source_folder": "source",
-            "split_ratios": {"train": 0.6, "valid": 0.2, "test": 0.2},
-            "modalities": {"image": "sat", "label": "map"},
-        }
-
-        # Create each split explicitly
-        train_ds = GeneralizedDataset({**base_cfg, "split": "train"})
-        valid_ds = GeneralizedDataset({**base_cfg, "split": "valid"})
-        test_ds  = GeneralizedDataset({**base_cfg, "split": "test"})
-
-        # Should be 6,2,2 images respectively
-        assert len(train_ds.modality_files["image"]) == 6
-        assert len(valid_ds.modality_files["image"]) == 2
-        assert len(test_ds.modality_files["image"])  == 2
-
-        # No overlap
-        t = set(train_ds.modality_files["image"])
-        v = set(valid_ds.modality_files["image"])
-        s = set(test_ds.modality_files["image"])
-        assert t.isdisjoint(v)
-        assert t.isdisjoint(s)
-        assert v.isdisjoint(s)
-
-    def test_kfold_splitting(self, mock_file_structure, monkeypatch):
-        """Test k-fold splitting logic"""
-        from core.general_dataset import GeneralizedDataset
-
-        # Mock KFold to return a single fixed split (first 8 train, last 2 valid)
-        class MockKFold:
-            def __init__(self, n_splits, shuffle, random_state):
-                pass
-            def split(self, X):
-                return [(np.arange(8), np.arange(8, 10))]
-
-        monkeypatch.setattr("sklearn.model_selection.KFold", MockKFold)
-
-        base_cfg = {
-            "root_dir": str(mock_file_structure),
-            "use_splitting": True,
-            "split_mode": "kfold",
-            "num_folds": 5,
-            "source_folder": "source",
-            "modalities": {"image": "sat", "label": "map"},
-        }
-
-        # Train fold 0
-        tr_cfg = {**base_cfg, "split": "train", "fold": 0}
-        train_ds = GeneralizedDataset(tr_cfg)
-        assert len(train_ds.modality_files["image"]) == 8
-
-        # Valid fold 0
-        va_cfg = {**base_cfg, "split": "valid", "fold": 0}
-        valid_ds = GeneralizedDataset(va_cfg)
-        assert len(valid_ds.modality_files["image"]) == 2
-
-
-class TestCustomCollate:
-    """Tests for custom_collate_fn"""
-
-    def test_basic(self):
-        batch = [
-            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
-            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
-        ]
-        c = custom_collate_fn(batch)
-        assert c["image"].shape == (2,3,10,10)
-        assert c["label"].shape == (2,1,10,10)
-
-    def test_mixed_types(self):
-        batch = [
-            {"image": torch.ones(3,10,10), "meta": {"id":1}},
-            {"image": torch.ones(3,10,10), "meta": {"id":2}},
-        ]
-        c = custom_collate_fn(batch)
-        assert isinstance(c["meta"], list)
-        assert c["meta"][0]["id"] == 1
-
-    def test_filter_none(self):
-        def imp(batch):
-            batch = [b for b in batch if b is not None]
-            if not batch:
-                return {"image": torch.zeros(0,3,10,10)}
-            return custom_collate_fn(batch)
-        b = [None, {"image": torch.ones(3,10,10)}]
-        c1 = imp(b)
-        assert c1["image"].shape[0] == 1
-        c2 = imp([None,None])
-        assert c2["image"].shape[0] == 0
-
-
-# ------------------------------------
-# tests/smoke_test.py
-# ------------------------------------
-"""
-Integration smoke test for the entire segmentation pipeline.
-This creates a minimal synthetic dataset and runs a few training steps.
-Run with: python smoke_test.py
-"""
-
-import os
-import shutil
-import tempfile
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pytorch_lightning as pl
-from tqdm import tqdm
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Import core modules
-from core.general_dataset import GeneralizedDataset, custom_collate_fn, worker_init_fn
-from core.model_loader import load_model
-from core.loss_loader import load_loss
-from core.mix_loss import MixedLoss
-from core.metric_loader import load_metrics
-from core.dataloader import SegmentationDataModule
-from seglit_module import SegLitModule
-
-
-def create_synthetic_dataset(root_dir, num_samples=10, img_size=32):
-    """Create a synthetic dataset with roads for testing"""
-    logger.info(f"Creating synthetic dataset in {root_dir} with {num_samples} samples")
-    
-    # Create directory structure
-    os.makedirs(os.path.join(root_dir, 'train', 'sat'), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, 'train', 'map'), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, 'valid', 'sat'), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, 'valid', 'map'), exist_ok=True)
-    
-    # Create test images with simple road patterns
-    for split in ['train', 'valid']:
-        for i in range(num_samples):
-            # Create image with random noise
-            img = np.random.randint(0, 255, (img_size, img_size, 3), dtype=np.uint8)
-            
-            # Create binary mask with horizontal and vertical lines (roads)
-            mask = np.zeros((img_size, img_size), dtype=np.uint8)
-            
-            # Horizontal road
-            h_pos = np.random.randint(5, img_size-5)
-            mask[h_pos-2:h_pos+2, :] = 1
-            
-            # Vertical road
-            v_pos = np.random.randint(5, img_size-5)
-            mask[:, v_pos-2:v_pos+2] = 1
-            
-            # Add brightness to the roads in the image for realism
-            for c in range(3):
-                img[:, :, c] = np.where(mask > 0, 
-                                        np.minimum(img[:, :, c] + 100, 255),
-                                        img[:, :, c])
-            
-            # Save files
-            np.save(os.path.join(root_dir, split, 'sat', f'img_{i}.npy'), img)
-            np.save(os.path.join(root_dir, split, 'map', f'img_{i}.npy'), mask * 255)  # 0/255 format
-    
-    logger.info(f"Created {num_samples} samples each for train and validation")
-
-
-class SimpleBinaryUNet(nn.Module):
-    """A very simple UNet for testing purposes"""
-    
-    def __init__(self, in_channels=3, out_channels=1):
-        super().__init__()
-        
-        # Encoder
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        
-        # Decoder
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(32, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(16, 16, 2, stride=2)
-        )
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(16, 8, 3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(8, 8, 2, stride=2)
-        )
-        
-        # Final layer
-        self.final = nn.Conv2d(8, out_channels, 1)
-    
-    def forward(self, x):
-        # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        
-        # Decoder
-        d1 = self.dec1(e2)
-        d2 = self.dec2(d1)
-        
-        # Final layer
-        out = torch.sigmoid(self.final(d2))
-        return out
-
-
-def create_configs(dataset_path):
-    """Create configuration dictionaries for testing"""
-    # Dataset configuration
-    dataset_config = {
-        "root_dir": dataset_path,
-        "split_mode": "folder",
-        "patch_size": 16,
-        "small_window_size": 2,
-        "validate_road_ratio": False,  # Don't filter patches for quick testing
-        "train_batch_size": 2,
-        "val_batch_size": 1,
-        "num_workers": 0,  # Use 0 for easier debugging
-        "pin_memory": False,
-        "modalities": {
-            "image": "sat",
-            "label": "map"
-        }
-    }
-    
-    # Model configuration using our simple test model
-    model_config = {
-        "simple_unet": True,  # Flag for our smoke test
-        "in_channels": 3,
-        "out_channels": 1
-    }
-    
-    # Loss configuration
-    loss_config = {
-        "primary_loss": {
-            "class": "BCELoss",
-            "params": {}
-        },
-        "alpha": 1.0  # Only use primary loss
-    }
-    
-    # Metrics configuration
-    metrics_config = {
-        "metrics": [
-            {
-                "alias": "dice",
-                "path": "torchmetrics.classification",
-                "class": "Dice",
-                "params": {
-                    "threshold": 0.5,
-                    "zero_division": 1.0
-                }
-            }
-        ]
-    }
-    
-    # Inference configuration
-    inference_config = {
-        "patch_size": [16, 16],
-        "patch_margin": [2, 2]
-    }
-    
-    return dataset_config, model_config, loss_config, metrics_config, inference_config
-
-
-def run_smoke_test():
-    """Run a complete smoke test of the segmentation pipeline"""
-    logger.info("Starting smoke test")
-    
-    # Create temporary directory for dataset
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Create synthetic dataset
-        create_synthetic_dataset(tmp_dir, num_samples=5, img_size=32)
-        
-        # Create configurations
-        dataset_config, model_config, loss_config, metrics_config, inference_config = create_configs(tmp_dir)
-        
-        # Set up data module
-        logger.info("Setting up data module")
-        data_module = SegmentationDataModule(dataset_config)
-        data_module.setup()
-        
-        # Create model manually for smoke test
-        logger.info("Creating model")
-        if model_config.get("simple_unet", False):
-            model = SimpleBinaryUNet(
-                in_channels=model_config["in_channels"],
-                out_channels=model_config["out_channels"]
-            )
-        else:
-            model = load_model(model_config)
-        
-        # Create loss function
-        logger.info("Creating loss function")
-        primary_loss = load_loss(loss_config["primary_loss"])
-        secondary_loss = None
-        if "secondary_loss" in loss_config:
-            secondary_loss = load_loss(loss_config["secondary_loss"])
-        
-        mixed_loss = MixedLoss(primary_loss, secondary_loss, loss_config.get("alpha", 0.5), 
-                              loss_config.get("start_epoch", 0))
-        
-        # Create metrics
-        logger.info("Loading metrics")
-        metrics = load_metrics(metrics_config.get("metrics", []))
-        
-        # Create optimizer config
-        optimizer_config = {
-            "name": "Adam",
-            "params": {"lr": 0.001}
-        }
-        
-        # Create Lightning module
-        logger.info("Creating Lightning module")
-        lit_module = SegLitModule(
-            model=model,
-            loss_fn=mixed_loss,
-            metrics=metrics,
-            optimizer_config=optimizer_config,
-            inference_config=inference_config
-        )
-        
-        # Create a simple trainer for testing
-        logger.info("Creating trainer")
-        trainer = pl.Trainer(
-            max_epochs=2,
-            log_every_n_steps=1,
-            enable_checkpointing=False,
-            logger=False,
-            enable_progress_bar=True,
-            accelerator="cpu"
-        )
-        
-        # Run a few training steps
-        logger.info("Running training")
-        trainer.fit(lit_module, datamodule=data_module)
-        
-        logger.info("Smoke test complete!")
-
-
-def inspect_dataset_samples():
-    """Create and inspect dataset samples for debugging"""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Create synthetic dataset
-        create_synthetic_dataset(tmp_dir, num_samples=3, img_size=32)
-        
-        # Create configurations
-        dataset_config, _, _, _, _ = create_configs(tmp_dir)
-        
-        # Override for detailed inspection
-        dataset_config["train_batch_size"] = 1
-        
-        # Create dataset directly
-        train_config = dataset_config.copy()
-        train_config["split"] = "train"
-        
-        # Fix the None sample issue in __getitem__
-        from core.general_dataset import GeneralizedDataset
-        
-        # Patch the class to fix the None return issue
-        original_getitem = GeneralizedDataset.__getitem__
-        
-        def safe_getitem(self, idx):
-            result = original_getitem(self, idx)
-            if result is None:
-                # Try another index
-                logger.warning(f"Got None for index {idx}, trying next index")
-                return self.__getitem__((idx + 1) % len(self))
-            return result
-        
-        # Apply the monkey patch
-        GeneralizedDataset.__getitem__ = safe_getitem
-        
-        # Create and inspect dataset
-        train_dataset = GeneralizedDataset(train_config)
-        
-        # Check dataset length
-        logger.info(f"Dataset length: {len(train_dataset)}")
-        
-        # Iterate through a few samples
-        for i in range(min(3, len(train_dataset))):
-            sample = train_dataset[i]
-            logger.info(f"Sample {i} keys: {sample.keys()}")
-            
-            # Check shapes
-            for key, value in sample.items():
-                if isinstance(value, np.ndarray):
-                    logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}, range: [{value.min()}, {value.max()}]")
-        
-        # Create dataloader and inspect a batch
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=2,
-            shuffle=True,
-            collate_fn=custom_collate_fn,
-            num_workers=0
-        )
-        
-        # Get a batch
-        batch = next(iter(train_loader))
-        logger.info(f"Batch keys: {batch.keys()}")
-        
-        # Check shapes
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}")
-
-
-if __name__ == "__main__":
-    # First inspect dataset
-    logger.info("Inspecting dataset samples...")
-    inspect_dataset_samples()
-    
-    # Then run full smoke test
-    logger.info("\nRunning full smoke test...")
-    run_smoke_test()
-
-# ------------------------------------
-# configs/main.yaml
-# ------------------------------------
-# Main configuration file for segmentation experiments
-# This file references all sub-configs and sets high-level training parameters
-
-# Sub-config references
-dataset_config: "massroads.yaml"
-model_config: "baseline.yaml"
-loss_config: "mixed_topo.yaml"
-metrics_config: "segmentation.yaml"
-inference_config: "chunk.yaml"
-
-# Output directory
-output_dir: "outputs/baseline_unet_massroads"
-
-# Trainer configuration
-trainer:
-  max_epochs: 5000
-  val_check_interval: 1.0  # Validate once per epoch
-  check_val_every_n_epoch: 1
-  skip_validation_until_epoch: 0  # Skip validation for the first 5 epochs
-  val_every_n_epochs: 10
-  log_every_n_epochs: 2  # Log predictions every 2 epochs
-  log_every_n_steps: 1
-  train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
-  val_metrics_every_n_epochs: 1      # compute/log val   metrics once every epoch
-
-  save_gt_pred_val_test_every_n_epochs: 10  # Save every 5 epochs
-  save_gt_pred_val_test_after_epoch: 0    # Start saving after epoch 10
-  save_gt_pred_max_samples: null              # Save up to 4 samples per epoch
-  
-  # Extra arguments passed directly to PyTorch Lightning Trainer
-  extra_args:
-    accelerator: "auto"  # Use GPU if available
-    precision: 32  # Mixed precision training
-    # gradient_clip_val: 1.0
-    # accumulate_grad_batches: 1
-    deterministic: false
-    # Add timeout to prevent hanging
-    # max_time: "24:00:00"  # 24 hour timeout
-
-# Optimizer configuration
-optimizer:
-  name: "Adam"
-  params:
-    lr: 0.0001
-    weight_decay: 0.0001
-  
-  # Optional learning rate scheduler
-  scheduler:
-    # name: "ReduceLROnPlateau"
-    # params:
-    #   patience: 10
-    #   factor: 0.5
-    #   monitor: "val_loss"
-    #   mode: "min"
-    #   min_lr: 0.00001
-    name: "LambdaLR"
-    params:
-      lr_decay_factor: 0.00001
-
-target_x: "image_patch"
-target_y: "label_patch"
-
-# ------------------------------------
-# configs/metrics/segmentation.yaml
-# ------------------------------------
-# Segmentation Metrics Configuration
-
-# List of metrics to evaluate
-metrics:
-  # Dice coefficient
-  - alias: "dice"  # Shorthand name for the metric
-    path: "torchmetrics.classification"
-    class: "Dice"
-    params:
-      threshold: 0.5
-      zero_division: 1.0
-
-  # IoU (Jaccard index)
-  - alias: "iou"
-    path: "torchmetrics.classification"
-    class: "JaccardIndex"
-    params:
-      task: "binary"
-      threshold: 0.5
-      num_classes: 2  # Binary segmentation
-
-  # Connected Components Quality
-  - alias: "ccq"
-    path: "metrics.connected_components"
-    class: "ConnectedComponentsQuality"
-    params:
-      min_size: 5
-      tolerance: 2
-
-  # Average Path Length Similarity
-  - alias: "apls"
-    path: "metrics.apls"
-    class: "APLS"
-    params:
-      angle_range: [135, 225]
-      max_nodes: 1000
-      max_snap_dist: 25
-      allow_renaming: true
-      min_path_length: 10
-
-# Per-metric frequencies for training - how often to compute each metric
-train_frequencies:
-  dice: 1    # Compute every epoch (lightweight metric)
-  iou: 1     # Compute every epoch (lightweight metric)
-  ccq: 1    # Compute every 10 epochs (moderately expensive)
-  apls: 1   # Compute every 25 epochs (very computationally expensive)
-
-# Per-metric frequencies for validation - how often to compute each metric
-val_frequencies:
-  dice: 1    # Compute every epoch
-  iou: 1     # Compute every epoch
-  ccq: 1     # Compute every 5 epochs
-  apls: 1   # Compute every 10 epochs
-
-# ------------------------------------
-# configs/loss/mixed_topo.yaml
-# ------------------------------------
-# Mixed Topological Loss Configuration
-
-# Primary loss (used from the beginning)
-primary_loss:
-  class: "BCELoss"  # Built-in PyTorch loss
-  params: {}
-
-# # Secondary loss (activated after start_epoch)
-# secondary_loss:
-#   path: "losses.custom_loss"  # Path to the module containing the loss
-#   class: "TopologicalLoss"  # Name of the loss class
-#   params:
-#     topo_weight: 0.5  # Weight for the topological component
-#     smoothness: 1.0  # Smoothness parameter for gradient computation
-#     connectivity_weight: 0.3  # Weight for the connectivity component
-
-# # Mixing parameters
-# alpha: 0.4  # Weight for the secondary loss (0 to 1)
-# start_epoch: 10  # Epoch to start using the secondary loss
-
-# ------------------------------------
-# configs/inference/chunk.yaml
-# ------------------------------------
-# Chunked Inference Configuration
-
-# Patch size for inference [height, width]
-# Patches of this size will be processed independently 
-# and then reassembled to form the full output
-patch_size: [256, 256]
-
-# Patch margin [height, width]
-# Margin of overlap between patches to avoid edge artifacts
-# The effective stride will be (patch_size - 2*patch_margin)
-patch_margin: [50, 50]
-
-
-# ------------------------------------
-# configs/dataset/massroads.yaml
-# ------------------------------------
-# Massachusetts Roads Dataset Configuration
-
-# Dataset root directory
-root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-
-# Dataset split mode: "folder" or "kfold"
-split_mode: "folder"  # Uses folder structure for splits
-
-# K-fold configuration (used if split_mode is "kfold")
-fold: 0  # Current fold
-num_folds: 3  # Total number of folds
-
-# Split ratios (used if split_mode is "folder" with "source_folder")
-# split_ratios:
-  # train: 0.7
-  # valid: 0.15
-  # test: 0.15
-
-use_splitting: false
-
-# Source folder (used if split_mode is "folder" with split_ratios)
-# source_folder: 'train'
-
-# Batch sizes
-train_batch_size: 16
-val_batch_size: 1  # Usually 1 for full-image validation
-test_batch_size: 1  # Usually 1 for full-image testing
-
-# Patch and crop settings
-patch_size: 256  # Size of training patches
-small_window_size: 8  # Size of window to check for variation
-validate_road_ratio: false  # Validate patch has enough road content
-threshold: 0.05  # Minimum road ratio threshold
-
-# Data loading settings
-num_workers: 4
-pin_memory: true
-
-# Modality settings
-modalities:
-  image: "sat"  # Satellite imagery folder
-  label: "label"  # Road map folder
-  # distance: "distance"  # Distance transform folder
-  # sdf: "sdf"  # Signed distance function folder
-
-# Distance transform settings
-# distance_threshold: 20.0
-
-# Signed distance function settings
-# sdf_iterations: 3
-# sdf_thresholds: [-20, 20]
-
-# Augmentation settings
-augmentations:
-  - "flip_h"
-  - "flip_v"
-  - "rotation"
-
-# Misc settings
-# max_images: null  # No limit (set a number to limit images loaded)
-# max_images: 10  # No limit (set a number to limit images loaded)
-# max_attempts: 10  # Maximum attempts for finding valid patches
-save_computed: false  # Save computed distance maps and SDFs
-verbose: false  # Verbose output
-seed: 42  # Random seed
-
-# ------------------------------------
-# configs/model/baseline.yaml
-# ------------------------------------
-# TopoTokens Model Configuration
-
-# Model path and class
-path: "models.base_models"  # Path to the module containing the model
-class: "UNetBin"  # Name of the model class
-
-# Model parameters
-params:
-  three_dimensional: False
-  m_channels: 32
-  n_convs: 2
-  n_levels: 3
-  dropout: 0.1
-  batch_norm: True
-  upsampling: "bilinear"
-  pooling: "max"
-  in_channels: 3
-  out_channels: 1
 
 # ------------------------------------
 # models/custom_model.py
@@ -5564,7 +3296,7 @@ class UpBlock(nn.Module):
 class UNet(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
                  n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
-                 pooling="max", three_dimensional=False):
+                 pooling="max", three_dimensional=False, apply_final_relu=True):
         super().__init__()
 
         assert n_levels>=1
@@ -5581,6 +3313,7 @@ class UNet(nn.Module):
         self.pooling = pooling
         self.three_dimensional = three_dimensional
         _3d = three_dimensional
+        self.apply_final_relu = apply_final_relu
 
         channels = [2**x*m_channels for x in range(0, self.n_levels+1)]
 
@@ -5627,7 +3360,9 @@ class UNet(nn.Module):
 
             # === Last ===
             x = self.last_layer(x)
-            x = F.relu(x)
+
+            if self.apply_final_relu:
+                x = F.relu(x)
             
         except Exception as e:
             for i,dim in enumerate(input.shape[2:]):

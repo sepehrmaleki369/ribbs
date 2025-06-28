@@ -81,7 +81,7 @@ class SegLitModule(pl.LightningModule):
             if self.current_epoch % freq == 0:
                 self.log(f"train_{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-        return loss
+        return {"loss": loss, "predictions": y_hat, "gts": y}
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
@@ -104,7 +104,7 @@ class SegLitModule(pl.LightningModule):
                 self.log(f"val_{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        return {"predictions": y_hat, "val_loss": loss}
+        return {"predictions": y_hat, "val_loss": loss, "gts": y}
 
     def test_step(self, batch, batch_idx):
         # same as validation but logs under test_
@@ -125,7 +125,7 @@ class SegLitModule(pl.LightningModule):
             self.log(f"test_{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        return {"predictions": y_hat, "test_loss": loss}
+        return {"predictions": y_hat, "test_loss": loss, "gts": y}
 
     def configure_optimizers(self):
         Opt = getattr(torch.optim, self.opt_cfg["name"])

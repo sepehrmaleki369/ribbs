@@ -21,105 +21,102 @@ import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 
 
+def _gather_from_outputs(batch, outputs, pl_module):
+    """
+    Extract input, gt, and prediction tensors from batch and outputs without re-running the model.
+    """
+    x = batch[pl_module.input_key].float()
+    y = batch[pl_module.target_key].float()
+    if y.dim() == 3:
+        y = y.unsqueeze(1)
+    preds = outputs.get("predictions")
+    # ensure shapes match
+    preds = preds.float()
+    return x.cpu(), y.cpu(), preds.detach().cpu()
+
 class SamplePlotCallback(pl.Callback):
     """
     After each training & validation epoch, log up to `num_samples`
     examples as figures:
       - train/samples: [input | ground-truth | prediction]
-      - val/samples:   [input | ground-truth | prediction]
+      - validation/samples: [input | ground-truth | prediction]
+
+    Uses the model’s stored `predictions` in the step outputs, avoiding a second forward pass.
+    Both ground-truth and prediction share a signed colormap range.
     """
     def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
         super().__init__()
         self.num_samples = num_samples
         self.cmap = cmap
-        self._reset_buffers()
+        self._reset()
 
-    def _reset_buffers(self):
+    def _reset(self):
         self._images = []
-        self._gts = []
-        self._preds = []
-        self._collected = 0
+        self._gts    = []
+        self._preds  = []
+        self._count  = 0
 
     def on_train_epoch_start(self, trainer, pl_module):
-        self._reset_buffers()
+        self._reset()
 
     def on_validation_epoch_start(self, trainer, pl_module):
-        self._reset_buffers()
+        self._reset()
 
-    def _capture(self, batch, pl_module):
-        x = batch[pl_module.input_key].float().to(pl_module.device)
-        y = batch[pl_module.target_key].float().to(pl_module.device)
-        if y.ndim == 3:
-            y = y.unsqueeze(1)
-        with torch.no_grad():
-            logits = pl_module(x)
-            preds = torch.sigmoid(logits)
-        return x.cpu(), y.cpu(), preds.cpu()
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
-        if self._collected >= self.num_samples:
+    def _collect(self, batch, outputs, pl_module):
+        if self._count >= self.num_samples:
             return
-        x, y, preds = self._capture(batch, pl_module)
-        remaining = self.num_samples - self._collected
-        take = min(remaining, x.size(0))
+        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
+        take = min(self.num_samples - self._count, x.size(0))
         self._images.append(x[:take])
-        self._gts.append(y[:take])
-        self._preds.append(preds[:take])
-        self._collected += take
+        self._gts   .append(y[:take])
+        self._preds .append(preds[:take])
+        self._count += take
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args):
-        if self._collected >= self.num_samples:
-            return
-        x, y, preds = self._capture(batch, pl_module)
-        remaining = self.num_samples - self._collected
-        take = min(remaining, x.size(0))
-        self._images.append(x[:take])
-        self._gts.append(y[:take])
-        self._preds.append(preds[:take])
-        self._collected += take
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, **_):
+        self._collect(batch, outputs, pl_module)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, **_):
+        self._collect(batch, outputs, pl_module)
 
     def _plot_and_log(self, tag, trainer):
-        # concatenate everything we gathered
         imgs  = torch.cat(self._images, 0)
         gts   = torch.cat(self._gts,    0)
         preds = torch.cat(self._preds,  0)
         n = imgs.size(0)
+        # determine shared signed range
+        combined = torch.cat([gts.view(-1), preds.view(-1)], 0)
+        vlim = float(combined.abs().max())
 
-        # compute a symmetric range for cmap around zero
-        all_vals = torch.cat([gts.view(-1), preds.view(-1)], 0)
-        m = float(all_vals.abs().max())
-
-        fig, axes = plt.subplots(n, 3, figsize=(3*3, n*3), tight_layout=True)
+        fig, axes = plt.subplots(n, 3, figsize=(9, n*3), tight_layout=True)
         if n == 1:
             axes = axes[None, :]
-
         for i in range(n):
             img = imgs[i].permute(1,2,0)
             gt  = gts[i,0]
             pr  = preds[i,0]
 
-            axes[i,0].imshow(img)
+            axes[i,0].imshow(img, cmap='gray')
             axes[i,0].set_title("input")
             axes[i,0].axis("off")
 
-            axes[i,1].imshow(gt,  cmap=self.cmap, vmin=-m, vmax=m)
-            axes[i,1].set_title("gt")
+            axes[i,1].imshow(gt, cmap=self.cmap, vmin=-vlim, vmax=vlim)
+            axes[i,1].set_title("gt (signed)")
             axes[i,1].axis("off")
 
-            axes[i,2].imshow(pr,  cmap=self.cmap, vmin=-m, vmax=m)
-            axes[i,2].set_title("pred")
+            axes[i,2].imshow(pr, cmap=self.cmap, vmin=-vlim, vmax=vlim)
+            axes[i,2].set_title("pred (signed)")
             axes[i,2].axis("off")
 
         trainer.logger.experiment.add_figure(f"{tag}/samples", fig, global_step=trainer.current_epoch)
         plt.close(fig)
 
     def on_train_epoch_end(self, trainer, pl_module):
-        if self._collected > 0:
+        if self._count > 0:
             self._plot_and_log("train", trainer)
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if self._collected > 0:
-            self._plot_and_log("val", trainer)
+        if self._count > 0:
+            self._plot_and_log("validation", trainer)
 
 
 class PredictionLogger(Callback):
@@ -436,302 +433,88 @@ class SkipValidation(Callback):
                     f"Resuming validation from epoch {trainer.current_epoch}"
                 )
 
-class PredictionSaver(Callback):
+
+
+class PredictionSaver(pl.Callback):
     """
-    Callback to save ground truth and prediction tensors as NumPy arrays.
-    Only saves after a specified starting epoch and at a specified frequency.
-    
-    Fixed to properly save ALL samples when max_samples=None.
+    Save model predictions and ground truths on validation and test.
+
+    Args:
+        save_dir: Base directory under which to write files.
+        save_every_n_epochs: Interval (in epochs) at which to save.
+        save_after_epoch: Don’t save until this epoch (inclusive).
+        max_samples: Max number of samples to save per epoch; None→save all.
     """
-    
     def __init__(
         self,
         save_dir: str,
-        save_every_n_epochs: int = 5,
+        save_every_n_epochs: int = 1,
         save_after_epoch: int = 0,
-        max_samples: int = None  # None means save all samples
+        max_samples: Optional[int] = None,
     ):
-        """
-        Initialize the PredictionSaver callback.
-        
-        Args:
-            save_dir: Directory to save prediction data
-            save_every_n_epochs: How often to save (every N epochs)
-            save_after_epoch: Only start saving after this epoch
-            max_samples: Maximum number of samples to save per epoch (None = save all)
-        """
         super().__init__()
         self.save_dir = save_dir
-        self.save_every_n_epochs = save_every_n_epochs
-        self.save_after_epoch = save_after_epoch
-        self.max_samples = max_samples  # None means no limit
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize state
-        self._reset_buffers()
-        
-        # Log initialization once at INFO level
-        self.logger.info(f"PredictionSaver initialized:")
-        self.logger.info(f"  save_dir: {save_dir}")
-        self.logger.info(f"  save_every_n_epochs: {save_every_n_epochs}")
-        self.logger.info(f"  save_after_epoch: {save_after_epoch}")
-        if max_samples is None:
-            self.logger.info(f"  max_samples: unlimited (save all)")
-        else:
-            self.logger.info(f"  max_samples: {max_samples}")
-    
-    def _reset_buffers(self):
-        """Reset the internal buffers that collect samples."""
-        self._gts = []
-        self._preds = []
-        self._collected = 0
-        # Note: Don't reset _saved_this_epoch here - it's managed per epoch
-    
-    def _should_save_this_epoch(self, epoch):
-        """Determine if we should save data for this epoch."""
-        if epoch < self.save_after_epoch:
-            return False
-        self.logger.debug(f'Line 498: + epoch:{epoch} save_after:{self.save_after_epoch} every:{self.save_every_n_epochs} check: {(epoch - self.save_after_epoch)}')
-        return (epoch - self.save_after_epoch) % self.save_every_n_epochs == 0
-    
-    def on_validation_epoch_start(self, trainer, pl_module):
-        """Reset state at the start of a validation epoch."""
-        current_epoch = trainer.current_epoch
-        
-        # Always reset buffers and state for new epoch
-        self._reset_buffers()
-        self._saved_this_epoch = False
-        
-        # Check if we should save this epoch
-        if self._should_save_this_epoch(current_epoch):
-            self.logger.info(f"Will save predictions for epoch {current_epoch}")
-        else:
-            # Mark as done for non-saving epochs to skip processing
-            self._saved_this_epoch = True
-            self.logger.debug(f"Skipping epoch {current_epoch} (not a saving epoch)")
-    
-    def on_test_epoch_start(self, trainer, pl_module):
-        """Reset buffers at the start of a test epoch."""
-        self.logger.info(f"Starting test prediction collection for epoch {trainer.current_epoch}")
-        self._reset_buffers()
-        self._saved_this_epoch = False
-    
-    def on_validation_batch_end(
+        self.every = save_every_n_epochs
+        self.after = save_after_epoch
+        self.max_samples = max_samples
+
+    def _should_save(self, epoch: int) -> bool:
+        return epoch >= self.after and (epoch - self.after) % self.every == 0
+
+    def _save_split(
         self,
-        trainer,
-        pl_module,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx=0
+        split: str,
+        epoch: int,
+        outputs: List[Dict[str, Any]]
     ):
-        """Collect validation batch results for later saving."""
-        # Early return if we've already saved this epoch
-        if self._saved_this_epoch:
-            return
-        
-        current_epoch = trainer.current_epoch
-        if not self._should_save_this_epoch(current_epoch):
-            return
-        
-        # FIXED: Only check max_samples limit if it's actually set
-        # When max_samples is None, we want to collect ALL samples
-        if self.max_samples is not None and self._collected >= self.max_samples:
-            return
-        
-        # Extract data with additional safety checks
-        try:
-            if outputs is None or not isinstance(outputs, dict):
-                return
-            if "predictions" not in outputs:
-                return
-                
-            y_true = batch[pl_module.target_key]
-            y_pred = outputs["predictions"]
-            
-            # Validate tensor shapes
-            if y_true.numel() == 0 or y_pred.numel() == 0:
-                return
-                
-        except (KeyError, AttributeError, RuntimeError) as e:
-            self.logger.debug(f"Skipping batch due to extraction error: {e}")
-            return
-        
-        # Move to CPU and detach to prevent memory leaks
-        try:
-            y_true = y_true.detach().cpu()
-            y_pred = y_pred.detach().cpu()
-        except RuntimeError as e:
-            self.logger.debug(f"Error moving tensors to CPU: {e}")
-            return
-        
-        # FIXED: Calculate how many samples to take
-        if self.max_samples is None:
-            # Take ALL samples from the batch when max_samples is None
-            take = y_pred.shape[0]
-        else:
-            # Take limited samples when max_samples is set
-            remaining = self.max_samples - self._collected
-            take = min(remaining, y_pred.shape[0])
-        
-        if take > 0:
-            # Append the slices
-            self._gts.append(y_true[:take])
-            self._preds.append(y_pred[:take])
-            self._collected += take
-            
-            # FIXED: Improved logging for unlimited collection
-            if self.max_samples is None:
-                if batch_idx % 20 == 0:  # Log every 20 batches when saving all
-                    self.logger.debug(f"Collected {self._collected} samples so far (batch {batch_idx})")
-            else:
-                # Log when we reach max samples for limited collection
-                if self._collected >= self.max_samples:
-                    self.logger.info(f"Collected maximum {self.max_samples} samples for epoch {current_epoch}")
-                elif batch_idx % 10 == 0:  # Log progress every 10 batches
-                    self.logger.debug(f"Collected {self._collected}/{self.max_samples} samples (batch {batch_idx})")
-    
-    def on_test_batch_end(
+        """
+        Write out predictions and gts from an epoch’s outputs.
+        """
+        folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
+        os.makedirs(folder, exist_ok=True)
+
+        count = 0
+        for batch_idx, batch_out in enumerate(outputs):
+            preds = batch_out.get("predictions")
+            gts   = batch_out.get("gts")
+            if preds is None or gts is None:
+                continue
+
+            preds = preds.detach().cpu().numpy()
+            gts   = gts.detach().cpu().numpy()
+
+            for i in range(preds.shape[0]):
+                if self.max_samples is not None and count >= self.max_samples:
+                    return
+                # filenames
+                np.save(
+                    os.path.join(folder, f"{split}_e{epoch}_b{batch_idx}_i{i}_pred.npy"),
+                    preds[i]
+                )
+                np.save(
+                    os.path.join(folder, f"{split}_e{epoch}_b{batch_idx}_i{i}_gt.npy"),
+                    gts[i]
+                )
+                count += 1
+
+    def on_validation_epoch_end(
         self,
-        trainer,
-        pl_module,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx=0
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: List[Dict[str, Any]]
     ):
-        """Collect test batch results for later saving."""
-        # Early return if we've already saved this epoch
-        if self._saved_this_epoch:
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
             return
-        
-        # FIXED: Only check max_samples limit if it's actually set
-        # When max_samples is None, we want to collect ALL samples
-        if self.max_samples is not None and self._collected >= self.max_samples:
+        self._save_split("val", epoch, outputs)
+
+    def on_test_epoch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: List[Dict[str, Any]]
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
             return
-        
-        # Extract data
-        try:
-            if outputs is None or not isinstance(outputs, dict):
-                return
-            if "predictions" not in outputs:
-                return
-                
-            y_true = batch[pl_module.target_key]
-            y_pred = outputs["predictions"]
-            
-            # Validate tensor shapes
-            if y_true.numel() == 0 or y_pred.numel() == 0:
-                return
-                
-        except (KeyError, AttributeError, RuntimeError) as e:
-            self.logger.debug(f"Skipping test batch due to extraction error: {e}")
-            return
-        
-        # Move to CPU and detach
-        try:
-            y_true = y_true.detach().cpu()
-            y_pred = y_pred.detach().cpu()
-        except RuntimeError as e:
-            self.logger.debug(f"Error moving tensors to CPU: {e}")
-            return
-        
-        # FIXED: Calculate how many samples to take
-        if self.max_samples is None:
-            # Take ALL samples from the batch when max_samples is None
-            take = y_pred.shape[0]
-        else:
-            # Take limited samples when max_samples is set
-            remaining = self.max_samples - self._collected
-            take = min(remaining, y_pred.shape[0])
-        
-        if take > 0:
-            self._gts.append(y_true[:take])
-            self._preds.append(y_pred[:take])
-            self._collected += take
-            
-            # Log progress for test phase
-            if self.max_samples is None:
-                if batch_idx % 20 == 0:  # Log every 20 batches when saving all
-                    self.logger.debug(f"Collected {self._collected} test samples so far (batch {batch_idx})")
-            else:
-                if batch_idx % 10 == 0:  # Log progress every 10 batches
-                    self.logger.debug(f"Collected {self._collected}/{self.max_samples} test samples (batch {batch_idx})")
-    
-    def _save_data(self, trainer, phase="val"):
-        """Save collected data as NumPy arrays."""
-        if self._collected == 0:
-            self.logger.debug(f"No data collected to save for {phase}")
-            return False
-            
-        current_epoch = trainer.current_epoch
-        
-        try:
-            # Concatenate buffers
-            gts = torch.cat(self._gts, dim=0)
-            preds = torch.cat(self._preds, dim=0)
-            
-            # Create output directory
-            phase_dir = os.path.join(self.save_dir, phase)
-            epoch_dir = os.path.join(phase_dir, f"epoch_{current_epoch:06d}")
-            os.makedirs(epoch_dir, exist_ok=True)
-            
-            # Convert to NumPy and save
-            gts_numpy = gts.numpy()
-            preds_numpy = preds.numpy()
-            
-            # Save as .npy files
-            gt_path = os.path.join(epoch_dir, "ground_truth.npy")
-            pred_path = os.path.join(epoch_dir, "predictions.npy")
-            
-            np.save(gt_path, gts_numpy)
-            np.save(pred_path, preds_numpy)
-            
-            # FIXED: Better logging message
-            samples_info = f"{self._collected} samples" if self.max_samples is None else f"{self._collected}/{self.max_samples} samples"
-            self.logger.info(f"Saved {samples_info} for {phase} epoch {current_epoch} "
-                           f"(shapes: gt={gts_numpy.shape}, pred={preds_numpy.shape})")
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to save {phase} data for epoch {current_epoch}: {e}")
-            return False
-    
-    def on_validation_epoch_end(self, trainer, pl_module):
-        """Save data at the end of the validation epoch if conditions are met."""
-        current_epoch = trainer.current_epoch
-        
-        # Only attempt to save if we haven't already saved and we collected data
-        if not self._saved_this_epoch and self._collected > 0:
-            success = self._save_data(trainer, "val")
-            if success:
-                self._saved_this_epoch = True
-        
-        # Clean up buffers to free memory
-        self._gts.clear()
-        self._preds.clear()
-        
-        final_count = self._collected
-        self._collected = 0
-        
-        self.logger.debug(f"Validation epoch {current_epoch} end: "
-                         f"saved={self._saved_this_epoch}, collected={final_count} samples")
-    
-    def on_test_epoch_end(self, trainer, pl_module):
-        """Save data at the end of the test epoch."""
-        current_epoch = trainer.current_epoch
-        
-        if not self._saved_this_epoch and self._collected > 0:
-            success = self._save_data(trainer, "test")
-            if success:
-                self._saved_this_epoch = True
-        
-        # Clean up buffers
-        self._gts.clear()
-        self._preds.clear()
-        
-        final_count = self._collected
-        self._collected = 0
-        
-        self.logger.debug(f"Test epoch {current_epoch} end: collected={final_count} samples")
+        self._save_split("test", epoch, outputs)
