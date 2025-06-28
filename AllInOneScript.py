@@ -36,25 +36,14 @@ from core.checkpoint import CheckpointManager
 from core.utils import yaml_read, mkdir
 
 from seglit_module import SegLitModule
-# import torch
-# torch.set_float32_matmul_precision('medium' | 'high' | 'highest')
-logging.getLogger('rasterio').setLevel(logging.WARNING)
-logging.getLogger('rasterio.env').setLevel(logging.WARNING)
-logging.getLogger('rasterio._io').setLevel(logging.WARNING)
-logging.getLogger('rasterio._env').setLevel(logging.WARNING)
-logging.getLogger('rasterio._base').setLevel(logging.WARNING)
-logging.getLogger('matplotlib').setLevel(logging.WARNING)
-logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
-logging.getLogger('PIL').setLevel(logging.WARNING)
-logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
-logging.getLogger('tensorboard').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-# I think you can remove lines 38-48
-
+# Silence noisy loggers
+for lib in ('rasterio', 'matplotlib', 'PIL', 'tensorboard', 'urllib3'):
+    logging.getLogger(lib).setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO)
 logging.getLogger('core').setLevel(logging.DEBUG)
 logging.getLogger('__main__').setLevel(logging.DEBUG)
+
 
 def load_config(config_path: str) -> Dict[str, Any]:
     return yaml_read(config_path)
@@ -84,18 +73,12 @@ def main():
     logger = setup_logger(os.path.join(output_dir, "training.log"))
     logger.info(f"Output dir: {output_dir}")
 
-    # --- trainer params ---
-    trainer_cfg            = main_cfg.get("trainer", {})
-    max_epochs             = trainer_cfg.get("max_epochs", 100)
-    skip_valid_until_epoch = trainer_cfg.get("skip_validation_until_epoch", 0)
-    
-    # Track metrics frequency from config (for consistent visualization even if not all shown in progress bar)
-    train_metrics_every_n_epochs = trainer_cfg.get("train_metrics_every_n_epochs", 1)
-    val_metrics_every_n_epochs = trainer_cfg.get("val_metrics_every_n_epochs", 1)
-    
-    # Get per-metric frequencies if defined
-    train_metric_frequencies = metrics_cfg.get("train_frequencies", {})
-    val_metric_frequencies = metrics_cfg.get("val_frequencies", {})
+    # --- trainer params from YAML ---
+    trainer_cfg                = main_cfg.get("trainer", {})
+    skip_valid_until_epoch     = trainer_cfg["skip_validation_until_epoch"]
+
+    train_metrics_every_n      = trainer_cfg["train_metrics_every_n_epochs"]
+    val_metrics_every_n        = trainer_cfg["val_metrics_every_n_epochs"]
 
     # --- model, loss, metrics ---
     logger.info("Loading model...")
@@ -121,12 +104,9 @@ def main():
     logger.info(f"Validation set size: {len(dm.val_dataset)} samples")
     logger.info(f"Test set size:       {len(dm.test_dataset)} samples")
 
-    # --- dynamic batch keys ---
+    # --- lightning module ---
     input_key  = main_cfg.get("target_x", "image_patch")
     target_key = main_cfg.get("target_y", "label_patch")
-
-    # --- lightning module ---
-    logger.info("Creating Lightning module...")
     lit = SegLitModule(
         model=model,
         loss_fn=mixed_loss,
@@ -135,44 +115,32 @@ def main():
         inference_config=inference_cfg,
         input_key=input_key,
         target_key=target_key,
-        train_metrics_every_n_epochs=train_metrics_every_n_epochs,
-        val_metrics_every_n_epochs=val_metrics_every_n_epochs,
-        train_metric_frequencies=train_metric_frequencies,
-        val_metric_frequencies=val_metric_frequencies,
+        train_metrics_every_n_epochs=train_metrics_every_n,
+        val_metrics_every_n_epochs=val_metrics_every_n,
+        train_metric_frequencies=metrics_cfg.get("train_frequencies", {}),
+        val_metric_frequencies=metrics_cfg.get("val_frequencies", {}),
     )
 
     # --- callbacks ---
     callbacks: List[pl.Callback] = []
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     mkdir(ckpt_dir)
-    
-    # Add BestMetricCheckpoint callback to save best models for each metric
+
     callbacks.append(BestMetricCheckpoint(
         dirpath=ckpt_dir,
         metric_names=list(metric_list.keys()),
         mode="max",
         save_last=True,
-        last_k=1,  # Save last checkpoint every epoch instead of every 5 epochs
+        last_k=1,
     ))
-    
-    # Add PredictionLogger to visualize predictions
-    # callbacks.append(PredictionLogger(
-    #     log_dir=os.path.join(output_dir, "predictions"),
-    #     log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
-    #     max_samples=trainer_cfg.get("num_samples_plot", 4),
-    #     cmap=trainer_cfg.get("cmap_plot", 'gray')
-    # ))
-    
-    # Add SamplePlotCallback to monitor sample predictions during training
+
     callbacks.append(SamplePlotCallback(
-        num_samples=trainer_cfg.get("num_samples_plot", 3),
-        cmap=trainer_cfg.get("cmap_plot", 'gray')
+        num_samples=trainer_cfg["num_samples_plot"],
+        cmap=trainer_cfg["cmap_plot"]
     ))
-    
-    # Add LearningRateMonitor to track learning rate changes
+
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
-    
-    # Archive code if not resuming
+
     if not args.resume:
         code_dir = os.path.join(output_dir, "code")
         mkdir(code_dir)
@@ -180,8 +148,7 @@ def main():
             output_dir=code_dir,
             project_root=os.path.dirname(os.path.abspath(__file__))
         ))
-    
-    # Skip validation for early epochs if needed
+
     if skip_valid_until_epoch > 0:
         callbacks.append(SkipValidation(skip_until_epoch=skip_valid_until_epoch))
 
@@ -189,73 +156,33 @@ def main():
     mkdir(pred_save_dir)
     callbacks.append(PredictionSaver(
         save_dir=pred_save_dir,
-        save_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
-        save_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
-        max_samples=trainer_cfg.get("save_gt_pred_max_samples", None)
+        save_every_n_epochs=trainer_cfg["save_gt_pred_val_test_every_n_epochs"],
+        save_after_epoch=trainer_cfg["save_gt_pred_val_test_after_epoch"],
+        max_samples=trainer_cfg["save_gt_pred_max_samples"],
     ))
     logging.getLogger("core.callbacks.PredictionSaver").setLevel(logging.DEBUG)
 
-    # --- trainer & logger ---
-    tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
-    
-    # Prepare trainer kwargs - FIXED: Remove resume_from_checkpoint
-    # First: copy anything in extra_args straight through
+    # --- trainer & logger setup ---
+    tb_logger     = TensorBoardLogger(save_dir=output_dir, name="logs")
     trainer_kwargs = dict(trainer_cfg.get("extra_args", {}))
 
-    # Core training loop controls
+    # apply only those keys you defined in YAML
     trainer_kwargs.update({
-        "max_epochs":                     trainer_cfg.get("max_epochs"),
-        "min_epochs":                     trainer_cfg.get("min_epochs"),
-        "max_steps":                      trainer_cfg.get("max_steps", -1),
-        "min_steps":                      trainer_cfg.get("min_steps"),
-        "max_time":                       trainer_cfg.get("max_time"),
-        "limit_train_batches":            trainer_cfg.get("limit_train_batches"),
-        "limit_val_batches":              trainer_cfg.get("limit_val_batches"),
-        "limit_test_batches":             trainer_cfg.get("limit_test_batches"),
-        "limit_predict_batches":          trainer_cfg.get("limit_predict_batches"),
-        "overfit_batches":                trainer_cfg.get("overfit_batches", 0.0),
-        "check_val_every_n_epoch":        trainer_cfg.get("val_every_n_epochs", 1),
-        "num_sanity_val_steps":           trainer_cfg.get("num_sanity_val_steps"),
+        "max_epochs":                trainer_cfg["max_epochs"],
+        "num_sanity_val_steps":      trainer_cfg["num_sanity_val_steps"],
+        "check_val_every_n_epoch":   trainer_cfg["check_val_every_n_epoch"],
+        "log_every_n_steps":         trainer_cfg["log_every_n_steps"],
     })
 
-    # Logging & checkpointing toggles
-    trainer_kwargs.update({
-        "log_every_n_steps":              trainer_cfg.get("log_every_n_steps"),
-        "enable_checkpointing":           trainer_cfg.get("enable_checkpointing", True),
-        "enable_progress_bar":            trainer_cfg.get("enable_progress_bar", True),
-        "enable_model_summary":           trainer_cfg.get("enable_model_summary", True),
-    })
+    trainer_kwargs["callbacks"]         = callbacks
+    trainer_kwargs["logger"]            = tb_logger
+    trainer_kwargs.setdefault("default_root_dir", output_dir)
 
-    # Gradient & precision controls
-    trainer_kwargs.update({
-        "accumulate_grad_batches":        trainer_cfg.get("accumulate_grad_batches", 1),
-        "gradient_clip_val":              trainer_cfg.get("gradient_clip_val"),
-        "gradient_clip_algorithm":        trainer_cfg.get("gradient_clip_algorithm"),
-        "deterministic":                  trainer_cfg.get("deterministic"),
-        "benchmark":                      trainer_cfg.get("benchmark"),
-    })
-
-    # Distributed/accelerator options (if not already in extra_args)
-    # these will be overridden by extra_args if present
-    for key in ("accelerator","strategy","devices","num_nodes","plugins","sync_batchnorm"):
-        if key in trainer_cfg:
-            trainer_kwargs[key] = trainer_cfg[key]
-
-    # Callbacks & logger
-    trainer_kwargs["callbacks"] = callbacks
-    trainer_kwargs["logger"] = tb_logger
-
-    # Finally: put back any default-root-dir if you want logs/ckpts under output_dir
-    if "default_root_dir" not in trainer_kwargs:
-        trainer_kwargs["default_root_dir"] = output_dir
-    
-    # Don't add resume_from_checkpoint to trainer_kwargs anymore
     trainer = pl.Trainer(**trainer_kwargs)
 
     # --- run ---
     if args.test:
         logger.info("Running test...")
-        # For testing, load from checkpoint if provided
         if args.resume:
             logger.info(f"Loading checkpoint for testing: {args.resume}")
             trainer.test(lit, datamodule=dm, ckpt_path=args.resume)
@@ -263,7 +190,6 @@ def main():
             trainer.test(lit, datamodule=dm)
     else:
         logger.info("Running training...")
-        # For training, use ckpt_path parameter in fit() method
         if args.resume:
             logger.info(f"Resuming training from checkpoint: {args.resume}")
             trainer.fit(lit, datamodule=dm, ckpt_path=args.resume)
@@ -271,7 +197,6 @@ def main():
             logger.info("Starting training from scratch...")
             trainer.fit(lit, datamodule=dm)
 
-        # test best checkpoint
         mgr = CheckpointManager(
             checkpoint_dir=ckpt_dir,
             metrics=list(metric_list.keys()),
@@ -284,6 +209,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 # ------------------------------------
 # seglit_module.py
@@ -3205,17 +3131,15 @@ output_dir: "outputs/baseline_unet_massroads"
 # Trainer configuration
 trainer:
   num_sanity_val_steps: 0
-  max_epochs: 5000
+  max_epochs: 10000
   # val_check_interval: 1.0         # Validate once per epoch
-  check_val_every_n_epoch: 20      # Validate every N epochs (this is redundant with val_check_interval=1.0)
-  skip_validation_until_epoch: 2  # Skip validation until this epoch
-  val_every_n_epochs: 2          # used for custom callbacks
-  log_every_n_epochs: 2           # log predictions every 2 epochs
+  check_val_every_n_epoch: 10      # Validate every N epochs (this is redundant with val_check_interval=1.0)
+  skip_validation_until_epoch: 10  # Skip validation until this epoch
   log_every_n_steps: 1            # log metrics every step
-  train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
-  val_metrics_every_n_epochs: 1   # compute/log val   metrics every epoch
-  save_gt_pred_val_test_every_n_epochs: 1  # Save GT+pred every 10 epochs
-  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
+  train_metrics_every_n_epochs: 10 # compute/log train metrics every epoch
+  val_metrics_every_n_epochs: 10  # compute/log val   metrics every epoch
+  save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
+  save_gt_pred_val_test_after_epoch: 10      # Start saving after epoch 0
   save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
   
   num_samples_plot: 5
