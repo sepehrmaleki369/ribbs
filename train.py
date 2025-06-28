@@ -154,12 +154,14 @@ def main():
     callbacks.append(PredictionLogger(
         log_dir=os.path.join(output_dir, "predictions"),
         log_every_n_epochs=trainer_cfg.get("log_every_n_epochs", 1),
-        max_samples=4
+        max_samples=trainer_cfg.get("num_samples_plot", 4),
+        cmap=trainer_cfg.get("cmap_plot", 'gray')
     ))
     
     # Add SamplePlotCallback to monitor sample predictions during training
     callbacks.append(SamplePlotCallback(
-        num_samples=trainer_cfg.get("num_samples_plot", 3)
+        num_samples=trainer_cfg.get("num_samples_plot", 3),
+        cmap=trainer_cfg.get("cmap_plot", 'gray')
     ))
     
     # Add LearningRateMonitor to track learning rate changes

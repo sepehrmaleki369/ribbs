@@ -27,6 +27,9 @@ trainer:
   save_gt_pred_val_test_after_epoch: 0    # Start saving after epoch 10
   save_gt_pred_max_samples: null              # Save up to 4 samples per epoch
   
+  num_samples_plot: 5
+  cmap_plot: "coolwarm"
+  
   # Extra arguments passed directly to PyTorch Lightning Trainer
   extra_args:
     accelerator: "auto"  # Use GPU if available

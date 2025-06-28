@@ -20,6 +20,7 @@ from pytorch_lightning.callbacks import Callback
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 
+
 class SamplePlotCallback(pl.Callback):
     """
     After each training & validation epoch, log up to `num_samples`
@@ -27,15 +28,16 @@ class SamplePlotCallback(pl.Callback):
       - train/samples: [input | ground-truth | prediction]
       - val/samples:   [input | ground-truth | prediction]
     """
-    def __init__(self, num_samples: int = 5):
+    def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
         super().__init__()
         self.num_samples = num_samples
+        self.cmap = cmap
         self._reset_buffers()
 
     def _reset_buffers(self):
-        self._images   = []   # list of torch.Tensor batches
-        self._gts      = []
-        self._preds    = []
+        self._images = []
+        self._gts = []
+        self._preds = []
         self._collected = 0
 
     def on_train_epoch_start(self, trainer, pl_module):
@@ -83,6 +85,10 @@ class SamplePlotCallback(pl.Callback):
         preds = torch.cat(self._preds,  0)
         n = imgs.size(0)
 
+        # compute a symmetric range for cmap around zero
+        all_vals = torch.cat([gts.view(-1), preds.view(-1)], 0)
+        m = float(all_vals.abs().max())
+
         fig, axes = plt.subplots(n, 3, figsize=(3*3, n*3), tight_layout=True)
         if n == 1:
             axes = axes[None, :]
@@ -92,9 +98,17 @@ class SamplePlotCallback(pl.Callback):
             gt  = gts[i,0]
             pr  = preds[i,0]
 
-            axes[i,0].imshow(img); axes[i,0].set_title("input"); axes[i,0].axis("off")
-            axes[i,1].imshow(gt,  cmap="gray");       axes[i,1].set_title("gt");    axes[i,1].axis("off")
-            axes[i,2].imshow(pr,  cmap="gray");       axes[i,2].set_title("pred");  axes[i,2].axis("off")
+            axes[i,0].imshow(img)
+            axes[i,0].set_title("input")
+            axes[i,0].axis("off")
+
+            axes[i,1].imshow(gt,  cmap=self.cmap, vmin=-m, vmax=m)
+            axes[i,1].set_title("gt")
+            axes[i,1].axis("off")
+
+            axes[i,2].imshow(pr,  cmap=self.cmap, vmin=-m, vmax=m)
+            axes[i,2].set_title("pred")
+            axes[i,2].axis("off")
 
         trainer.logger.experiment.add_figure(f"{tag}/samples", fig, global_step=trainer.current_epoch)
         plt.close(fig)
@@ -113,11 +127,12 @@ class PredictionLogger(Callback):
     Callback to log input/prediction/ground truth visualization during validation.
     Accumulates up to `max_samples` across batches and saves one grid per epoch.
     """
-    def __init__(self, log_dir: str, log_every_n_epochs: int = 1, max_samples: int = 4):
+    def __init__(self, log_dir: str, log_every_n_epochs: int = 1, max_samples: int = 4, cmap: str = "coolwarm"):
         super().__init__()
         self.log_dir = log_dir
         self.log_every_n_epochs = log_every_n_epochs
         self.max_samples = max_samples
+        self.cmap = cmap
         self.logger = logging.getLogger(__name__)
         self._reset_buffers()
 
@@ -135,19 +150,12 @@ class PredictionLogger(Callback):
             self._logged_this_epoch = True
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        if self._logged_this_epoch:
-            return
-        if trainer.current_epoch % self.log_every_n_epochs != 0:
+        if self._logged_this_epoch or (trainer.current_epoch % self.log_every_n_epochs != 0):
             return
 
-        # Pull images and labels by dynamic key:
-        x = batch[pl_module.input_key]
-        y_true = batch[pl_module.target_key]
-        y_pred = outputs["predictions"]
-
-        x = x.detach().cpu()
-        y_true = y_true.detach().cpu()
-        y_pred = y_pred.detach().cpu()
+        x = batch[pl_module.input_key].detach().cpu()
+        y_true = batch[pl_module.target_key].detach().cpu()
+        y_pred = outputs["predictions"].detach().cpu()
 
         remaining = self.max_samples - self._collected
         take = min(remaining, x.shape[0])
@@ -162,22 +170,19 @@ class PredictionLogger(Callback):
             gts  = torch.cat(self._gts,    dim=0)
             preds= torch.cat(self._preds,  dim=0)
 
+            # compute symmetric range
+            all_vals = torch.cat([gts.view(-1), preds.view(-1)], 0)
+            m = float(all_vals.abs().max())
+
             os.makedirs(self.log_dir, exist_ok=True)
-            filename = os.path.join(
-                self.log_dir,
-                f"pred_epoch_{trainer.current_epoch:06d}.png"
-            )
+            filename = os.path.join(self.log_dir, f"pred_epoch_{trainer.current_epoch:06d}.png")
 
-            fig, axes = plt.subplots(
-                self.max_samples, 3,
-                figsize=(12, 4 * self.max_samples)
-            )
-
+            fig, axes = plt.subplots(self.max_samples, 3, figsize=(12, 4 * self.max_samples))
             for i in range(self.max_samples):
                 # Input
                 ax = axes[i, 0]
                 if imgs.shape[1] == 1:
-                    ax.imshow(imgs[i, 0], cmap='gray')
+                    ax.imshow(imgs[i, 0], cmap=self.cmap, vmin=-m, vmax=m)
                 else:
                     im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
                     ax.imshow(im)
@@ -186,21 +191,13 @@ class PredictionLogger(Callback):
 
                 # Ground truth
                 ax = axes[i, 1]
-                if gts.shape[1] == 1:
-                    ax.imshow(gts[i, 0], cmap='gray')
-                else:
-                    mask = torch.argmax(gts[i], dim=0)
-                    ax.imshow(mask, cmap='tab20')
+                ax.imshow(gts[i, 0], cmap=self.cmap, vmin=-m, vmax=m)
                 ax.set_title('Ground Truth')
                 ax.axis('off')
 
                 # Prediction
                 ax = axes[i, 2]
-                if preds.shape[1] == 1:
-                    ax.imshow(preds[i, 0], cmap='gray')
-                else:
-                    pmask = torch.argmax(preds[i], dim=0)
-                    ax.imshow(pmask, cmap='tab20')
+                ax.imshow(preds[i, 0], cmap=self.cmap, vmin=-m, vmax=m)
                 ax.set_title('Prediction')
                 ax.axis('off')
 
@@ -210,7 +207,6 @@ class PredictionLogger(Callback):
 
             self.logger.info(f"Saved prediction visualization: {filename}")
             self._logged_this_epoch = True
-
 
 class BestMetricCheckpoint(Callback):
     """

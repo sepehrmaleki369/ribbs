@@ -6,18 +6,19 @@ primary_loss:
   params: {}
 
 # # Secondary loss (activated after start_epoch)
-# secondary_loss:
-#   path: "losses.custom_loss"  # Path to the module containing the loss
-#   class: "TopologicalLoss"  # Name of the loss class
-#   params:
-#     topo_weight: 0.5  # Weight for the topological component
-#     smoothness: 1.0  # Smoothness parameter for gradient computation
-#     connectivity_weight: 0.3  # Weight for the connectivity component
+secondary_loss:
+  path: "losses.chamfer_class"  # Path to the module containing the loss
+  class: "ChamferBoundarySDFLoss"  # Name of the loss class
+  params:
+    update_scale: 1.0
+    dist_threshold: 3.0
+    w_inject: 1.0
+    w_pixel: 1.0
 
 # # Mixing parameters
-# alpha: 0.4  # Weight for the secondary loss (0 to 1)
-# start_epoch: 10  # Epoch to start using the secondary loss
+alpha: 1  # Weight for the secondary loss (0 to 1)
+start_epoch: 10000  # Epoch to start using the secondary loss
 
-secondary_loss: null
-alpha: 0.0
-start_epoch: 0
+
+
+ 

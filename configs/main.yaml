@@ -22,7 +22,6 @@ trainer:
   log_every_n_steps: 1
   train_metrics_every_n_epochs: 1    # compute/log train metrics once every epoch
   val_metrics_every_n_epochs: 1      # compute/log val   metrics once every epoch
-
   save_gt_pred_val_test_every_n_epochs: 10  # Save every 5 epochs
   save_gt_pred_val_test_after_epoch: 0    # Start saving after epoch 10
   save_gt_pred_max_samples: null              # Save up to 4 samples per epoch
@@ -36,6 +35,9 @@ trainer:
     deterministic: false
     # Add timeout to prevent hanging
     # max_time: "24:00:00"  # 24 hour timeout
+  
+
+
 
 # Optimizer configuration
 optimizer:
@@ -58,4 +60,5 @@ optimizer:
       lr_decay_factor: 0.00001
 
 target_x: "image_patch"
-target_y: "label_patch"
+target_y: "sdf_patch"
+

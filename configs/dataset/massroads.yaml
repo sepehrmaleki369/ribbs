@@ -60,6 +60,6 @@ augmentations:
 # max_images: null  # No limit (set a number to limit images loaded)
 max_images: 10  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
-save_computed: false  # Save computed distance maps and SDFs
+save_computed: true  # Save computed distance maps and SDFs
 verbose: false  # Verbose output
 seed: 42  # Random seed
