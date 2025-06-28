@@ -26,7 +26,8 @@ from core.callbacks import (
     ConfigArchiver,
     SkipValidation,
     SamplePlotCallback,
-    PredictionSaver
+    PredictionSaver,
+    PeriodicCheckpoint
 )
 from core.logger import setup_logger
 from core.checkpoint import CheckpointManager
@@ -131,6 +132,14 @@ def main():
         last_k=1,
     ))
 
+    backup_ckpt_dir = os.path.join(output_dir, "backup_checkpoints")
+    mkdir(backup_ckpt_dir)
+
+    callbacks.append(PeriodicCheckpoint(               # <-- add this block
+        dirpath=backup_ckpt_dir,
+        every_n_epochs=trainer_cfg.get("save_checkpoints_every_n_epochs", 5)
+    ))
+
     callbacks.append(SamplePlotCallback(
         num_samples=trainer_cfg["num_samples_plot"],
         cmap=trainer_cfg["cmap_plot"]
@@ -155,7 +164,7 @@ def main():
         save_dir=pred_save_dir,
         save_every_n_epochs=trainer_cfg["save_gt_pred_val_test_every_n_epochs"],
         save_after_epoch=trainer_cfg["save_gt_pred_val_test_after_epoch"],
-        max_samples=trainer_cfg["save_gt_pred_max_samples"],
+        max_samples=trainer_cfg.get('save_gt_pred_max_samples', None),
     ))
     logging.getLogger("core.callbacks.PredictionSaver").setLevel(logging.DEBUG)
 
