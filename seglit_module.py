@@ -60,6 +60,9 @@ class SegLitModule(pl.LightningModule):
         return y_hat
     
     def on_train_epoch_start(self):
+        self._train_preds = []
+        self._train_gts   = []
+
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
         for m in self.metrics.values():
@@ -72,16 +75,49 @@ class SegLitModule(pl.LightningModule):
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
 
+        # self._train_preds.append(y_hat.detach().flatten())
+        # self._train_gts.append(  y.detach().flatten())
+        # print(f"[Train]  x.shape={x.shape}, y.shape={y.shape}")
+        # print(f"[Train] y_hat.shape={y_hat.shape}")
+        # print(f"[Train] loss computed on y_hat of shape {y_hat.shape} and y of shape {y.shape}")
+
         self.log("train_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        y_int = y.long()
+        y_int = y
         for name, metric in self.metrics.items():
             freq = self.train_metric_frequencies.get(name, self.train_freq)
             if self.current_epoch % freq == 0:
-                self.log(f"train_{name}", metric(y_hat, y_int),
+                self.log(f"train_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+        
+        # ——— Log GT / Pred stats for TensorBoard ———
+        # flatten tensors
+        pred_flat = y_hat.flatten()
+        gt_flat   = y.flatten()
+        # GT statistics
+        self.log("train_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
+        self.log("train_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
+        self.log("train_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        # Pred statistics
+        self.log("train_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
+        self.log("train_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
+        self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
+
+
         return {"loss": loss, "predictions": y_hat, "gts": y}
+    
+    # def on_train_epoch_end(self):
+    #     # concatenate everything
+    #     preds = torch.cat(self._train_preds, dim=0)
+    #     gts   = torch.cat(self._train_gts,   dim=0)
+    #     # compute RMSE
+    #     rmse = torch.sqrt(F.mse_loss(preds, gts))
+    #     self.log("train_rmse", rmse, prog_bar=True, on_epoch=True)
+
+    def on_validation_epoch_start(self):
+        self._val_preds = []
+        self._val_gts   = []
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
@@ -94,17 +130,42 @@ class SegLitModule(pl.LightningModule):
             y_hat = self.validator.run_chunked_inference(self.model, x)
 
         loss = self.loss_fn(y_hat, y)
+
+        # self._val_preds.append(y_hat.detach().flatten())
+        # self._val_gts  .append(y.detach().flatten())
+        # print(f"[Val]  x.shape={x.shape}, y.shape={y.shape}")
+        # print(f"[Val] y_hat.shape={y_hat.shape}")
+        # print(f"[Val] loss computed on y_hat of shape {y_hat.shape} and y of shape {y.shape}")
         self.log("val_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        y_int = y.long()
+        y_int = y
         for name, metric in self.metrics.items():
             freq = self.val_metric_frequencies.get(name, self.val_freq)
             if self.current_epoch % freq == 0:
-                self.log(f"val_{name}", metric(y_hat, y_int),
+                self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        
+        # ——— Log GT / Pred stats for TensorBoard ———
+        # flatten tensors
+        pred_flat = y_hat.flatten()
+        gt_flat   = y.flatten()
+        # GT statistics
+        self.log("val_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
+        self.log("val_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
+        self.log("val_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        # Pred statistics
+        self.log("val_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
+        self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
+        self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
 
         return {"predictions": y_hat, "val_loss": loss, "gts": y}
+    
+    # def on_validation_epoch_end(self):
+    #     preds = torch.cat(self._val_preds, dim=0)
+    #     gts   = torch.cat(self._val_gts,   dim=0)
+    #     rmse = torch.sqrt(F.mse_loss(preds, gts))
+    #     self.log("val_rmse", rmse, prog_bar=True, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
         # same as validation but logs under test_
@@ -120,9 +181,9 @@ class SegLitModule(pl.LightningModule):
         self.log("test_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        y_int = y.long()
+        y_int = y
         for name, metric in self.metrics.items():
-            self.log(f"test_{name}", metric(y_hat, y_int),
+            self.log(f"test_metrics/{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
         return {"predictions": y_hat, "test_loss": loss, "gts": y}
@@ -162,3 +223,4 @@ class SegLitModule(pl.LightningModule):
         Scheduler = getattr(torch.optim.lr_scheduler, name)
         scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
+

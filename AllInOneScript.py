@@ -29,7 +29,8 @@ from core.callbacks import (
     ConfigArchiver,
     SkipValidation,
     SamplePlotCallback,
-    PredictionSaver
+    PredictionSaver,
+    PeriodicCheckpoint
 )
 from core.logger import setup_logger
 from core.checkpoint import CheckpointManager
@@ -134,6 +135,14 @@ def main():
         last_k=1,
     ))
 
+    backup_ckpt_dir = os.path.join(output_dir, "backup_checkpoints")
+    mkdir(backup_ckpt_dir)
+
+    callbacks.append(PeriodicCheckpoint(               # <-- add this block
+        dirpath=backup_ckpt_dir,
+        every_n_epochs=trainer_cfg.get("save_checkpoints_every_n_epochs", 5)
+    ))
+
     callbacks.append(SamplePlotCallback(
         num_samples=trainer_cfg["num_samples_plot"],
         cmap=trainer_cfg["cmap_plot"]
@@ -158,7 +167,7 @@ def main():
         save_dir=pred_save_dir,
         save_every_n_epochs=trainer_cfg["save_gt_pred_val_test_every_n_epochs"],
         save_after_epoch=trainer_cfg["save_gt_pred_val_test_after_epoch"],
-        max_samples=trainer_cfg["save_gt_pred_max_samples"],
+        max_samples=trainer_cfg.get('save_gt_pred_max_samples', None),
     ))
     logging.getLogger("core.callbacks.PredictionSaver").setLevel(logging.DEBUG)
 
@@ -276,6 +285,9 @@ class SegLitModule(pl.LightningModule):
         return y_hat
     
     def on_train_epoch_start(self):
+        self._train_preds = []
+        self._train_gts   = []
+
         if isinstance(self.loss_fn, MixedLoss):
             self.loss_fn.update_epoch(self.current_epoch)
         for m in self.metrics.values():
@@ -288,16 +300,49 @@ class SegLitModule(pl.LightningModule):
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
 
+        # self._train_preds.append(y_hat.detach().flatten())
+        # self._train_gts.append(  y.detach().flatten())
+        # print(f"[Train]  x.shape={x.shape}, y.shape={y.shape}")
+        # print(f"[Train] y_hat.shape={y_hat.shape}")
+        # print(f"[Train] loss computed on y_hat of shape {y_hat.shape} and y of shape {y.shape}")
+
         self.log("train_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        y_int = y.long()
+        y_int = y
         for name, metric in self.metrics.items():
             freq = self.train_metric_frequencies.get(name, self.train_freq)
             if self.current_epoch % freq == 0:
-                self.log(f"train_{name}", metric(y_hat, y_int),
+                self.log(f"train_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+        
+        # ——— Log GT / Pred stats for TensorBoard ———
+        # flatten tensors
+        pred_flat = y_hat.flatten()
+        gt_flat   = y.flatten()
+        # GT statistics
+        self.log("train_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
+        self.log("train_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
+        self.log("train_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        # Pred statistics
+        self.log("train_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
+        self.log("train_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
+        self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
+
+
         return {"loss": loss, "predictions": y_hat, "gts": y}
+    
+    # def on_train_epoch_end(self):
+    #     # concatenate everything
+    #     preds = torch.cat(self._train_preds, dim=0)
+    #     gts   = torch.cat(self._train_gts,   dim=0)
+    #     # compute RMSE
+    #     rmse = torch.sqrt(F.mse_loss(preds, gts))
+    #     self.log("train_rmse", rmse, prog_bar=True, on_epoch=True)
+
+    def on_validation_epoch_start(self):
+        self._val_preds = []
+        self._val_gts   = []
 
     def validation_step(self, batch, batch_idx):
         x = batch[self.input_key].float()
@@ -310,17 +355,42 @@ class SegLitModule(pl.LightningModule):
             y_hat = self.validator.run_chunked_inference(self.model, x)
 
         loss = self.loss_fn(y_hat, y)
+
+        # self._val_preds.append(y_hat.detach().flatten())
+        # self._val_gts  .append(y.detach().flatten())
+        # print(f"[Val]  x.shape={x.shape}, y.shape={y.shape}")
+        # print(f"[Val] y_hat.shape={y_hat.shape}")
+        # print(f"[Val] loss computed on y_hat of shape {y_hat.shape} and y of shape {y.shape}")
         self.log("val_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        y_int = y.long()
+        y_int = y
         for name, metric in self.metrics.items():
             freq = self.val_metric_frequencies.get(name, self.val_freq)
             if self.current_epoch % freq == 0:
-                self.log(f"val_{name}", metric(y_hat, y_int),
+                self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        
+        # ——— Log GT / Pred stats for TensorBoard ———
+        # flatten tensors
+        pred_flat = y_hat.flatten()
+        gt_flat   = y.flatten()
+        # GT statistics
+        self.log("val_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
+        self.log("val_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
+        self.log("val_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        # Pred statistics
+        self.log("val_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
+        self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
+        self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
 
         return {"predictions": y_hat, "val_loss": loss, "gts": y}
+    
+    # def on_validation_epoch_end(self):
+    #     preds = torch.cat(self._val_preds, dim=0)
+    #     gts   = torch.cat(self._val_gts,   dim=0)
+    #     rmse = torch.sqrt(F.mse_loss(preds, gts))
+    #     self.log("val_rmse", rmse, prog_bar=True, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
         # same as validation but logs under test_
@@ -336,9 +406,9 @@ class SegLitModule(pl.LightningModule):
         self.log("test_loss", loss,
                  prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        y_int = y.long()
+        y_int = y
         for name, metric in self.metrics.items():
-            self.log(f"test_{name}", metric(y_hat, y_int),
+            self.log(f"test_metrics/{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
         return {"predictions": y_hat, "test_loss": loss, "gts": y}
@@ -378,6 +448,7 @@ class SegLitModule(pl.LightningModule):
         Scheduler = getattr(torch.optim.lr_scheduler, name)
         scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
 
 
 # ------------------------------------
@@ -665,7 +736,7 @@ class GeneralizedDataset(Dataset):
             folder_name = self.modalities[key]
             mod_dir = os.path.join(self.data_dir, folder_name)
             os.makedirs(mod_dir, exist_ok=True)
-            sdf_comp_again = True
+            sdf_comp_again = False
             config_path = os.path.join(mod_dir, "config.json")
             # if os.path.exists(config_path):
             #     with open(config_path, "r") as config_file:
@@ -2439,7 +2510,8 @@ class ConnectedComponentsQuality(nn.Module):
         tolerance: int = 2,
         alpha: float = 0.5,
         threshold: float = 0.5,
-        eps: float = 1e-8
+        greater_is_one=True,
+        eps: float = 1e-8,
     ):
         """
         Initialize the CCQ metric.
@@ -2457,6 +2529,11 @@ class ConnectedComponentsQuality(nn.Module):
         self.alpha = alpha
         self.threshold = threshold
         self.eps = eps
+        self.greater_is_one = bool(greater_is_one)
+    
+    def _bin(self, arr: np.ndarray) -> np.ndarray:
+        return (arr >  self.threshold) if self.greater_is_one else \
+               (arr <  self.threshold)
     
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
@@ -2476,8 +2553,8 @@ class ConnectedComponentsQuality(nn.Module):
         
         for i in range(batch_size):
             # Binarize predictions and ground truth via threshold
-            pred = (y_pred[i, 0].detach().cpu().numpy() > self.threshold).astype(np.uint8)
-            true = (y_true[i, 0].detach().cpu().numpy() > self.threshold).astype(np.uint8)
+            pred = self._bin(y_pred[i, 0].detach().cpu().numpy()).astype(np.uint8)
+            true = self._bin(y_true[i, 0].detach().cpu().numpy()).astype(np.uint8)
             
             # Skip empty ground truth masks
             if np.sum(true) == 0:
@@ -2605,6 +2682,7 @@ class ThresholdedDiceMetric(nn.Module):
         eps=1e-6,
         multiclass=False,
         zero_division=1.0,
+        greater_is_one=True
     ):
         super().__init__()
         # Force numerical types
@@ -2612,6 +2690,13 @@ class ThresholdedDiceMetric(nn.Module):
         self.eps           = float(eps)
         self.multiclass    = bool(multiclass)
         self.zero_division = float(zero_division)
+        self.greater_is_one = bool(greater_is_one)
+
+    def _binarize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.greater_is_one:
+            return (x >  self.threshold).float()
+        else:
+            return (x <  self.threshold).float()
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         # ensure (N, C, H, W)
@@ -2625,9 +2710,8 @@ class ThresholdedDiceMetric(nn.Module):
             raise ValueError(f"[ThresholdedDiceMetric] Binary mode expects 1 channel, got {C}")
 
         # binarize
-        y_pred_bin = (y_pred > self.threshold).float()
-        y_true_bin = (y_true > self.threshold).float()
-
+        y_pred_bin = self._binarize(y_pred)
+        y_true_bin = self._binarize(y_true)
         # flatten
         y_pred_flat = y_pred_bin.view(N, C, -1)
         y_true_flat = y_true_bin.view(N, C, -1)
@@ -2680,13 +2764,21 @@ class ThresholdedIoUMetric(nn.Module):
         eps = 1e-6,
         multiclass = False,
         zero_division = 1.0,
+        greater_is_one=True
     ):
         super().__init__()
         self.threshold     = float(threshold)
         self.eps           = float(eps)
         self.multiclass    = bool(multiclass)
         self.zero_division = float(zero_division)
+        self.greater_is_one = bool(greater_is_one)
 
+    def _binarize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.greater_is_one:
+            return (x >  self.threshold).float()
+        else:
+            return (x <  self.threshold).float()
+        
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         # Ensure shape (N, C, H, W)
         if y_pred.dim() == 3:
@@ -2699,9 +2791,9 @@ class ThresholdedIoUMetric(nn.Module):
             raise ValueError(f"[ThresholdedIoUMetric] Binary mode expects 1 channel, got {C}")
 
         # Binarize
-        y_pred_bin = (y_pred > self.threshold).float()
-        y_true_bin = (y_true > self.threshold).float()
-
+        y_pred_bin = self._binarize(y_pred)
+        y_true_bin = self._binarize(y_true)
+        
         # Flatten
         y_pred_flat = y_pred_bin.view(N, C, -1)
         y_true_flat = y_true_bin.view(N, C, -1)
@@ -2750,8 +2842,11 @@ def compute_batch_apls(
     max_nodes=500,
     max_snap_dist=4,
     allow_renaming=True,
-    min_path_length=10
+    min_path_length=10,
+    greater_is_one=True
 ):
+    def _bin(x): return (x > threshold) if greater_is_one else (x < threshold)
+
     # --- convert to numpy if needed ---
     if torch.is_tensor(gt_masks):
         gt_masks = gt_masks.detach().cpu().numpy()
@@ -2778,8 +2873,8 @@ def compute_batch_apls(
 
     for i in range(B):
         # Binarize with threshold
-        gt_bin = (gt[i] > threshold).astype(np.uint8)
-        pr_bin = (pr[i] > threshold).astype(np.uint8)
+        gt_bin = _bin(gt[i]).astype(np.uint8)
+        pr_bin = _bin(pr[i]).astype(np.uint8)
 
         # Skip empty ground truth
         if gt_bin.sum() == 0:
@@ -2813,7 +2908,8 @@ class APLS(nn.Module):
         max_nodes=500,
         max_snap_dist=4,
         allow_renaming=True,
-        min_path_length=10
+        min_path_length=10,
+        greater_is_one=True
     ):
         super().__init__()
         self.threshold = threshold
@@ -2822,6 +2918,7 @@ class APLS(nn.Module):
         self.max_snap_dist = max_snap_dist
         self.allow_renaming = allow_renaming
         self.min_path_length = min_path_length
+        self.greater_is_one = bool(greater_is_one)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         scores = compute_batch_apls(
@@ -2832,7 +2929,8 @@ class APLS(nn.Module):
             max_nodes=self.max_nodes,
             max_snap_dist=self.max_snap_dist,
             allow_renaming=self.allow_renaming,
-            min_path_length=self.min_path_length
+            min_path_length=self.min_path_length,
+            greater_is_one=self.greater_is_one,
         )
         return torch.tensor(scores.mean(), device=y_pred.device)
 
@@ -3111,6 +3209,271 @@ class TopologicalLoss(nn.Module):
         connectivity_error = F.mse_loss(dilated_pred, dilated_true)
         
         return connectivity_error
+
+# ------------------------------------
+# configs/main.yaml
+# ------------------------------------
+# Main configuration file for segmentation experiments
+# This file references all sub-configs and sets high-level training parameters
+
+# Sub-config references
+dataset_config: "massroads.yaml"
+model_config: "baseline.yaml"
+loss_config: "mixed_topo.yaml"
+metrics_config: "segmentation.yaml"
+inference_config: "chunk.yaml"
+
+# Output directory
+output_dir: "outputs/baseline_unet_massroads"
+
+# Trainer configuration
+trainer:
+  num_sanity_val_steps: 0
+  max_epochs: 10000
+  check_val_every_n_epoch: 10      # Validate every N epochs (this is redundant with val_check_interval=1.0)
+  skip_validation_until_epoch: 0  # Skip validation until this epoch
+  log_every_n_steps: 1            # log metrics every step
+  train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
+  val_metrics_every_n_epochs: 1  # compute/log val   metrics every epoch
+  save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
+  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
+  # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
+  save_checkpoints_every_n_epochs: 1
+
+  num_samples_plot: 5
+  cmap_plot: "coolwarm"
+
+  extra_args:
+    accelerator: "auto" 
+    precision: 32  
+    deterministic: false
+    # gradient_clip_val: 1.0
+    # accumulate_grad_batches: 1
+    # max_time: "24:00:00"
+
+
+
+# Optimizer configuration
+optimizer:
+  name: "Adam"
+  params:
+    lr: 0.0001
+    weight_decay: 0.0001
+  
+  # Optional learning rate scheduler
+  scheduler:
+    # name: "ReduceLROnPlateau"
+    # params:
+    #   patience: 10
+    #   factor: 0.5
+    #   monitor: "val_loss"
+    #   mode: "min"
+    #   min_lr: 0.00001
+    name: "LambdaLR"
+    params:
+      lr_decay_factor: 0.00001
+
+target_x: "image_patch"
+target_y: "sdf_patch"
+
+
+
+# ------------------------------------
+# configs/metrics/segmentation.yaml
+# ------------------------------------
+# ----------------------------------------
+# Segmentation-metrics configuration
+# ----------------------------------------
+
+metrics:
+
+  # Dice
+  - alias: dice
+    path: metrics.dice
+    class: ThresholdedDiceMetric
+    params:
+      threshold: 0          # 0 splits neg/pos
+      greater_is_one: false # neg < 0  -> road = 1
+      eps: 1e-6
+      multiclass: false
+      zero_division: 1.0
+
+  # IoU
+  - alias: iou
+    path: metrics.iou
+    class: ThresholdedIoUMetric
+    params:
+      threshold: 0
+      greater_is_one: false
+      eps: 1e-6
+      multiclass: false     
+      zero_division: 1.0
+
+  # Connected-components quality
+  - alias: ccq
+    path: metrics.connected_components
+    class: ConnectedComponentsQuality
+    params:
+      min_size: 5
+      tolerance: 5           # centroid distance in px
+      threshold: 0
+      greater_is_one: false
+
+  # APLS
+  - alias: apls
+    path: metrics.apls
+    class: APLS
+    params:
+      threshold: 0
+      greater_is_one: false
+      angle_range: [135, 225]
+      max_nodes: 1000
+      max_snap_dist: 25
+      allow_renaming: true
+      min_path_length: 10
+
+# How often to compute each metric
+train_frequencies:   {dice: 1,  iou: 1,  ccq: 10, apls: 25}
+val_frequencies:     {dice: 1,  iou: 1,  ccq: 5,  apls: 10}
+
+
+# ------------------------------------
+# configs/loss/mixed_topo.yaml
+# ------------------------------------
+# Mixed Topological Loss Configuration
+
+# Primary loss (used from the beginning)
+primary_loss:
+  class: "MSELoss"  # Built-in PyTorch loss
+  params: {}
+
+# # Secondary loss (activated after start_epoch)
+secondary_loss:
+  path: "losses.chamfer_class"  # Path to the module containing the loss
+  class: "ChamferBoundarySDFLoss"  # Name of the loss class
+  params:
+    update_scale: 1.0
+    dist_threshold: 3.0
+    w_inject: 1.0
+    w_pixel: 1.0
+
+# # Mixing parameters
+alpha: 1  # Weight for the secondary loss (0 to 1)
+start_epoch: 10000  # Epoch to start using the secondary loss
+
+
+
+ 
+
+# ------------------------------------
+# configs/inference/chunk.yaml
+# ------------------------------------
+# Chunked Inference Configuration
+
+# Patch size for inference [height, width]
+# Patches of this size will be processed independently 
+# and then reassembled to form the full output
+patch_size: [256, 256]
+
+# Patch margin [height, width]
+# Margin of overlap between patches to avoid edge artifacts
+# The effective stride will be (patch_size - 2*patch_margin)
+patch_margin: [50, 50]
+
+
+# ------------------------------------
+# configs/dataset/massroads.yaml
+# ------------------------------------
+# Massachusetts Roads Dataset Configuration
+
+# Dataset root directory
+root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+# root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
+
+# Dataset split mode: "folder" or "kfold"
+split_mode: "folder"  # Uses folder structure for splits
+
+# K-fold configuration (used if split_mode is "kfold")
+# fold: 0  # Current fold
+# num_folds: 3  # Total number of folds
+
+# Split ratios (used if split_mode is "folder" with "source_folder")
+# split_ratios:
+  # train: 0.7
+  # valid: 0.15
+  # test: 0.15
+
+use_splitting: false
+
+# Source folder (used if split_mode is "folder" with split_ratios)
+# source_folder: 'train'
+
+# Batch sizes
+train_batch_size: 1 #64
+val_batch_size: 1  # Usually 1 for full-image validation
+test_batch_size: 1  # Usually 1 for full-image testing
+
+# Patch and crop settings
+patch_size: 512  # Size of training patches
+small_window_size: 8  # Size of window to check for variation
+validate_road_ratio: false  # Validate patch has enough road content
+threshold: 0.05  # Minimum road ratio threshold
+
+# Data loading settings
+num_workers: 4
+pin_memory: true
+
+# Modality settings
+modalities:
+  image: "sat"  # Satellite imagery folder
+  label: "label"  # Road map folder
+  # distance: "distance"  # Distance transform folder
+  sdf: "sdf"  # Signed distance function folder
+
+# Distance transform settings
+# distance_threshold: 20.0
+
+# Signed distance function settings
+sdf_iterations: 3
+sdf_thresholds: [-20, 20]
+
+# Augmentation settings
+augmentations:
+  - "flip_h"
+  - "flip_v"
+  - "rotation"
+
+# Misc settings
+# max_images: null  # No limit (set a number to limit images loaded)
+max_images: 2 #200  # No limit (set a number to limit images loaded)
+# max_attempts: 10  # Maximum attempts for finding valid patches
+save_computed: true  # Save computed distance maps and SDFs
+verbose: false  # Verbose output
+seed: 42  # Random seed
+
+# ------------------------------------
+# configs/model/baseline.yaml
+# ------------------------------------
+# TopoTokens Model Configuration
+
+# Model path and class
+path: "models.base_models"  # Path to the module containing the model
+class: "UNet"  # Name of the model class
+
+# Model parameters
+params:
+  three_dimensional: False
+  m_channels: 32
+  n_convs: 2
+  n_levels: 3
+  dropout: 0.1
+  batch_norm: True
+  upsampling: "bilinear"
+  pooling: "max"
+  in_channels: 3
+  out_channels: 1
+  apply_final_relu: False
+  
 
 # ------------------------------------
 # models/custom_model.py

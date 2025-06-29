@@ -150,7 +150,7 @@ class SamplePlotCallback(pl.Callback):
             axes[i, 2].axis("off")
 
         trainer.logger.experiment.add_figure(
-            f"{tag}/samples", fig, global_step=trainer.current_epoch
+            f"{tag}_samples", fig, global_step=trainer.current_epoch
         )
         plt.close(fig)
 
@@ -653,7 +653,7 @@ class PeriodicCheckpoint(pl.Callback):
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         epoch = trainer.current_epoch + 1  # epochs are 0-indexed internally
         if epoch % self.every_n_epochs == 0:
-            filename = f"{self.prefix}{epoch:04d}.ckpt"
+            filename = f"{self.prefix}{epoch:06d}.ckpt"
             ckpt_path = os.path.join(self.dirpath, filename)
             trainer.save_checkpoint(ckpt_path)
             # optional: log the path so you can grep it later

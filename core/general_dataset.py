@@ -181,7 +181,7 @@ class GeneralizedDataset(Dataset):
             folder_name = self.modalities[key]
             mod_dir = os.path.join(self.data_dir, folder_name)
             os.makedirs(mod_dir, exist_ok=True)
-            sdf_comp_again = True
+            sdf_comp_again = False
             config_path = os.path.join(mod_dir, "config.json")
             # if os.path.exists(config_path):
             #     with open(config_path, "r") as config_file:

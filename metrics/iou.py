@@ -17,13 +17,21 @@ class ThresholdedIoUMetric(nn.Module):
         eps = 1e-6,
         multiclass = False,
         zero_division = 1.0,
+        greater_is_one=True
     ):
         super().__init__()
         self.threshold     = float(threshold)
         self.eps           = float(eps)
         self.multiclass    = bool(multiclass)
         self.zero_division = float(zero_division)
+        self.greater_is_one = bool(greater_is_one)
 
+    def _binarize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.greater_is_one:
+            return (x >  self.threshold).float()
+        else:
+            return (x <  self.threshold).float()
+        
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         # Ensure shape (N, C, H, W)
         if y_pred.dim() == 3:
@@ -36,9 +44,9 @@ class ThresholdedIoUMetric(nn.Module):
             raise ValueError(f"[ThresholdedIoUMetric] Binary mode expects 1 channel, got {C}")
 
         # Binarize
-        y_pred_bin = (y_pred > self.threshold).float()
-        y_true_bin = (y_true > self.threshold).float()
-
+        y_pred_bin = self._binarize(y_pred)
+        y_true_bin = self._binarize(y_true)
+        
         # Flatten
         y_pred_flat = y_pred_bin.view(N, C, -1)
         y_true_flat = y_true_bin.view(N, C, -1)

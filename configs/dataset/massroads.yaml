@@ -1,7 +1,8 @@
 # Massachusetts Roads Dataset Configuration
 
 # Dataset root directory
-root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+# root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
 
 # Dataset split mode: "folder" or "kfold"
 split_mode: "folder"  # Uses folder structure for splits
@@ -22,12 +23,12 @@ use_splitting: false
 # source_folder: 'train'
 
 # Batch sizes
-train_batch_size: 2
+train_batch_size: 1 #64
 val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
 # Patch and crop settings
-patch_size: 256  # Size of training patches
+patch_size: 512  # Size of training patches
 small_window_size: 8  # Size of window to check for variation
 validate_road_ratio: false  # Validate patch has enough road content
 threshold: 0.05  # Minimum road ratio threshold
@@ -58,7 +59,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images: 2  # No limit (set a number to limit images loaded)
+# max_images:  #200  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: true  # Save computed distance maps and SDFs
 verbose: false  # Verbose output

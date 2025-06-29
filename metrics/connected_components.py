@@ -28,7 +28,8 @@ class ConnectedComponentsQuality(nn.Module):
         tolerance: int = 2,
         alpha: float = 0.5,
         threshold: float = 0.5,
-        eps: float = 1e-8
+        greater_is_one=True,
+        eps: float = 1e-8,
     ):
         """
         Initialize the CCQ metric.
@@ -46,6 +47,11 @@ class ConnectedComponentsQuality(nn.Module):
         self.alpha = alpha
         self.threshold = threshold
         self.eps = eps
+        self.greater_is_one = bool(greater_is_one)
+    
+    def _bin(self, arr: np.ndarray) -> np.ndarray:
+        return (arr >  self.threshold) if self.greater_is_one else \
+               (arr <  self.threshold)
     
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
@@ -65,8 +71,8 @@ class ConnectedComponentsQuality(nn.Module):
         
         for i in range(batch_size):
             # Binarize predictions and ground truth via threshold
-            pred = (y_pred[i, 0].detach().cpu().numpy() > self.threshold).astype(np.uint8)
-            true = (y_true[i, 0].detach().cpu().numpy() > self.threshold).astype(np.uint8)
+            pred = self._bin(y_pred[i, 0].detach().cpu().numpy()).astype(np.uint8)
+            true = self._bin(y_true[i, 0].detach().cpu().numpy()).astype(np.uint8)
             
             # Skip empty ground truth masks
             if np.sum(true) == 0:
