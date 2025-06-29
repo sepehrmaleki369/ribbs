@@ -50,5 +50,5 @@ metrics:
       min_path_length: 15
 
 # How often to compute each metric
-train_frequencies:   {dice: 1,  iou: 1,  ccq: 10, apls: 25}
-val_frequencies:     {dice: 1,  iou: 1,  ccq: 5,  apls: 10}
+train_frequencies:   {dice: 1,  iou: 1,  ccq: 20, apls: 50}
+val_frequencies:     {dice: 1,  iou: 1,  ccq: 10,  apls: 10}

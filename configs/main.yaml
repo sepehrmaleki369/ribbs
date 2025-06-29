@@ -9,7 +9,7 @@ metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 
 # Output directory
-output_dir: "outputs/baseline_unet_massroads"
+output_dir: "outputs/base_sdf_mass_500dp"
 
 # Trainer configuration
 trainer:

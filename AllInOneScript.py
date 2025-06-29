@@ -2936,6 +2936,67 @@ class APLS(nn.Module):
 
 
 # ------------------------------------
+# losses/weigted_mse.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class WeightedMSELoss(nn.Module):
+    def __init__(
+        self,
+        road_weight: float = 5.0,
+        bg_weight: float = 1.0,
+        threshold: float = 0.0,
+        greater_is_one: bool = False,
+        reduction: str = 'mean'
+    ):
+        """
+        road_weight:      weight for predicted errors on road pixels
+        bg_weight:        weight for predicted errors on background pixels
+        threshold:        SDF threshold to split road vs bg
+        greater_is_one:   if True, pixels >= threshold are road; else pixels < threshold are road
+        reduction:        'mean' | 'sum' | 'none'
+        """
+        super().__init__()
+        self.road_weight = road_weight
+        self.bg_weight = bg_weight
+        self.threshold = threshold
+        self.greater_is_one = greater_is_one
+        self.reduction = reduction
+
+    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor):
+        """
+        y_pred:     model output (same shape as y_true_sdf)
+        y_true_sdf: signed-distance map (float tensor, negative=road if greater_is_one=False)
+        """
+        # 1) build binary road mask based on threshold & direction
+        if self.greater_is_one:
+            # road where y_true_sdf >= threshold
+            road_mask = (y_true_sdf >= self.threshold).to(y_pred.dtype)
+        else:
+            # road where y_true_sdf < threshold
+            road_mask = (y_true_sdf < self.threshold).to(y_pred.dtype)
+
+        # 2) build weight map
+        weight = road_mask * self.road_weight + (1 - road_mask) * self.bg_weight
+
+        # 3) compute squared error
+        se = (y_pred - y_true_sdf) ** 2
+
+        # 4) apply weights
+        wse = se * weight
+
+        # 5) reduce
+        if self.reduction == 'mean':
+            # normalize by total weight
+            return wse.sum() / weight.sum()
+        elif self.reduction == 'sum':
+            return wse.sum()
+        else:  # 'none'
+            return wse
+
+
+# ------------------------------------
 # losses/chamfer_class.py
 # ------------------------------------
 import torch
@@ -3224,7 +3285,7 @@ metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 
 # Output directory
-output_dir: "outputs/baseline_unet_massroads"
+output_dir: "outputs/baseline_unet_massroads_500dp"
 
 # Trainer configuration
 trainer:
@@ -3330,11 +3391,11 @@ metrics:
       max_nodes: 1000
       max_snap_dist: 25
       allow_renaming: true
-      min_path_length: 10
+      min_path_length: 15
 
 # How often to compute each metric
-train_frequencies:   {dice: 1,  iou: 1,  ccq: 10, apls: 25}
-val_frequencies:     {dice: 1,  iou: 1,  ccq: 5,  apls: 10}
+train_frequencies:   {dice: 1,  iou: 1,  ccq: 20, apls: 50}
+val_frequencies:     {dice: 1,  iou: 1,  ccq: 10,  apls: 10}
 
 
 # ------------------------------------
@@ -3344,8 +3405,14 @@ val_frequencies:     {dice: 1,  iou: 1,  ccq: 5,  apls: 10}
 
 # Primary loss (used from the beginning)
 primary_loss:
+  path: "losses.weighted_mse"
   class: "MSELoss"  # Built-in PyTorch loss
-  params: {}
+  params:
+    road_weight: 5
+    bg_weight: 1
+    threshold: 0
+    greater_is_one: False
+    reduction: sum
 
 # # Secondary loss (activated after start_epoch)
 secondary_loss:
@@ -3373,12 +3440,12 @@ start_epoch: 10000  # Epoch to start using the secondary loss
 # Patch size for inference [height, width]
 # Patches of this size will be processed independently 
 # and then reassembled to form the full output
-patch_size: [256, 256]
+patch_size: [512, 512]
 
 # Patch margin [height, width]
 # Margin of overlap between patches to avoid edge artifacts
 # The effective stride will be (patch_size - 2*patch_margin)
-patch_margin: [50, 50]
+patch_margin: [100, 100]
 
 
 # ------------------------------------
@@ -3409,7 +3476,7 @@ use_splitting: false
 # source_folder: 'train'
 
 # Batch sizes
-train_batch_size: 1 #64
+train_batch_size: 64
 val_batch_size: 1  # Usually 1 for full-image validation
 test_batch_size: 1  # Usually 1 for full-image testing
 
@@ -3435,7 +3502,7 @@ modalities:
 
 # Signed distance function settings
 sdf_iterations: 3
-sdf_thresholds: [-20, 20]
+sdf_thresholds: [-7, 7]
 
 # Augmentation settings
 augmentations:
@@ -3445,7 +3512,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images: 2 #200  # No limit (set a number to limit images loaded)
+max_images:  2 #500  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: true  # Save computed distance maps and SDFs
 verbose: false  # Verbose output
