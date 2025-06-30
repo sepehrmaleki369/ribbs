@@ -2,14 +2,23 @@
 
 # Primary loss (used from the beginning)
 primary_loss:
-  path: "losses.weighted_mse"
-  class: "WeightedMSELoss"
+  path: "losses.lif_weighted_mse"
+  class: "LIFWeightedMSELoss"
   params:
-    road_weight: 4
-    bg_weight: 1
-    threshold: 0
-    greater_is_road: False
-    reduction: mean
+    sdf_min: -7.0
+    sdf_max: 7.0
+    n_bins: 256
+    eps: 0.02
+    freeze_after_first: False
+    reduction: "mean"
+
+  # class: "WeightedMSELoss"
+  # params:
+  #   road_weight: 4
+  #   bg_weight: 1
+  #   threshold: 0
+  #   greater_is_road: False
+  #   reduction: mean
 
   # class: "MSELoss"  # Built-in PyTorch loss
   # params: {}

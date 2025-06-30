@@ -31,7 +31,7 @@ metrics:
     path: metrics.connected_components
     class: ConnectedComponentsQuality
     params:
-      min_size: 5
+      min_size: 15
       tolerance: 5           # centroid distance in px
       threshold: 0
       greater_is_road: false

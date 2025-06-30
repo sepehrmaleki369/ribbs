@@ -59,7 +59,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images:  500  # No limit (set a number to limit images loaded)
+max_images:  640  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: true  # Save computed distance maps and SDFs
 verbose: false  # Verbose output

@@ -9,7 +9,7 @@ metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 
 # Output directory
-output_dir: "outputs/base_sdf_mass_500dp"
+output_dir: "outputs/base_sdf_mass_lif_640dp"
 
 # Trainer configuration
 trainer:
