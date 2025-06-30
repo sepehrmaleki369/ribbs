@@ -321,13 +321,13 @@ class SegLitModule(pl.LightningModule):
         pred_flat = y_hat.flatten()
         gt_flat   = y.flatten()
         # GT statistics
-        self.log("train_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
-        self.log("train_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
-        self.log("train_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        self.log("train_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True, batch_size=x.size(0))
         # Pred statistics
-        self.log("train_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
-        self.log("train_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
-        self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
+        self.log("train_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True, batch_size=x.size(0))
 
 
         return {"loss": loss, "predictions": y_hat, "gts": y}
@@ -376,13 +376,13 @@ class SegLitModule(pl.LightningModule):
         pred_flat = y_hat.flatten()
         gt_flat   = y.flatten()
         # GT statistics
-        self.log("val_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
-        self.log("val_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
-        self.log("val_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        self.log("val_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True, batch_size=x.size(0))
         # Pred statistics
-        self.log("val_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
-        self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
-        self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
+        self.log("val_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True, batch_size=x.size(0))
 
         return {"predictions": y_hat, "val_loss": loss, "gts": y}
     
@@ -2538,7 +2538,7 @@ class ConnectedComponentsQuality(nn.Module):
     
     def _bin(self, arr: np.ndarray) -> np.ndarray:
         return (arr >  self.threshold) if self.greater_is_road else \
-               (arr <  self.threshold)
+               (arr <=  self.threshold)
     
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
@@ -2701,7 +2701,7 @@ class ThresholdedDiceMetric(nn.Module):
         if self.greater_is_road:
             return (x >  self.threshold).float()
         else:
-            return (x <  self.threshold).float()
+            return (x <=  self.threshold).float()
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         # ensure (N, C, H, W)
@@ -2782,7 +2782,7 @@ class ThresholdedIoUMetric(nn.Module):
         if self.greater_is_road:
             return (x >  self.threshold).float()
         else:
-            return (x <  self.threshold).float()
+            return (x <=  self.threshold).float()
         
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         # Ensure shape (N, C, H, W)
@@ -2850,7 +2850,7 @@ def compute_batch_apls(
     min_path_length=10,
     greater_is_road=True
 ):
-    def _bin(x): return (x > threshold) if greater_is_road else (x < threshold)
+    def _bin(x): return (x > threshold) if greater_is_road else (x <= threshold)
 
     # --- convert to numpy if needed ---
     if torch.is_tensor(gt_masks):
@@ -2941,6 +2941,688 @@ class APLS(nn.Module):
 
 
 # ------------------------------------
+# libs/graph_from_skeleton/example.py
+# ------------------------------------
+#%load_ext autoreload
+#%autoreload 2
+#%matplotlib notebook
+import matplotlib.pyplot as plt
+import numpy as np
+import imageio
+from scipy.ndimage import binary_dilation
+
+from utils import *
+from graph_from_skeleton import graph_from_skeleton
+
+base = "/cvlabdata2/home/citraro/exps/delin/scores_comparison/agata_results/"
+skeleton = imageio.imread(base+"skels2/amsterdam_fc30.png").astype(np.uint8)[:2048, :2048]
+skeleton_dil = binary_dilation(skeleton, iterations=5)
+
+G = graph_from_skeleton(skeleton, angle_range=(135,225), dist_line=3, 
+                        dist_node=10, verbose=True)
+
+plt.figure()
+plt.imshow(skeleton_dil)
+plot_graph(G)
+plt.show()
+
+# ------------------------------------
+# libs/graph_from_skeleton/utils.py
+# ------------------------------------
+import os
+import sys
+import json
+import re
+import os
+import glob
+import pickle
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from shapely.geometry import Point, LineString
+import scipy
+import copy
+
+def json_read(filename):
+    try:
+        with open(os.path.abspath(filename)) as f:    
+            data = json.load(f)
+        return data
+    except:
+        raise ValueError("Unable to read JSON {}".format(filename))
+
+def mkdir(directory):
+    directory = os.path.abspath(directory)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def sort_nicely(l):
+    """ Sort the given list in the way that humans expect.
+    """
+    convert = lambda text: int(text) if text.isdigit() else text
+    alphanum_key = lambda key: [ convert(c) for c in re.split('([0-9]+)', key) ]
+    return sorted(l, key=alphanum_key)
+
+def find_files(file_or_folder, hint=None, recursive=False):
+    # make sure to use ** in file_or_folder when using recusive
+    # ie find_files("folder/**", "*.json", recursive=True)
+    import os
+    import glob
+    if hint is not None:
+        file_or_folder = os.path.join(file_or_folder, hint)
+    filenames = [f for f in glob.glob(file_or_folder, recursive=recursive)]
+    filenames = sort_nicely(filenames)    
+    filename_files = []
+    for filename in filenames:
+        if os.path.isfile(filename):
+            filename_files.append(filename)                 
+    return filename_files
+
+def pickle_read(filename):
+    with open(filename, "rb") as f:    
+        data = pickle.load(f)
+    return data
+
+def pickle_write(filename, data):
+    directory = os.path.dirname(os.path.abspath(filename))
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    with open(filename, 'wb') as f:
+        pickle.dump(data, f)
+        
+def render_graph(segments, filename, height=3072, width=3072, thickness=4):
+    
+    mkdir(os.path.dirname(filename))
+    
+    if isinstance(segments, np.ndarray):
+        segments = segments.tolist()
+    
+    from PIL import Image, ImageDraw
+
+    im = Image.new('RGB', (width, height), (0, 0, 0)) 
+    draw = ImageDraw.Draw(im) 
+    for p1,p2 in segments:
+        draw.line(p1+p2, fill=(255,255,255), width=thickness)
+    im.save(filename) 
+    
+def interpolate_new_nodes(p1, p2, spacing=2):
+    
+    p1_, p2_ = np.array(p1), np.array(p2)
+
+    segment_length = np.linalg.norm(p1_-p2_)
+
+    new_node_pos = p1_ + (p2_-p1_)*np.linspace(0,1,int(np.ceil(segment_length/spacing)))[1:-1,None]
+
+    return new_node_pos 
+
+def plot_graph(graph, node_size=20, font_size=-1, 
+               node_color='y', edge_color='y', 
+               linewidths=2, offset=np.array([0,0]), **kwargs):
+  
+    pos = dict({n:graph.nodes[n]['pos']+offset for n in graph.nodes()})
+    nx.draw_networkx(graph, pos=pos, node_size=node_size, node_color=node_color,
+                     edge_color=edge_color, font_size=font_size, **kwargs)
+    plt.gca().invert_yaxis()
+    plt.legend()     
+    
+def load_graph_txt(filename):
+     
+    G = nx.Graph()
+        
+    nodes = []
+    edges = []
+    i = 0
+    switch = True
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            if len(line)==0 and switch:
+                switch = False
+                continue
+            if switch:
+                x,y = line.split(' ')
+                G.add_node(i, pos=(float(x),float(y)))
+                i+=1
+            else:
+                idx_node1, idx_node2 = line.split(' ')
+                G.add_edge(int(idx_node1),int(idx_node2))
+    
+    return G
+
+def txt_to_graph(filecontent):
+    G = nx.Graph()
+    lines = filecontent.strip().splitlines()
+    switch = True  
+    node_index = 0
+    
+    for line in lines:
+        line = line.strip()
+        if len(line) == 0 and switch:
+            switch = False
+            continue
+        
+        if switch:
+            try:
+                x, y = line.split()
+                G.add_node(node_index, pos=(float(x), float(y)))
+                node_index += 1
+            except ValueError:
+                raise ValueError(f"Error parsing node line: {line}")
+        else:
+            try:
+                idx_node1, idx_node2 = line.split()
+                G.add_edge(int(idx_node1), int(idx_node2))
+            except ValueError:
+                raise ValueError(f"Error parsing edge line: {line}")
+    
+    return G
+
+def save_graph_json(G, filename):
+    
+    def _tolist(x):
+        return x.tolist() if isinstance(x,np.ndarray) else x
+    
+    mkdir(os.path.dirname(filename))
+    
+    graph = {"nodes":[int(n) for n in G.nodes()],
+             "positions":[_tolist(G.nodes[n]['pos']) for n in G.nodes()],
+             "edges":[(int(s),int(t)) for s,t in G.edges()]}
+    
+    json_write(graph, filename)
+
+def save_graph_txt(G, filename):
+    
+    mkdir(os.path.dirname(filename))
+    
+    nodes = list(G.nodes())
+    
+    file = open(filename, "w+")
+    for n in nodes:
+        file.write("{:.6f} {:.6f}\r\n".format(G.nodes[n]['pos'][0], G.nodes[n]['pos'][1]))
+    file.write("\r\n")
+    for s,t in G.edges():
+        file.write("{} {}\r\n".format(nodes.index(s), nodes.index(t)))
+    file.close()
+
+def interpolate_new_nodes(p1, p2, spacing=2):
+    
+    p1_, p2_ = np.array(p1), np.array(p2)
+
+    segment_length = np.linalg.norm(p1_-p2_)
+
+    new_node_pos = p1_ + (p2_-p1_)*np.linspace(0,1,int(np.ceil(segment_length/spacing)))[1:-1,None]
+
+    return new_node_pos    
+    
+def oversampling_graph(G, spacing=20):
+    edges = list(G.edges())
+    for s,t in edges:
+
+        new_nodes_pos = interpolate_new_nodes(G.nodes[s]['pos'], G.nodes[t]['pos'], spacing)
+
+        if len(new_nodes_pos)>0:
+            G.remove_edge(s,t)
+            n = max(G.nodes())+1
+
+            for i,n_pos in enumerate(new_nodes_pos):
+                G.add_node(n+i, pos=tuple(n_pos))
+
+            G.add_edge(s,n)
+            for _ in range(len(new_nodes_pos)-1):
+                G.add_edge(n,n+1)
+                n+=1
+            G.add_edge(n,t)
+    return G    
+
+
+def get_length(line):
+    return scipy.spatial.distance.euclidean(line.coords[0], line.coords[1])
+
+
+# def pixel_graph(skeleton):
+
+#     _skeleton = copy.deepcopy(np.uint8(skeleton))
+#     _skeleton[0,:] = 0
+#     _skeleton[:,0] = 0
+#     _skeleton[-1,:] = 0
+#     _skeleton[:,-1] = 0
+#     G = nx.Graph()
+
+#     # add one node for each active pixel
+#     xs,ys,zs = np.where(_skeleton>0)
+#     G.add_nodes_from([(int(x),int(y)) for i,(x,y) in enumerate(zip(xs,ys))])
+
+#     # add one edge between each adjacent active pixels
+#     for (x,y) in G.nodes():
+#         patch = _skeleton[x-1:x+2, y-1:y+2]
+#         patch[1,1] = 0
+#         for _x,_y in zip(*np.where(patch>0)):
+#             if not G.has_edge((x,y),(x+_x-1,y+_y-1)):
+#                 G.add_edge((x,y),(x+_x-1,y+_y-1))
+
+#     for n,data in G.nodes(data=True):
+#         data['pos'] = np.array(n)[::-1]
+
+#     return G
+
+# def decimate_nodes_angle_distance(G, angle_range=(110,240), dist=0.3, verbose=True):
+#     import time
+#     H = copy.deepcopy(G)
+
+#     def f():
+#         start = time.time()
+#         nodes = list(H.nodes())
+#         np.random.shuffle(nodes)
+#         changed = False
+#         for n in nodes:
+
+#             ajacent_nodes = list(nx.neighbors(H, n))
+#             if n in ajacent_nodes:
+#                 ajacent_nodes.remove(n)
+#             if len(ajacent_nodes)==2:
+#                 angle = compute_angle_degree(n, *ajacent_nodes)
+#                 d = distance_point_line(np.array(n), np.array(ajacent_nodes[0]), np.array(ajacent_nodes[1]))
+#                 if d<dist or (angle>angle_range[0] and angle<angle_range[1]):
+#                     H.remove_node(n)
+#                     H.add_edge(*ajacent_nodes)
+#                     changed = True
+#         return changed
+
+#     while True:
+#         if verbose:
+#             print("Remaining nodes:", len(H.nodes()))
+#         if not f():
+#             break
+
+#     if verbose:
+#         print("Finished. Remaining nodes:", len(H.nodes()))
+
+#     return H
+
+
+# def grapher(skeleton, angle_range=(135,225), dist_line=3,
+#                         dist_node=10, verbose=True, max_passes=20, relabel=True):
+#     """
+#     Parameters
+#     ----------
+#     skeleton : numpy.ndarray
+#         binary skeleton
+#     angle_range : (min,max) in degree
+#         two connected edges are merged into one if the angle between them
+#         is in this range
+#     dist_line : pixels
+#         two connected edges are merged into one if the distance between
+#         the central node to the line connecting the external nodes is
+#         lower then this value.
+#     dist_node : pixels
+#         two nodes that are connected by an edge are "merged" if their distance is
+#         lower than this value.
+#     """
+#     if verbose: print("Creation of densly connected graph.")
+#     G = pixel_graph(skeleton)
+
+#     for i in range(max_passes):
+
+#         if verbose: print("Pass {}:".format(i))
+
+#         n = len(G.nodes())
+
+#         if verbose: print("\tFirst decimation of nodes.")
+#         G = decimate_nodes_angle_distance(G, angle_range, dist_line, verbose)
+
+#         if verbose: print("\tFirst removing close nodes.")
+#         G = remove_close_nodes(G, dist_node, verbose)
+
+
+#         if verbose: print("\tRemoving short danglings.")
+#         G = remove_small_dangling(G, length=dist_node)
+
+#         if verbose: print("\tMerging close intersections.")
+#         G = merge_close_intersections(G, dist_node, verbose)
+
+#         if n==len(G.nodes()):
+#             break
+
+#     if relabel:
+#         mapping = dict(zip(G.nodes(), range(len(G.nodes()))))
+#         G = nx.relabel_nodes(G, mapping)
+
+#     return G
+
+
+def make_graph(G, is_gt=False):
+    nodes = []
+    edges = []
+    for n in G.nodes():
+        nodes.append([G.nodes[n]["pos"][0], G.nodes[n]["pos"][1]] if is_gt else [G.nodes[n]["pos"][0]+0.01, G.nodes[n]["pos"][1]+0.01])
+
+    for e in G.edges():
+        edges.append(list(e))
+
+    G_m = nx.MultiGraph()
+
+    for i,n in enumerate(nodes):
+        G_m.add_node(i if is_gt else -i,
+                   x=n[0],
+                   y=n[1],
+                   lat=-1,
+                   lon=-1)
+
+    for s,t in edges:
+        line_geom = LineString([nodes[s],nodes[t]])
+        G_m.add_edge(s if is_gt else -s, t if is_gt else -t,
+                   geometry=line_geom,
+                   length=get_length(line_geom))
+
+    return G_m
+
+def shift_graph(G, shift_x, shift_y):
+    H = G.copy()
+    for _,data in H.nodes(data=True):
+        x,y = data['pos']
+        x,y = x+shift_x,y+shift_y
+        if isinstance(data['pos'], np.ndarray):
+            data['pos'] = np.array([x,y])
+        else:
+            data['pos'] = (x,y)
+    return H 
+
+# def crop_graph(G, xmin, ymin, xmax, ymax):
+#     valid_nodes = [n for n in G.nodes() 
+#                    if xmin <= G.nodes[n]['pos'][0] < xmax and ymin <= G.nodes[n]['pos'][1] < ymax]
+    
+#     mapping = {old_id: new_id for new_id, old_id in enumerate(valid_nodes)}
+    
+#     H = G.subgraph(valid_nodes).copy()
+#     H = nx.relabel_nodes(H, mapping, copy=True)
+    
+#     for n, attr in H.nodes(data=True):
+#         x, y = attr['pos']
+#         # attr['pos'] = (x - xmin, y - ymin)
+#         attr['pos'] = (int(x), int(y))
+    
+#     for new_edge_id, (u, v, data) in enumerate(H.edges(data=True)):
+#         data['id'] = new_edge_id
+
+    # return H
+
+# ------------------------------------
+# libs/graph_from_skeleton/graph_from_skeleton.py
+# ------------------------------------
+import numpy as np
+import networkx as nx
+import time
+import copy
+
+def pixel_graph(skeleton):
+
+    _skeleton = copy.deepcopy(np.uint8(skeleton))
+    _skeleton[0,:] = 0
+    _skeleton[:,0] = 0
+    _skeleton[-1,:] = 0
+    _skeleton[:,-1] = 0
+    G = nx.Graph()
+
+    # add one node for each active pixel
+    xs,ys = np.where(_skeleton>0)
+    G.add_nodes_from([(int(x),int(y)) for i,(x,y) in enumerate(zip(xs,ys))])
+
+    # add one edge between each adjacent active pixels
+    for (x,y) in G.nodes():
+        patch = _skeleton[x-1:x+2, y-1:y+2]
+        patch[1,1] = 0
+        for _x,_y in zip(*np.where(patch>0)):
+            if not G.has_edge((x,y),(x+_x-1,y+_y-1)):
+                G.add_edge((x,y),(x+_x-1,y+_y-1))
+
+    for n,data in G.nodes(data=True):
+        data['pos'] = np.array(n)[::-1]
+
+    return G
+
+def compute_angle_degree(c, p0, p1):
+    p0c = np.sqrt((c[0] - p0[0]) ** 2 + (c[1] - p0[1]) ** 2)
+    p1c = np.sqrt((c[0] - p1[0]) ** 2 + (c[1] - p1[1]) ** 2)
+    p0p1 = np.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2)
+
+    # Prevent division by zero
+    denominator = 2 * p1c * p0c
+    if denominator == 0:
+        return 0  # or some default value like 180
+
+    cos_value = (p1c**2 + p0c**2 - p0p1**2) / denominator
+
+    # Clip values to prevent NaN issues
+    cos_value = np.clip(cos_value, -1.0, 1.0)
+
+    return np.arccos(cos_value) * 180 / np.pi
+
+
+def distance_point_line(c,p0,p1):
+    return np.linalg.norm(np.cross(p0-c, c-p1))/np.linalg.norm(p1-p0)
+
+def decimate_nodes_ramer_douglas_peucker(G, epsilon=5, verbose=False):
+    verbose=False
+    import rdp
+
+    H = copy.deepcopy(G)
+    start = time.time()
+    def f():
+        start = time.time()
+        nodes = list(H.nodes())
+        changed = False
+        for n in nodes:
+
+            if verbose:
+                delta = time.time()-start
+                if delta>5:
+                    start = time.time()
+                    # print("Remaining nodes:", len(H.nodes()))
+
+            ajacent_nodes = list(nx.neighbors(H, n))
+            if n in ajacent_nodes:
+                ajacent_nodes.remove(n)
+            if len(ajacent_nodes)==2:
+                if len(rdp.rdp([ajacent_nodes[0], n, ajacent_nodes[1]], epsilon=epsilon))==2:
+                    H.remove_node(n)
+                    H.add_edge(*ajacent_nodes)
+                    changed = True
+        return changed
+
+    while True:
+        if not f():
+            break
+
+    # if verbose:
+        # print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def decimate_nodes_angle_distance(G, angle_range=(110,240), dist=0.3, verbose=True):
+
+    H = copy.deepcopy(G)
+
+    def f():
+        start = time.time()
+        nodes = list(H.nodes())
+        np.random.shuffle(nodes)
+        changed = False
+        for n in nodes:
+
+            ajacent_nodes = list(nx.neighbors(H, n))
+            if n in ajacent_nodes:
+                ajacent_nodes.remove(n)
+            if len(ajacent_nodes)==2:
+                angle = compute_angle_degree(n, *ajacent_nodes)
+                d = distance_point_line(np.array(n), np.array(ajacent_nodes[0]), np.array(ajacent_nodes[1]))
+                if d<dist or (angle>angle_range[0] and angle<angle_range[1]):
+                    H.remove_node(n)
+                    H.add_edge(*ajacent_nodes)
+                    changed = True
+        return changed
+
+    while True:
+        # if verbose:
+            # print("Remaining nodes:", len(H.nodes()))
+        if not f():
+            break
+
+    # if verbose:
+        # print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def remove_close_nodes(G, dist=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    def _remove_close_nodes():
+        edges = list(H.edges())
+        changed = False
+        for (s,t) in edges:
+            if H.has_node(s) and H.has_node(t):
+                d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
+                if d<dist:
+                    if len(H.edges(s))==2:
+                        ajacent_nodes = list(nx.neighbors(H, s))
+                        if s in ajacent_nodes:
+                            ajacent_nodes.remove(s)
+                        if t in ajacent_nodes:
+                            ajacent_nodes.remove(t)
+                        if len(ajacent_nodes)==1:
+                            d = np.sqrt((s[0]-ajacent_nodes[0][0])**2+(s[1]-ajacent_nodes[0][1])**2)
+                            if d<dist:
+                                H.remove_node(s)
+                                H.add_edge(ajacent_nodes[0], t)
+                                changed = True
+                    elif len(H.edges(t))==2:
+                        ajacent_nodes = list(nx.neighbors(H, t))
+                        if s in ajacent_nodes:
+                            ajacent_nodes.remove(s)
+                        if t in ajacent_nodes:
+                            ajacent_nodes.remove(t)
+                        if len(ajacent_nodes)==1:
+                            d = np.sqrt((t[0]-ajacent_nodes[0][0])**2+(t[1]-ajacent_nodes[0][1])**2)
+                            if d<dist:
+                                H.remove_node(t)
+                                H.add_edge(ajacent_nodes[0], s)
+                                changed = True
+        return changed
+
+    while True:
+        # if verbose:
+            # print("Remaining nodes:", len(H.nodes()))
+        if not _remove_close_nodes():
+            break
+
+    # if verbose:
+        # print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def remove_small_dangling(G, length=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    edges = list(H.edges())
+    for (s,t) in edges:
+        d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
+        if d<length:
+            edge_count_s = len(H.edges(s))
+            edge_count_t = len(H.edges(t))
+            if edge_count_s==1:
+                H.remove_node(s)
+            if edge_count_t==1:
+                H.remove_node(t)
+
+    return H
+
+def merge_close_intersections(G, dist=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    def _merge_close_intersections():
+        edges = list(H.edges())
+        changed = False
+        for (s,t) in edges:
+            d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
+            if d<dist:
+                if len(H.edges(s))>2 and len(H.edges(t))>2:
+                    ajacent_nodes = list(nx.neighbors(H, s))
+                    if t in ajacent_nodes:
+                        ajacent_nodes.remove(t)
+                    H.remove_node(s)
+                    for n in ajacent_nodes:
+                        H.add_edge(n, t)
+                    changed = True
+                else:
+                    pass
+        return changed
+
+    while True:
+        # if verbose:
+            # print("Remaining nodes:", len(H.nodes()))
+        if not _merge_close_intersections():
+            break
+
+    # if verbose:
+        # print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def graph_from_skeleton(skeleton, angle_range=(135,225), dist_line=3,
+                        dist_node=10, verbose=True, max_passes=20, relabel=True):
+    """
+    Parameters
+    ----------
+    skeleton : numpy.ndarray
+        binary skeleton
+    angle_range : (min,max) in degree
+        two connected edges are merged into one if the angle between them
+        is in this range
+    dist_line : pixels
+        two connected edges are merged into one if the distance between
+        the central node to the line connecting the external nodes is
+        lower then this value.
+    dist_node : pixels
+        two nodes that are connected by an edge are "merged" if their distance is
+        lower than this value.
+    """
+    # if verbose: print("Creation of densly connected graph.")
+    G = pixel_graph(skeleton)
+
+    for i in range(max_passes):
+
+        # if verbose: print("Pass {}:".format(i))
+
+        n = len(G.nodes())
+
+        # if verbose: print("\tFirst decimation of nodes.")
+        G = decimate_nodes_angle_distance(G, angle_range, dist_line, verbose)
+
+        # if verbose: print("\tFirst removing close nodes.")
+        G = remove_close_nodes(G, dist_node, verbose)
+
+
+        # if verbose: print("\tRemoving short danglings.")
+        G = remove_small_dangling(G, length=dist_node)
+
+        # if verbose: print("\tMerging close intersections.")
+        G = merge_close_intersections(G, dist_node, verbose)
+
+        if n==len(G.nodes()):
+            break
+
+    if relabel:
+        mapping = dict(zip(G.nodes(), range(len(G.nodes()))))
+        G = nx.relabel_nodes(G, mapping)
+
+    return G
+
+
+# ------------------------------------
+# libs/graph_from_skeleton/__init__.py
+# ------------------------------------
+
+
+# ------------------------------------
 # losses/weighted_mse.py
 # ------------------------------------
 import torch
@@ -3004,9 +3686,9 @@ class WeightedMSELoss(nn.Module):
 
         # 1) build per-pixel weights
         if self.greater_is_road:
-            is_road = (y_true_sdf >= self.threshold)
+            is_road = (y_true_sdf > self.threshold)
         else:
-            is_road = (y_true_sdf <  self.threshold)
+            is_road = (y_true_sdf <=  self.threshold)
         weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
 
         # 2) weighted squared error
@@ -3161,6 +3843,122 @@ class ChamferBoundarySDFLoss(nn.Module):
 
 
 # ------------------------------------
+# losses/lif_weighted_mse.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class LIFWeightedMSELoss(nn.Module):
+    """
+    Log-Inverse-Frequency weighted MSE loss with optional global LUT freezing.
+
+    Each pixel weight = 1 / log(1 + eps + freq_k), where freq_k is the relative
+    frequency of the pixel's SDF bin across the current batch or a frozen dataset.
+
+    Args:
+        sdf_min (float): lower clamp for SDF values (e.g. -d_max).
+        sdf_max (float): upper clamp for SDF values (e.g. +d_max).
+        n_bins (int): number of histogram bins.
+        eps (float): small constant inside log to avoid division-by-zero.
+        freeze_after_first (bool): if True, build LUT once at first forward and reuse.
+        reduction (str): 'mean', 'sum', or 'none'.
+    """
+    def __init__(
+        self,
+        sdf_min: float = -7.0,
+        sdf_max: float = 7.0,
+        n_bins: int = 256,
+        eps: float = 0.02,
+        freeze_after_first: bool = False,
+        reduction: str = 'mean',
+    ) -> None:
+        super().__init__()
+        if sdf_max <= sdf_min:
+            raise ValueError('sdf_max must be > sdf_min')
+
+        # store range and scale as buffers
+        self.register_buffer('sdf_min', torch.tensor(float(sdf_min)))
+        self.register_buffer('sdf_max', torch.tensor(float(sdf_max)))
+        self.register_buffer('scale', 1.0 / (self.sdf_max - self.sdf_min))
+
+        self.n_bins = int(n_bins)
+        self.eps = float(eps)
+        self.freeze_after_first = bool(freeze_after_first)
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.reduction = reduction
+
+        # LUT registered as buffer, persistent to allow checkpointing
+        self.register_buffer('_lut', torch.ones(self.n_bins), persistent=True)
+        self._lut_ready = False
+
+    @torch.no_grad()
+    def freeze(self, data_loader) -> None:
+        """
+        Build a global LUT from ground-truth SDFs in data_loader and freeze it.
+        Subsequent forwards will reuse this LUT.
+        """
+        if self._lut_ready:
+            return
+        device = self.sdf_min.device
+        counts = torch.zeros(self.n_bins, device=device)
+        total = 0
+        for batch in data_loader:
+            sdf = batch.to(device)
+            idx = self._bin_indices(sdf)
+            counts += torch.bincount(idx.flatten(), minlength=self.n_bins)
+            total += idx.numel()
+        if total == 0:
+            raise RuntimeError('freeze received empty data_loader')
+        freq = counts.float() / total
+        self._lut = 1.0 / torch.log1p(self.eps + freq)
+        self._lut_ready = True
+
+    @torch.no_grad()
+    def _bin_indices(self, sdf: torch.Tensor) -> torch.LongTensor:
+        clamped = torch.clamp(sdf, self.sdf_min, self.sdf_max)
+        unit = (clamped - self.sdf_min) * self.scale
+        idx = torch.round(unit * (self.n_bins - 1)).long()
+        return idx
+
+    @torch.no_grad()
+    def _build_lut(self, sdf: torch.Tensor) -> torch.Tensor:
+        idx = self._bin_indices(sdf)
+        freq = torch.bincount(idx.flatten(), minlength=self.n_bins).float()
+        freq /= idx.numel()
+        return 1.0 / torch.log1p(self.eps + freq)
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # build or reuse LUT
+        if not self._lut_ready:
+            with torch.no_grad():
+                self._lut = self._build_lut(y_true)
+                if self.freeze_after_first:
+                    self._lut_ready = True
+
+        # gather weights
+        idx = self._bin_indices(y_true)
+        w = self._lut[idx].to(dtype=y_pred.dtype)
+
+        # weighted squared error
+        wse = w * (y_pred - y_true).pow(2)
+
+        # reduction
+        if self.reduction == 'mean':
+            return wse.sum() / y_pred.numel()
+        if self.reduction == 'sum':
+            return wse.sum()
+        return wse
+
+    def extra_repr(self) -> str:
+        return (
+            f'sdf_min={self.sdf_min.item()}, sdf_max={self.sdf_max.item()}, '
+            f'n_bins={self.n_bins}, eps={self.eps}, '
+            f'freeze_after_first={self.freeze_after_first}, reduction={self.reduction}'
+        )
+
+
+# ------------------------------------
 # losses/custom_loss.py
 # ------------------------------------
 """
@@ -3296,280 +4094,6 @@ class TopologicalLoss(nn.Module):
         connectivity_error = F.mse_loss(dilated_pred, dilated_true)
         
         return connectivity_error
-
-# ------------------------------------
-# configs/main.yaml
-# ------------------------------------
-# Main configuration file for segmentation experiments
-# This file references all sub-configs and sets high-level training parameters
-
-# Sub-config references
-dataset_config: "massroads.yaml"
-model_config: "baseline.yaml"
-loss_config: "mixed_topo.yaml"
-metrics_config: "segmentation.yaml"
-inference_config: "chunk.yaml"
-
-# Output directory
-output_dir: "outputs/base_sdf_mass_500dp"
-
-# Trainer configuration
-trainer:
-  num_sanity_val_steps: 0
-  max_epochs: 10000
-  check_val_every_n_epoch: 10      # Validate every N epochs (this is redundant with val_check_interval=1.0)
-  skip_validation_until_epoch: 0  # Skip validation until this epoch
-  log_every_n_steps: 1            # log metrics every step
-  train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
-  val_metrics_every_n_epochs: 1  # compute/log val   metrics every epoch
-  save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
-  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
-  # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
-  save_checkpoints_every_n_epochs: 1
-
-  num_samples_plot: 5
-  cmap_plot: "coolwarm"
-
-  extra_args:
-    accelerator: "auto" 
-    precision: 32  
-    deterministic: false
-    # gradient_clip_val: 1.0
-    # accumulate_grad_batches: 1
-    # max_time: "24:00:00"
-
-
-
-# Optimizer configuration
-optimizer:
-  name: "Adam"
-  params:
-    lr: 0.0001
-    weight_decay: 0.0001
-  
-  # Optional learning rate scheduler
-  scheduler:
-    # name: "ReduceLROnPlateau"
-    # params:
-    #   patience: 10
-    #   factor: 0.5
-    #   monitor: "val_loss"
-    #   mode: "min"
-    #   min_lr: 0.00001
-    name: "LambdaLR"
-    params:
-      lr_decay_factor: 0.00001
-
-target_x: "image_patch"
-target_y: "sdf_patch"
-
-
-
-# ------------------------------------
-# configs/metrics/segmentation.yaml
-# ------------------------------------
-# ----------------------------------------
-# Segmentation-metrics configuration
-# ----------------------------------------
-
-metrics:
-
-  # Dice
-  - alias: dice
-    path: metrics.dice
-    class: ThresholdedDiceMetric
-    params:
-      threshold: 0          # 0 splits neg/pos
-      greater_is_road: false # neg < 0  -> road = 1
-      eps: 1e-6
-      multiclass: false
-      zero_division: 1.0
-
-  # IoU
-  - alias: iou
-    path: metrics.iou
-    class: ThresholdedIoUMetric
-    params:
-      threshold: 0
-      greater_is_road: false
-      eps: 1e-6
-      multiclass: false     
-      zero_division: 1.0
-
-  # Connected-components quality
-  - alias: ccq
-    path: metrics.connected_components
-    class: ConnectedComponentsQuality
-    params:
-      min_size: 5
-      tolerance: 5           # centroid distance in px
-      threshold: 0
-      greater_is_road: false
-
-  # APLS
-  - alias: apls
-    path: metrics.apls
-    class: APLS
-    params:
-      threshold: 0
-      greater_is_road: false
-      angle_range: [135, 225]
-      max_nodes: 1000
-      max_snap_dist: 25
-      allow_renaming: true
-      min_path_length: 15
-
-# How often to compute each metric
-train_frequencies:   {dice: 1,  iou: 1,  ccq: 20, apls: 50}
-val_frequencies:     {dice: 1,  iou: 1,  ccq: 10,  apls: 10}
-
-
-# ------------------------------------
-# configs/loss/mixed_topo.yaml
-# ------------------------------------
-# Mixed Topological Loss Configuration
-
-# Primary loss (used from the beginning)
-primary_loss:
-  path: "losses.weighted_mse"
-  class: "WeightedMSELoss"
-  params:
-    road_weight: 4
-    bg_weight: 1
-    threshold: 0
-    greater_is_road: False
-    reduction: mean
-
-  # class: "MSELoss"  # Built-in PyTorch loss
-  # params: {}
-
-# # Secondary loss (activated after start_epoch)
-secondary_loss:
-  path: "losses.chamfer_class"  # Path to the module containing the loss
-  class: "ChamferBoundarySDFLoss"  # Name of the loss class
-  params:
-    update_scale: 1.0
-    dist_threshold: 3.0
-    w_inject: 1.0
-    w_pixel: 1.0
-
-# # Mixing parameters
-alpha: 1  # Weight for the secondary loss (0 to 1)
-start_epoch: 10000  # Epoch to start using the secondary loss
-
-
-
- 
-
-# ------------------------------------
-# configs/inference/chunk.yaml
-# ------------------------------------
-# Chunked Inference Configuration
-
-# Patch size for inference [height, width]
-# Patches of this size will be processed independently 
-# and then reassembled to form the full output
-patch_size: [512, 512]
-
-# Patch margin [height, width]
-# Margin of overlap between patches to avoid edge artifacts
-# The effective stride will be (patch_size - 2*patch_margin)
-patch_margin: [100, 100]
-
-
-# ------------------------------------
-# configs/dataset/massroads.yaml
-# ------------------------------------
-# Massachusetts Roads Dataset Configuration
-
-# Dataset root directory
-# root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
-
-# Dataset split mode: "folder" or "kfold"
-split_mode: "folder"  # Uses folder structure for splits
-
-# K-fold configuration (used if split_mode is "kfold")
-# fold: 0  # Current fold
-# num_folds: 3  # Total number of folds
-
-# Split ratios (used if split_mode is "folder" with "source_folder")
-# split_ratios:
-  # train: 0.7
-  # valid: 0.15
-  # test: 0.15
-
-use_splitting: false
-
-# Source folder (used if split_mode is "folder" with split_ratios)
-# source_folder: 'train'
-
-# Batch sizes
-train_batch_size: 64
-val_batch_size: 1  # Usually 1 for full-image validation
-test_batch_size: 1  # Usually 1 for full-image testing
-
-# Patch and crop settings
-patch_size: 512  # Size of training patches
-small_window_size: 8  # Size of window to check for variation
-validate_road_ratio: false  # Validate patch has enough road content
-threshold: 0.05  # Minimum road ratio threshold
-
-# Data loading settings
-num_workers: 4
-pin_memory: true
-
-# Modality settings
-modalities:
-  image: "sat"  # Satellite imagery folder
-  label: "label"  # Road map folder
-  # distance: "distance"  # Distance transform folder
-  sdf: "sdf"  # Signed distance function folder
-
-# Distance transform settings
-# distance_threshold: 20.0
-
-# Signed distance function settings
-sdf_iterations: 3
-sdf_thresholds: [-7, 7]
-
-# Augmentation settings
-augmentations:
-  - "flip_h"
-  - "flip_v"
-  - "rotation"
-
-# Misc settings
-# max_images: null  # No limit (set a number to limit images loaded)
-max_images:  500  # No limit (set a number to limit images loaded)
-# max_attempts: 10  # Maximum attempts for finding valid patches
-save_computed: true  # Save computed distance maps and SDFs
-verbose: false  # Verbose output
-seed: 42  # Random seed
-
-# ------------------------------------
-# configs/model/baseline.yaml
-# ------------------------------------
-# TopoTokens Model Configuration
-
-# Model path and class
-path: "models.base_models"  # Path to the module containing the model
-class: "UNet"  # Name of the model class
-
-# Model parameters
-params:
-  three_dimensional: False
-  m_channels: 32
-  n_convs: 2
-  n_levels: 3
-  dropout: 0.1
-  batch_norm: True
-  upsampling: "bilinear"
-  pooling: "max"
-  in_channels: 3
-  out_channels: 1
-  apply_final_relu: False
-  
 
 # ------------------------------------
 # models/custom_model.py

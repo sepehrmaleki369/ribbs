@@ -96,13 +96,13 @@ class SegLitModule(pl.LightningModule):
         pred_flat = y_hat.flatten()
         gt_flat   = y.flatten()
         # GT statistics
-        self.log("train_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
-        self.log("train_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
-        self.log("train_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        self.log("train_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True, batch_size=x.size(0))
         # Pred statistics
-        self.log("train_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
-        self.log("train_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
-        self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
+        self.log("train_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True, batch_size=x.size(0))
 
 
         return {"loss": loss, "predictions": y_hat, "gts": y}
@@ -151,13 +151,13 @@ class SegLitModule(pl.LightningModule):
         pred_flat = y_hat.flatten()
         gt_flat   = y.flatten()
         # GT statistics
-        self.log("val_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True)
-        self.log("val_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True)
-        self.log("val_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True)
+        self.log("val_mmm/gt_min",   torch.min(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/gt_max",   torch.max(gt_flat),   on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/gt_mean",  torch.mean(gt_flat),  on_step=False, on_epoch=True, batch_size=x.size(0))
         # Pred statistics
-        self.log("val_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True)
-        self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True)
-        self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True)
+        self.log("val_mmm/pred_min", torch.min(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True, batch_size=x.size(0))
 
         return {"predictions": y_hat, "val_loss": loss, "gts": y}
     
