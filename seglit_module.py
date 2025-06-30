@@ -87,7 +87,7 @@ class SegLitModule(pl.LightningModule):
         y_int = y
         for name, metric in self.metrics.items():
             freq = self.train_metric_frequencies.get(name, self.train_freq)
-            if self.current_epoch % freq == 0:
+            if (self.current_epoch+1) % freq == 0:
                 self.log(f"train_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         
@@ -142,7 +142,7 @@ class SegLitModule(pl.LightningModule):
         y_int = y
         for name, metric in self.metrics.items():
             freq = self.val_metric_frequencies.get(name, self.val_freq)
-            if self.current_epoch % freq == 0:
+            if (self.current_epoch+1) % freq == 0:
                 self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         

@@ -189,7 +189,7 @@ class PredictionLogger(Callback):
         self._logged_this_epoch = False
 
     def on_validation_epoch_start(self, trainer, pl_module):
-        if trainer.current_epoch % self.log_every_n_epochs == 0:
+        if (trainer.current_epoch+1) % self.log_every_n_epochs == 0:
             self._reset_buffers()
         else:
             self._logged_this_epoch = True
@@ -202,7 +202,7 @@ class PredictionLogger(Callback):
                                 batch_idx,
                                 dataloader_idx=0):
         if self._logged_this_epoch \
-           or (trainer.current_epoch % self.log_every_n_epochs != 0):
+           or ((trainer.current_epoch+1) % self.log_every_n_epochs != 0):
             return
 
         x       = batch[pl_module.input_key].detach().cpu()
@@ -358,7 +358,7 @@ class BestMetricCheckpoint(Callback):
         
         # Save last checkpoint if requested (with reduced frequency)
         if self.save_last and (
-            trainer.current_epoch % self.last_k == 0 or  # Every k epochs
+            (trainer.current_epoch+1) % self.last_k == 0 or  # Every k epochs
             trainer.current_epoch == trainer.max_epochs - 1  # Last epoch
         ):
             filename = "last.ckpt"

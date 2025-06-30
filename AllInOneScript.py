@@ -312,7 +312,7 @@ class SegLitModule(pl.LightningModule):
         y_int = y
         for name, metric in self.metrics.items():
             freq = self.train_metric_frequencies.get(name, self.train_freq)
-            if self.current_epoch % freq == 0:
+            if (self.current_epoch+1) % freq == 0:
                 self.log(f"train_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         
@@ -367,7 +367,7 @@ class SegLitModule(pl.LightningModule):
         y_int = y
         for name, metric in self.metrics.items():
             freq = self.val_metric_frequencies.get(name, self.val_freq)
-            if self.current_epoch % freq == 0:
+            if (self.current_epoch+1) % freq == 0:
                 self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         
@@ -1280,80 +1280,59 @@ class Validator:
                    patch_size and patch_margin
         """
         self.config = config
-        self.patch_size = config.get("patch_size", [512, 512])
-        self.patch_margin = config.get("patch_margin", [32, 32])
+        self.patch_size   = config.get("patch_size",   [512, 512])
+        self.patch_margin = config.get("patch_margin", [32,  32])
         self.logger = logging.getLogger(__name__)
         
         # Convert to tuples if provided as lists
         if isinstance(self.patch_size, list):
             self.patch_size = tuple(self.patch_size)
-            
         if isinstance(self.patch_margin, list):
             self.patch_margin = tuple(self.patch_margin)
             
         # Ensure patch_size and patch_margin have the same dimensions
         if len(self.patch_size) != len(self.patch_margin):
-            raise ValueError(f"patch_size {self.patch_size} and patch_margin {self.patch_margin} "
-                             f"must have the same number of dimensions")
+            raise ValueError(f"patch_size {self.patch_size} and patch_margin "
+                             f"{self.patch_margin} must have the same number "
+                             f"of dimensions")
     
+    # --------------------------------------------------------------------- #
+    # helpers                                                               #
+    # --------------------------------------------------------------------- #
     def _pad_to_valid_size(self, image: torch.Tensor, divisor: int = 16) -> tuple:
         """
-        Pad image to ensure dimensions are divisible by divisor.
+        Pad image to ensure dimensions are divisible by `divisor`.
         
-        Args:
-            image: Input tensor (N, C, H, W)
-            divisor: Divisor for dimension constraint (default: 16 for UNet with 3-4 levels)
-            
-        Returns:
-            Tuple of (padded_image, (pad_h, pad_w)) where pad_h and pad_w are padding amounts
+        Returns
+        -------
+        image        : padded tensor
+        (pad_h, pad_w): how much was added on bottom / right
         """
         N, C, H, W = image.shape
-        
-        # Calculate required padding
         pad_h = (divisor - H % divisor) % divisor
         pad_w = (divisor - W % divisor) % divisor
-        
-        if pad_h > 0 or pad_w > 0:
-            # Pad with reflection to avoid artifacts
-            image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
-            # self.logger.debug(f"Padded image from ({H}, {W}) to ({H + pad_h}, {W + pad_w})")
-        
+        if pad_h or pad_w:
+            image = F.pad(image, (0, pad_w, 0, pad_h), mode="reflect")
         return image, (pad_h, pad_w)
     
-    def _remove_padding(self, output: torch.Tensor, padding: tuple) -> torch.Tensor:
-        """
-        Remove padding from output tensor.
-        
-        Args:
-            output: Padded output tensor (N, C, H, W)
-            padding: Tuple of (pad_h, pad_w) padding amounts
-            
-        Returns:
-            Unpadded output tensor
-        """
-        pad_h, pad_w = padding
-        
-        if pad_h > 0 or pad_w > 0:
-            if pad_h > 0 and pad_w > 0:
-                output = output[:, :, :-pad_h, :-pad_w]
-            elif pad_h > 0:
-                output = output[:, :, :-pad_h, :]
-            elif pad_w > 0:
-                output = output[:, :, :, :-pad_w]
-        
-        return output
-    
+    # --------------------------------------------------------------------- #
+    # main entry                                                            #
+    # --------------------------------------------------------------------- #
     def run_chunked_inference(
         self,
-        model: nn.Module,
-        image: torch.Tensor,
+        model : nn.Module,
+        image : torch.Tensor,
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
         """
-        Run inference on a large image by processing it in chunks.
-        Pads the full image up to a multiple of 16, then
-        splits into overlapping patches with margin, runs each
-        chunk through the model, and stitches back together.
+        Full-image inference with overlapping tiles.
+
+        1) Pad by `patch_margin` on all four sides (reflect).
+        2) Pad further so H and W are divisible by 16.
+        3) Slide windows of size `patch_size` with stride
+           `patch_size – 2*patch_margin`, call `model`, keep only the
+           inner (centre) region, and stitch into a canvas.
+        4) Remove the /16 pad, then remove the initial margin pad.
         """
         if device is None:
             device = next(model.parameters()).device
@@ -1361,31 +1340,47 @@ class Validator:
         model.eval()
         image = image.to(device)
 
-        # 1) pad the full image so H and W are divisible by 16
-        padded_image, (pad_h, pad_w) = self._pad_to_valid_size(image, divisor=16)
-        N, C, H, W = padded_image.shape
+        # -------------------------------------------------------------- #
+        # (A) FIRST pad by the desired margins so borders get context    #
+        # -------------------------------------------------------------- #
+        mh, mw = self.patch_margin                                   
+        if mh or mw:                                                 
+            image = F.pad(                                           
+                image,                                               
+                pad=(mw, mw, mh, mh),  # (left, right, top, bottom)  
+                mode="reflect",                                      
+            )                                                        
 
-        # 2) figure out how many output channels the model produces
-        #    by running one patch—but *also* pad that patch to 16!
+        # -------------------------------------------------------------- #
+        # (B) SECOND, pad to make H and W divisible by 16               #
+        # -------------------------------------------------------------- #
+        padded_image, (pad_h16, pad_w16) = self._pad_to_valid_size(image, 16)
+        N, C, Hpad, Wpad = padded_image.shape
+
+        # -------------------------------------------------------------- #
+        # (C) Determine #output channels with a dummy forward           #
+        # -------------------------------------------------------------- #
         with torch.no_grad():
-            # define a “test patch” of size (patch_size + 2*margin)
-            test_h = min(H, self.patch_size[0] + 2 * self.patch_margin[0])
-            test_w = min(W, self.patch_size[1] + 2 * self.patch_margin[1])
+            test_h = min(Hpad, self.patch_size[0] + 2 * mh)
+            test_w = min(Wpad, self.patch_size[1] + 2 * mw)
             test_patch = padded_image[:, :, :test_h, :test_w]
-            # pad it so its dims are multiples of 16
-            test_patch, _ = self._pad_to_valid_size(test_patch, divisor=16)
-            test_out = model(test_patch)
-            out_channels = test_out.shape[1]
+            test_patch, _ = self._pad_to_valid_size(test_patch, 16)
+            out_channels = model(test_patch).shape[1]
 
-        # 3) allocate a big “canvas” for all of our outputs
-        output = torch.zeros((N, out_channels, H, W), device=device, dtype=test_out.dtype)
+        # Allocate output canvas (same size as padded_image)
+        output = torch.zeros(
+            (N, out_channels, Hpad, Wpad),
+            device=device,
+            dtype=padded_image.dtype,
+        )
 
-        # 4) define a helper that just calls the model
+        # -------------------------------------------------------------- #
+        # (D) Sliding-window inference                                  #
+        # -------------------------------------------------------------- #
         def _process(chunk: torch.Tensor) -> torch.Tensor:
             with torch.no_grad():
                 return model(chunk)
-
-        # 5) chunk & stitch
+        
         with torch.no_grad():
             output = process_in_chuncks(
                 padded_image,
@@ -1395,9 +1390,19 @@ class Validator:
                 list(self.patch_margin),
             )
 
-        # 6) remove exactly the same padding we added at the top
-        if pad_h > 0 or pad_w > 0:
-            output = output[:, :, : image.shape[2], : image.shape[3]]
+        # -------------------------------------------------------------- #
+        # (E) Remove the /16 pad                                         #
+        # -------------------------------------------------------------- #
+        if pad_h16 or pad_w16:
+            output = output[:, :, : -pad_h16 if pad_h16 else None,
+                                   : -pad_w16 if pad_w16 else None]
+
+        # -------------------------------------------------------------- #
+        # (F) Remove the initial margin pad                              #
+        # -------------------------------------------------------------- #
+        if mh or mw:                                                 
+            output = output[:, :, mh : output.shape[2] - mh,         
+                                   mw : output.shape[3] - mw]       
 
         return output
 
@@ -2936,63 +2941,84 @@ class APLS(nn.Module):
 
 
 # ------------------------------------
-# losses/weigted_mse.py
+# losses/weighted_mse.py
 # ------------------------------------
 import torch
 import torch.nn as nn
 
 class WeightedMSELoss(nn.Module):
+    """
+    Per-pixel MSE with class-dependent weights (e.g. give roads > background).
+
+    Args
+    ----
+    road_weight : float
+        Weight applied to squared errors on road pixels.
+    bg_weight   : float
+        Weight applied to squared errors on background pixels.
+    threshold   : float
+        Threshold that separates “road” from “background” in the SDF.
+    greater_is_one : bool
+        If True, pixels **>= threshold** are treated as road.
+        If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
+    reduction : {'mean', 'sum', 'none'}
+        • 'mean' – divide the *weighted* SSE by the total number of elements  
+          (so when both weights are 1 you recover standard MSE, and
+          changing the class weights doesn’t blow up the loss scale).  
+        • 'sum'  – return the weighted sum of squared errors.  
+        • 'none' – return the full per-pixel tensor.
+    """
+
     def __init__(
         self,
         road_weight: float = 5.0,
-        bg_weight: float = 1.0,
-        threshold: float = 0.0,
+        bg_weight:   float = 1.0,
+        threshold:   float = 0.0,
         greater_is_one: bool = False,
-        reduction: str = 'mean'
+        reduction: str = "mean",
     ):
-        """
-        road_weight:      weight for predicted errors on road pixels
-        bg_weight:        weight for predicted errors on background pixels
-        threshold:        SDF threshold to split road vs bg
-        greater_is_one:   if True, pixels >= threshold are road; else pixels < threshold are road
-        reduction:        'mean' | 'sum' | 'none'
-        """
         super().__init__()
-        self.road_weight = road_weight
-        self.bg_weight = bg_weight
-        self.threshold = threshold
-        self.greater_is_one = greater_is_one
-        self.reduction = reduction
+        self.road_weight   = float(road_weight)
+        self.bg_weight     = float(bg_weight)
+        self.threshold     = float(threshold)
+        self.greater_is_one = bool(greater_is_one)
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.reduction     = reduction
 
-    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor):
+    # ------------------------------------------------------------------ #
+    # forward                                                             #
+    # ------------------------------------------------------------------ #
+    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor) -> torch.Tensor:
         """
-        y_pred:     model output (same shape as y_true_sdf)
-        y_true_sdf: signed-distance map (float tensor, negative=road if greater_is_one=False)
+        Parameters
+        ----------
+        y_pred      : Tensor (N, 1, H, W)  – model output SDF
+        y_true_sdf  : Tensor (N, 1, H, W)  – ground-truth signed-distance map
+
+        Returns
+        -------
+        Tensor
+            A scalar (for 'mean' / 'sum') or a tensor shaped like the input (for 'none').
         """
-        # 1) build binary road mask based on threshold & direction
+
+        # 1) build per-pixel weights
         if self.greater_is_one:
-            # road where y_true_sdf >= threshold
-            road_mask = (y_true_sdf >= self.threshold).to(y_pred.dtype)
+            is_road = (y_true_sdf >= self.threshold)
         else:
-            # road where y_true_sdf < threshold
-            road_mask = (y_true_sdf < self.threshold).to(y_pred.dtype)
+            is_road = (y_true_sdf <  self.threshold)
+        weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
 
-        # 2) build weight map
-        weight = road_mask * self.road_weight + (1 - road_mask) * self.bg_weight
+        # 2) weighted squared error
+        wse = (y_pred - y_true_sdf) ** 2 * weight
 
-        # 3) compute squared error
-        se = (y_pred - y_true_sdf) ** 2
-
-        # 4) apply weights
-        wse = se * weight
-
-        # 5) reduce
-        if self.reduction == 'mean':
-            # normalize by total weight
-            return wse.sum() / weight.sum()
-        elif self.reduction == 'sum':
+        # 3) reduction
+        if self.reduction == "mean":
+            # divide by the *number of elements* so scale matches plain MSE
+            return wse.sum() / y_pred.numel()
+        elif self.reduction == "sum":
             return wse.sum()
-        else:  # 'none'
+        else:                       # 'none'
             return wse
 
 
@@ -3285,7 +3311,7 @@ metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 
 # Output directory
-output_dir: "outputs/baseline_unet_massroads_500dp"
+output_dir: "outputs/base_sdf_mass_500dp"
 
 # Trainer configuration
 trainer:
@@ -3406,13 +3432,16 @@ val_frequencies:     {dice: 1,  iou: 1,  ccq: 10,  apls: 10}
 # Primary loss (used from the beginning)
 primary_loss:
   path: "losses.weighted_mse"
-  class: "MSELoss"  # Built-in PyTorch loss
+  class: "WeightedMSELoss"
   params:
-    road_weight: 5
+    road_weight: 4
     bg_weight: 1
     threshold: 0
     greater_is_one: False
-    reduction: sum
+    reduction: mean
+
+  # class: "MSELoss"  # Built-in PyTorch loss
+  # params: {}
 
 # # Secondary loss (activated after start_epoch)
 secondary_loss:
@@ -3454,8 +3483,8 @@ patch_margin: [100, 100]
 # Massachusetts Roads Dataset Configuration
 
 # Dataset root directory
-root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-# root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
+# root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
 
 # Dataset split mode: "folder" or "kfold"
 split_mode: "folder"  # Uses folder structure for splits
@@ -3512,7 +3541,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images:  2 #500  # No limit (set a number to limit images loaded)
+max_images:  500  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: true  # Save computed distance maps and SDFs
 verbose: false  # Verbose output
