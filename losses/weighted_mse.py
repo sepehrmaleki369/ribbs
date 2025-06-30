@@ -13,7 +13,7 @@ class WeightedMSELoss(nn.Module):
         Weight applied to squared errors on background pixels.
     threshold   : float
         Threshold that separates “road” from “background” in the SDF.
-    greater_is_one : bool
+    greater_is_road : bool
         If True, pixels **>= threshold** are treated as road.
         If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
     reduction : {'mean', 'sum', 'none'}
@@ -29,14 +29,14 @@ class WeightedMSELoss(nn.Module):
         road_weight: float = 5.0,
         bg_weight:   float = 1.0,
         threshold:   float = 0.0,
-        greater_is_one: bool = False,
+        greater_is_road: bool = False,
         reduction: str = "mean",
     ):
         super().__init__()
         self.road_weight   = float(road_weight)
         self.bg_weight     = float(bg_weight)
         self.threshold     = float(threshold)
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
         if reduction not in ("mean", "sum", "none"):
             raise ValueError("reduction must be 'mean', 'sum', or 'none'")
         self.reduction     = reduction
@@ -58,10 +58,10 @@ class WeightedMSELoss(nn.Module):
         """
 
         # 1) build per-pixel weights
-        if self.greater_is_one:
-            is_road = (y_true_sdf >= self.threshold)
+        if self.greater_is_road:
+            is_road = (y_true_sdf > self.threshold)
         else:
-            is_road = (y_true_sdf <  self.threshold)
+            is_road = (y_true_sdf <=  self.threshold)
         weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
 
         # 2) weighted squared error

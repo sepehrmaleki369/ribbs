@@ -28,7 +28,7 @@ class ConnectedComponentsQuality(nn.Module):
         tolerance: int = 2,
         alpha: float = 0.5,
         threshold: float = 0.5,
-        greater_is_one=True,
+        greater_is_road=True,
         eps: float = 1e-8,
     ):
         """
@@ -47,11 +47,11 @@ class ConnectedComponentsQuality(nn.Module):
         self.alpha = alpha
         self.threshold = threshold
         self.eps = eps
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
     
     def _bin(self, arr: np.ndarray) -> np.ndarray:
-        return (arr >  self.threshold) if self.greater_is_one else \
-               (arr <  self.threshold)
+        return (arr >  self.threshold) if self.greater_is_road else \
+               (arr <=  self.threshold)
     
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """

@@ -17,20 +17,20 @@ class ThresholdedIoUMetric(nn.Module):
         eps = 1e-6,
         multiclass = False,
         zero_division = 1.0,
-        greater_is_one=True
+        greater_is_road=True
     ):
         super().__init__()
         self.threshold     = float(threshold)
         self.eps           = float(eps)
         self.multiclass    = bool(multiclass)
         self.zero_division = float(zero_division)
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
 
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.greater_is_one:
+        if self.greater_is_road:
             return (x >  self.threshold).float()
         else:
-            return (x <  self.threshold).float()
+            return (x <=  self.threshold).float()
         
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         # Ensure shape (N, C, H, W)

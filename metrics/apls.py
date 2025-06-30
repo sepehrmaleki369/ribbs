@@ -13,9 +13,9 @@ def compute_batch_apls(
     max_snap_dist=4,
     allow_renaming=True,
     min_path_length=10,
-    greater_is_one=True
+    greater_is_road=True
 ):
-    def _bin(x): return (x > threshold) if greater_is_one else (x < threshold)
+    def _bin(x): return (x > threshold) if greater_is_road else (x <= threshold)
 
     # --- convert to numpy if needed ---
     if torch.is_tensor(gt_masks):
@@ -79,7 +79,7 @@ class APLS(nn.Module):
         max_snap_dist=4,
         allow_renaming=True,
         min_path_length=10,
-        greater_is_one=True
+        greater_is_road=True
     ):
         super().__init__()
         self.threshold = threshold
@@ -88,7 +88,7 @@ class APLS(nn.Module):
         self.max_snap_dist = max_snap_dist
         self.allow_renaming = allow_renaming
         self.min_path_length = min_path_length
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         scores = compute_batch_apls(
@@ -100,6 +100,6 @@ class APLS(nn.Module):
             max_snap_dist=self.max_snap_dist,
             allow_renaming=self.allow_renaming,
             min_path_length=self.min_path_length,
-            greater_is_one=self.greater_is_one,
+            greater_is_road=self.greater_is_road,
         )
         return torch.tensor(scores.mean(), device=y_pred.device)

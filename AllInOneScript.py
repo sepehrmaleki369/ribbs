@@ -2515,7 +2515,7 @@ class ConnectedComponentsQuality(nn.Module):
         tolerance: int = 2,
         alpha: float = 0.5,
         threshold: float = 0.5,
-        greater_is_one=True,
+        greater_is_road=True,
         eps: float = 1e-8,
     ):
         """
@@ -2534,10 +2534,10 @@ class ConnectedComponentsQuality(nn.Module):
         self.alpha = alpha
         self.threshold = threshold
         self.eps = eps
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
     
     def _bin(self, arr: np.ndarray) -> np.ndarray:
-        return (arr >  self.threshold) if self.greater_is_one else \
+        return (arr >  self.threshold) if self.greater_is_road else \
                (arr <  self.threshold)
     
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -2687,7 +2687,7 @@ class ThresholdedDiceMetric(nn.Module):
         eps=1e-6,
         multiclass=False,
         zero_division=1.0,
-        greater_is_one=True
+        greater_is_road=True
     ):
         super().__init__()
         # Force numerical types
@@ -2695,10 +2695,10 @@ class ThresholdedDiceMetric(nn.Module):
         self.eps           = float(eps)
         self.multiclass    = bool(multiclass)
         self.zero_division = float(zero_division)
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
 
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.greater_is_one:
+        if self.greater_is_road:
             return (x >  self.threshold).float()
         else:
             return (x <  self.threshold).float()
@@ -2769,17 +2769,17 @@ class ThresholdedIoUMetric(nn.Module):
         eps = 1e-6,
         multiclass = False,
         zero_division = 1.0,
-        greater_is_one=True
+        greater_is_road=True
     ):
         super().__init__()
         self.threshold     = float(threshold)
         self.eps           = float(eps)
         self.multiclass    = bool(multiclass)
         self.zero_division = float(zero_division)
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
 
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.greater_is_one:
+        if self.greater_is_road:
             return (x >  self.threshold).float()
         else:
             return (x <  self.threshold).float()
@@ -2848,9 +2848,9 @@ def compute_batch_apls(
     max_snap_dist=4,
     allow_renaming=True,
     min_path_length=10,
-    greater_is_one=True
+    greater_is_road=True
 ):
-    def _bin(x): return (x > threshold) if greater_is_one else (x < threshold)
+    def _bin(x): return (x > threshold) if greater_is_road else (x < threshold)
 
     # --- convert to numpy if needed ---
     if torch.is_tensor(gt_masks):
@@ -2914,7 +2914,7 @@ class APLS(nn.Module):
         max_snap_dist=4,
         allow_renaming=True,
         min_path_length=10,
-        greater_is_one=True
+        greater_is_road=True
     ):
         super().__init__()
         self.threshold = threshold
@@ -2923,7 +2923,7 @@ class APLS(nn.Module):
         self.max_snap_dist = max_snap_dist
         self.allow_renaming = allow_renaming
         self.min_path_length = min_path_length
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         scores = compute_batch_apls(
@@ -2935,7 +2935,7 @@ class APLS(nn.Module):
             max_snap_dist=self.max_snap_dist,
             allow_renaming=self.allow_renaming,
             min_path_length=self.min_path_length,
-            greater_is_one=self.greater_is_one,
+            greater_is_road=self.greater_is_road,
         )
         return torch.tensor(scores.mean(), device=y_pred.device)
 
@@ -2958,7 +2958,7 @@ class WeightedMSELoss(nn.Module):
         Weight applied to squared errors on background pixels.
     threshold   : float
         Threshold that separates “road” from “background” in the SDF.
-    greater_is_one : bool
+    greater_is_road : bool
         If True, pixels **>= threshold** are treated as road.
         If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
     reduction : {'mean', 'sum', 'none'}
@@ -2974,14 +2974,14 @@ class WeightedMSELoss(nn.Module):
         road_weight: float = 5.0,
         bg_weight:   float = 1.0,
         threshold:   float = 0.0,
-        greater_is_one: bool = False,
+        greater_is_road: bool = False,
         reduction: str = "mean",
     ):
         super().__init__()
         self.road_weight   = float(road_weight)
         self.bg_weight     = float(bg_weight)
         self.threshold     = float(threshold)
-        self.greater_is_one = bool(greater_is_one)
+        self.greater_is_road = bool(greater_is_road)
         if reduction not in ("mean", "sum", "none"):
             raise ValueError("reduction must be 'mean', 'sum', or 'none'")
         self.reduction     = reduction
@@ -3003,7 +3003,7 @@ class WeightedMSELoss(nn.Module):
         """
 
         # 1) build per-pixel weights
-        if self.greater_is_one:
+        if self.greater_is_road:
             is_road = (y_true_sdf >= self.threshold)
         else:
             is_road = (y_true_sdf <  self.threshold)
@@ -3380,7 +3380,7 @@ metrics:
     class: ThresholdedDiceMetric
     params:
       threshold: 0          # 0 splits neg/pos
-      greater_is_one: false # neg < 0  -> road = 1
+      greater_is_road: false # neg < 0  -> road = 1
       eps: 1e-6
       multiclass: false
       zero_division: 1.0
@@ -3391,7 +3391,7 @@ metrics:
     class: ThresholdedIoUMetric
     params:
       threshold: 0
-      greater_is_one: false
+      greater_is_road: false
       eps: 1e-6
       multiclass: false     
       zero_division: 1.0
@@ -3404,7 +3404,7 @@ metrics:
       min_size: 5
       tolerance: 5           # centroid distance in px
       threshold: 0
-      greater_is_one: false
+      greater_is_road: false
 
   # APLS
   - alias: apls
@@ -3412,7 +3412,7 @@ metrics:
     class: APLS
     params:
       threshold: 0
-      greater_is_one: false
+      greater_is_road: false
       angle_range: [135, 225]
       max_nodes: 1000
       max_snap_dist: 25
@@ -3437,7 +3437,7 @@ primary_loss:
     road_weight: 4
     bg_weight: 1
     threshold: 0
-    greater_is_one: False
+    greater_is_road: False
     reduction: mean
 
   # class: "MSELoss"  # Built-in PyTorch loss

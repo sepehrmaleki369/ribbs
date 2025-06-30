@@ -8,7 +8,7 @@ primary_loss:
     road_weight: 4
     bg_weight: 1
     threshold: 0
-    greater_is_one: False
+    greater_is_road: False
     reduction: mean
 
   # class: "MSELoss"  # Built-in PyTorch loss
