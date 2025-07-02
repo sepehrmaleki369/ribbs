@@ -1,8 +1,8 @@
 # Massachusetts Roads Dataset Configuration
 
 # Dataset root directory
-# root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
+root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+# root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
 
 # Dataset split mode: "folder" or "kfold"
 split_mode: "folder"  # Uses folder structure for splits
@@ -59,7 +59,7 @@ augmentations:
 
 # Misc settings
 # max_images: null  # No limit (set a number to limit images loaded)
-max_images:  640  # No limit (set a number to limit images loaded)
+max_images: 2 #640  # No limit (set a number to limit images loaded)
 # max_attempts: 10  # Maximum attempts for finding valid patches
 save_computed: true  # Save computed distance maps and SDFs
 verbose: false  # Verbose output

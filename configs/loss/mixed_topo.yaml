@@ -12,6 +12,7 @@ primary_loss:
     freeze_after_first: False
     reduction: "mean"
 
+  # path: "losses.weighted_mse"
   # class: "WeightedMSELoss"
   # params:
   #   road_weight: 4
@@ -25,17 +26,17 @@ primary_loss:
 
 # # Secondary loss (activated after start_epoch)
 secondary_loss:
-  path: "losses.chamfer_class"  # Path to the module containing the loss
-  class: "ChamferBoundarySDFLoss"  # Name of the loss class
+  path: "losses.vectorized_chamfer"  # Path to the module containing the loss
+  class: "ChamferBoundarySDFLossVec"  # Name of the loss class
   params:
-    update_scale: 1.0
-    dist_threshold: 3.0
-    w_inject: 1.0
-    w_pixel: 1.0
+    update_scale: 1.0     # scale applied to the gradient projection
+    dist_threshold: 3.0   # max distance (in pixels) to consider a match
+    w_inject: 1.0         # weight for the “inject” term
+    w_pixel: 1.0          # weight for the “pixel” term
 
 # # Mixing parameters
-alpha: 1  # Weight for the secondary loss (0 to 1)
-start_epoch: 10000  # Epoch to start using the secondary loss
+alpha: 0.5  # Weight for the secondary loss (0 to 1)
+start_epoch: 3020  # Epoch to start using the secondary loss
 
 
 
