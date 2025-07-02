@@ -57,7 +57,7 @@ class MixedLoss(nn.Module):
         """
         self.current_epoch = epoch
     
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Calculate the mixed loss.
         
@@ -68,12 +68,10 @@ class MixedLoss(nn.Module):
         Returns:
             Tensor containing the calculated loss
         """
-        primary_loss_value = self.primary_loss(y_pred, y_true)
-        
-        # If secondary loss is not configured or hasn't been activated yet, return only primary loss
+        p = self.primary_loss(y_pred, y_true)
         if self.secondary_loss is None or self.current_epoch < self.start_epoch:
-            return primary_loss_value
-        
-        # Calculate mixed loss
-        secondary_loss_value = self.secondary_loss(y_pred, y_true)
-        return (1 - self.alpha) * primary_loss_value + self.alpha * secondary_loss_value
+            s = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+        else:
+            s = self.secondary_loss(y_pred, y_true)
+        m = (1 - self.alpha) * p + self.alpha * s
+        return {"primary": p, "secondary": s, "mixed": m}

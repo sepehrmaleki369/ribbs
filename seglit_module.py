@@ -73,16 +73,23 @@ class SegLitModule(pl.LightningModule):
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
         y_hat = self(x)
-        loss = self.loss_fn(y_hat, y)
+        # loss = self.loss_fn(y_hat, y)
+        loss_dict = self.loss_fn(y_hat, y)
+        # combined
+        self.log("train_loss", loss_dict["mixed"],
+                prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+        # components
+        self.log("train_loss/primary",   loss_dict["primary"],
+                prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("train_loss/secondary", loss_dict["secondary"],
+                prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+
 
         # self._train_preds.append(y_hat.detach().flatten())
         # self._train_gts.append(  y.detach().flatten())
         # print(f"[Train]  x.shape={x.shape}, y.shape={y.shape}")
         # print(f"[Train] y_hat.shape={y_hat.shape}")
         # print(f"[Train] loss computed on y_hat of shape {y_hat.shape} and y of shape {y.shape}")
-
-        self.log("train_loss", loss,
-                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
 
         y_int = y
         for name, metric in self.metrics.items():
@@ -105,7 +112,7 @@ class SegLitModule(pl.LightningModule):
         self.log("train_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True, batch_size=x.size(0))
 
 
-        return {"loss": loss, "predictions": y_hat, "gts": y}
+        return {"loss": loss_dict["mixed"], "predictions": y_hat, "gts": y}
     
     # def on_train_epoch_end(self):
     #     # concatenate everything
@@ -129,15 +136,23 @@ class SegLitModule(pl.LightningModule):
         with torch.no_grad():
             y_hat = self.validator.run_chunked_inference(self.model, x)
 
-        loss = self.loss_fn(y_hat, y)
+        # loss = self.loss_fn(y_hat, y)
+        loss_dict = self.loss_fn(y_hat, y)
+        # combined
+        self.log("val_loss", loss_dict["mixed"],
+                prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+        # components
+        self.log("val_loss/primary",   loss_dict["primary"],
+                prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("val_loss/secondary", loss_dict["secondary"],
+                prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+
 
         # self._val_preds.append(y_hat.detach().flatten())
         # self._val_gts  .append(y.detach().flatten())
         # print(f"[Val]  x.shape={x.shape}, y.shape={y.shape}")
         # print(f"[Val] y_hat.shape={y_hat.shape}")
         # print(f"[Val] loss computed on y_hat of shape {y_hat.shape} and y of shape {y.shape}")
-        self.log("val_loss", loss,
-                 prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
         y_int = y
         for name, metric in self.metrics.items():
@@ -159,7 +174,7 @@ class SegLitModule(pl.LightningModule):
         self.log("val_mmm/pred_max", torch.max(pred_flat), on_step=False, on_epoch=True, batch_size=x.size(0))
         self.log("val_mmm/pred_mean",torch.mean(pred_flat),on_step=False, on_epoch=True, batch_size=x.size(0))
 
-        return {"predictions": y_hat, "val_loss": loss, "gts": y}
+        return {"predictions": y_hat, "val_loss": loss_dict["mixed"], "gts": y}
     
     # def on_validation_epoch_end(self):
     #     preds = torch.cat(self._val_preds, dim=0)
@@ -177,16 +192,23 @@ class SegLitModule(pl.LightningModule):
         with torch.no_grad():
             y_hat = self.validator.run_chunked_inference(self.model, x)
 
-        loss = self.loss_fn(y_hat, y)
-        self.log("test_loss", loss,
-                 prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        # loss = self.loss_fn(y_hat, y)
+        loss_dict = self.loss_fn(y_hat, y)
+        # combined
+        self.log("test_loss", loss_dict["mixed"],
+                prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
+        # components
+        self.log("test_loss/primary",   loss_dict["primary"],
+                prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+        self.log("test_loss/secondary", loss_dict["secondary"],
+                prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
 
         y_int = y
         for name, metric in self.metrics.items():
             self.log(f"test_metrics/{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        return {"predictions": y_hat, "test_loss": loss, "gts": y}
+        return {"predictions": y_hat, "test_loss": loss_dict["mixed"], "gts": y}
 
     def configure_optimizers(self):
         Opt = getattr(torch.optim, self.opt_cfg["name"])
