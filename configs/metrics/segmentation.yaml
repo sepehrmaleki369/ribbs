@@ -28,7 +28,7 @@ metrics:
 
   # Connected-components quality
   - alias: ccq
-    path: metrics.connected_components
+    path: metrics.ccq
     class: ConnectedComponentsQuality
     params:
       min_size: 15

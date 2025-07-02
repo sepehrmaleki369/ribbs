@@ -400,7 +400,7 @@ metrics:
 
   # Connected Components Quality
   - alias: "ccq"
-    path: "metrics.connected_components"
+    path: "metrics.ccq"
     class: "ConnectedComponentsQuality"
     params:
       min_size: 5
