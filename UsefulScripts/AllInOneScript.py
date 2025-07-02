@@ -2503,189 +2503,6 @@ __all__ = [
 ]
 
 # ------------------------------------
-# metrics/connected_components.py
-# ------------------------------------
-"""
-Connected Components Quality (CCQ) metric for segmentation.
-
-This module provides a metric that evaluates segmentation quality based on
-" "the quality of connected components in the prediction compared to ground truth.
-" "Supports both binary masks and continuous distance-map outputs via a threshold.
-"""
-
-import torch
-import torch.nn as nn
-import numpy as np
-from skimage import measure
-from typing import List, Tuple, Set
-
-
-class ConnectedComponentsQuality(nn.Module):
-    """
-    Connected Components Quality (CCQ) metric for evaluating segmentation quality.
-    
-    This metric considers both detection and shape accuracy of connected components
-    in the predicted segmentation compared to the ground truth. It supports binary
-    outputs as well as continuous-valued maps via a configurable threshold.
-    """
-    
-    def __init__(
-        self,
-        min_size: int = 5,
-        tolerance: int = 2,
-        alpha: float = 0.5,
-        threshold: float = 0.5,
-        greater_is_road=True,
-        eps: float = 1e-8,
-    ):
-        """
-        Initialize the CCQ metric.
-        
-        Args:
-            min_size: Minimum component size to consider
-            tolerance: Pixel tolerance for component matching
-            alpha: Weight between detection score and shape score (0 to 1)
-            threshold: Scalar threshold for binarizing predictions and ground truth
-            eps: Small constant for numerical stability
-        """
-        super().__init__()
-        self.min_size = min_size
-        self.tolerance = tolerance
-        self.alpha = alpha
-        self.threshold = threshold
-        self.eps = eps
-        self.greater_is_road = bool(greater_is_road)
-    
-    def _bin(self, arr: np.ndarray) -> np.ndarray:
-        return (arr >  self.threshold) if self.greater_is_road else \
-               (arr <=  self.threshold)
-    
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the CCQ metric between predicted and ground truth masks.
-        
-        Args:
-            y_pred: Predicted maps (B, 1, H, W), e.g., logits, probability maps,
-                    or signed/unsigned distance maps
-            y_true: Ground truth masks or continuous maps (B, 1, H, W)
-        
-        Returns:
-            Tensor containing the CCQ score (higher is better)
-        """
-        # Process each item in the batch
-        batch_size = y_pred.shape[0]
-        scores = []
-        
-        for i in range(batch_size):
-            # Binarize predictions and ground truth via threshold
-            pred = self._bin(y_pred[i, 0].detach().cpu().numpy()).astype(np.uint8)
-            true = self._bin(y_true[i, 0].detach().cpu().numpy()).astype(np.uint8)
-            
-            # Skip empty ground truth masks
-            if np.sum(true) == 0:
-                if np.sum(pred) == 0:
-                    scores.append(1.0)  # Both empty - perfect match
-                else:
-                    scores.append(0.0)  # True empty but pred not - no match
-                continue
-            
-            # Find connected components
-            true_labels = measure.label(true, connectivity=2)
-            pred_labels = measure.label(pred, connectivity=2)
-            
-            true_props = measure.regionprops(true_labels)
-            pred_props = measure.regionprops(pred_labels)
-            
-            # Filter out small components
-            true_props = [prop for prop in true_props if prop.area >= self.min_size]
-            pred_props = [prop for prop in pred_props if prop.area >= self.min_size]
-            
-            # Handle cases with no significant components
-            if not true_props:
-                if not pred_props:
-                    scores.append(1.0)
-                else:
-                    scores.append(0.0)
-                continue
-            if not pred_props:
-                scores.append(0.0)
-                continue
-            
-            # Match components
-            matches = self._match_components(true_props, pred_props)
-            
-            # Detection score = TP / (TP + FP + FN)
-            tp = len(matches)
-            fp = max(0, len(pred_props) - tp)
-            fn = max(0, len(true_props) - tp)
-            detection_score = tp / (tp + fp + fn + self.eps)
-            
-            # Shape score = mean IoU of matched components
-            shape_scores = []
-            for true_idx, pred_idx in matches:
-                true_mask = (true_labels == true_props[true_idx].label).astype(np.uint8)
-                pred_mask = (pred_labels == pred_props[pred_idx].label).astype(np.uint8)
-                intersection = np.sum(true_mask & pred_mask)
-                union = np.sum(true_mask | pred_mask)
-                iou = intersection / (union + self.eps)
-                shape_scores.append(iou)
-            
-            shape_score = np.mean(shape_scores) if shape_scores else 0.0
-            
-            # Combined CCQ score
-            combined_score = self.alpha * detection_score + (1 - self.alpha) * shape_score
-            scores.append(combined_score)
-        
-        # Return mean score over batch
-        return torch.tensor(sum(scores) / batch_size, device=y_pred.device)
-    
-    def _match_components(
-        self,
-        true_props: List[object],
-        pred_props: List[object]
-    ) -> List[Tuple[int, int]]:
-        """
-        Match predicted components to ground truth components.
-        
-        This uses a greedy approach based on centroid distance.
-        
-        Args:
-            true_props: List of ground truth region properties
-            pred_props: List of predicted region properties
-        
-        Returns:
-            List of (true_idx, pred_idx) matches
-        """
-        matches = []
-        used_pred: Set[int] = set()
-        
-        for true_idx, true_prop in enumerate(true_props):
-            best_dist = float('inf')
-            best_pred_idx = None
-            true_centroid = true_prop.centroid
-            
-            for pred_idx, pred_prop in enumerate(pred_props):
-                if pred_idx in used_pred:
-                    continue
-                pred_centroid = pred_prop.centroid
-                
-                # Calculate Euclidean distancebetween centroids
-                dist = np.sqrt(
-                    (true_centroid[0] - pred_centroid[0])**2 + 
-                    (true_centroid[1] - pred_centroid[1])**2
-                )
-                if dist < best_dist and dist <= self.tolerance:
-                    best_dist = dist
-                    best_pred_idx = pred_idx
-            
-            if best_pred_idx is not None:
-                matches.append((true_idx, best_pred_idx))
-                used_pred.add(best_pred_idx)
-        
-        return matches
-
-
-# ------------------------------------
 # metrics/dice.py
 # ------------------------------------
 import torch
@@ -2961,85 +2778,186 @@ class APLS(nn.Module):
 
 
 # ------------------------------------
-# losses/weighted_mse.py
+# metrics/ccq.py
 # ------------------------------------
+"""
+Connected Components Quality (CCQ) metric for segmentation.
+
+This module provides a metric that evaluates segmentation quality based on
+" "the quality of connected components in the prediction compared to ground truth.
+" "Supports both binary masks and continuous distance-map outputs via a threshold.
+"""
+
 import torch
 import torch.nn as nn
+import numpy as np
+from skimage import measure
+from typing import List, Tuple, Set
 
-class WeightedMSELoss(nn.Module):
+
+class ConnectedComponentsQuality(nn.Module):
     """
-    Per-pixel MSE with class-dependent weights (e.g. give roads > background).
-
-    Args
-    ----
-    road_weight : float
-        Weight applied to squared errors on road pixels.
-    bg_weight   : float
-        Weight applied to squared errors on background pixels.
-    threshold   : float
-        Threshold that separates “road” from “background” in the SDF.
-    greater_is_road : bool
-        If True, pixels **>= threshold** are treated as road.
-        If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
-    reduction : {'mean', 'sum', 'none'}
-        • 'mean' – divide the *weighted* SSE by the total number of elements  
-          (so when both weights are 1 you recover standard MSE, and
-          changing the class weights doesn’t blow up the loss scale).  
-        • 'sum'  – return the weighted sum of squared errors.  
-        • 'none' – return the full per-pixel tensor.
+    Connected Components Quality (CCQ) metric for evaluating segmentation quality.
+    
+    This metric considers both detection and shape accuracy of connected components
+    in the predicted segmentation compared to the ground truth. It supports binary
+    outputs as well as continuous-valued maps via a configurable threshold.
     """
-
+    
     def __init__(
         self,
-        road_weight: float = 5.0,
-        bg_weight:   float = 1.0,
-        threshold:   float = 0.0,
-        greater_is_road: bool = False,
-        reduction: str = "mean",
+        min_size: int = 5,
+        tolerance: int = 2,
+        alpha: float = 0.5,
+        threshold: float = 0.5,
+        greater_is_road=True,
+        eps: float = 1e-8,
     ):
+        """
+        Initialize the CCQ metric.
+        
+        Args:
+            min_size: Minimum component size to consider
+            tolerance: Pixel tolerance for component matching
+            alpha: Weight between detection score and shape score (0 to 1)
+            threshold: Scalar threshold for binarizing predictions and ground truth
+            eps: Small constant for numerical stability
+        """
         super().__init__()
-        self.road_weight   = float(road_weight)
-        self.bg_weight     = float(bg_weight)
-        self.threshold     = float(threshold)
+        self.min_size = min_size
+        self.tolerance = tolerance
+        self.alpha = alpha
+        self.threshold = threshold
+        self.eps = eps
         self.greater_is_road = bool(greater_is_road)
-        if reduction not in ("mean", "sum", "none"):
-            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
-        self.reduction     = reduction
-
-    # ------------------------------------------------------------------ #
-    # forward                                                             #
-    # ------------------------------------------------------------------ #
-    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor) -> torch.Tensor:
+    
+    def _bin(self, arr: np.ndarray) -> np.ndarray:
+        return (arr >  self.threshold) if self.greater_is_road else \
+               (arr <=  self.threshold)
+    
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
-        Parameters
-        ----------
-        y_pred      : Tensor (N, 1, H, W)  – model output SDF
-        y_true_sdf  : Tensor (N, 1, H, W)  – ground-truth signed-distance map
-
-        Returns
-        -------
-        Tensor
-            A scalar (for 'mean' / 'sum') or a tensor shaped like the input (for 'none').
+        Compute the CCQ metric between predicted and ground truth masks.
+        
+        Args:
+            y_pred: Predicted maps (B, 1, H, W), e.g., logits, probability maps,
+                    or signed/unsigned distance maps
+            y_true: Ground truth masks or continuous maps (B, 1, H, W)
+        
+        Returns:
+            Tensor containing the CCQ score (higher is better)
         """
-
-        # 1) build per-pixel weights
-        if self.greater_is_road:
-            is_road = (y_true_sdf > self.threshold)
-        else:
-            is_road = (y_true_sdf <=  self.threshold)
-        weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
-
-        # 2) weighted squared error
-        wse = (y_pred - y_true_sdf) ** 2 * weight
-
-        # 3) reduction
-        if self.reduction == "mean":
-            # divide by the *number of elements* so scale matches plain MSE
-            return wse.sum() / y_pred.numel()
-        elif self.reduction == "sum":
-            return wse.sum()
-        else:                       # 'none'
-            return wse
+        # Process each item in the batch
+        batch_size = y_pred.shape[0]
+        scores = []
+        
+        for i in range(batch_size):
+            # Binarize predictions and ground truth via threshold
+            pred = self._bin(y_pred[i, 0].detach().cpu().numpy()).astype(np.uint8)
+            true = self._bin(y_true[i, 0].detach().cpu().numpy()).astype(np.uint8)
+            
+            # Skip empty ground truth masks
+            if np.sum(true) == 0:
+                if np.sum(pred) == 0:
+                    scores.append(1.0)  # Both empty - perfect match
+                else:
+                    scores.append(0.0)  # True empty but pred not - no match
+                continue
+            
+            # Find connected components
+            true_labels = measure.label(true, connectivity=2)
+            pred_labels = measure.label(pred, connectivity=2)
+            
+            true_props = measure.regionprops(true_labels)
+            pred_props = measure.regionprops(pred_labels)
+            
+            # Filter out small components
+            true_props = [prop for prop in true_props if prop.area >= self.min_size]
+            pred_props = [prop for prop in pred_props if prop.area >= self.min_size]
+            
+            # Handle cases with no significant components
+            if not true_props:
+                if not pred_props:
+                    scores.append(1.0)
+                else:
+                    scores.append(0.0)
+                continue
+            if not pred_props:
+                scores.append(0.0)
+                continue
+            
+            # Match components
+            matches = self._match_components(true_props, pred_props)
+            
+            # Detection score = TP / (TP + FP + FN)
+            tp = len(matches)
+            fp = max(0, len(pred_props) - tp)
+            fn = max(0, len(true_props) - tp)
+            detection_score = tp / (tp + fp + fn + self.eps)
+            
+            # Shape score = mean IoU of matched components
+            shape_scores = []
+            for true_idx, pred_idx in matches:
+                true_mask = (true_labels == true_props[true_idx].label).astype(np.uint8)
+                pred_mask = (pred_labels == pred_props[pred_idx].label).astype(np.uint8)
+                intersection = np.sum(true_mask & pred_mask)
+                union = np.sum(true_mask | pred_mask)
+                iou = intersection / (union + self.eps)
+                shape_scores.append(iou)
+            
+            shape_score = np.mean(shape_scores) if shape_scores else 0.0
+            
+            # Combined CCQ score
+            combined_score = self.alpha * detection_score + (1 - self.alpha) * shape_score
+            scores.append(combined_score)
+        
+        # Return mean score over batch
+        return torch.tensor(sum(scores) / batch_size, device=y_pred.device)
+    
+    def _match_components(
+        self,
+        true_props: List[object],
+        pred_props: List[object]
+    ) -> List[Tuple[int, int]]:
+        """
+        Match predicted components to ground truth components.
+        
+        This uses a greedy approach based on centroid distance.
+        
+        Args:
+            true_props: List of ground truth region properties
+            pred_props: List of predicted region properties
+        
+        Returns:
+            List of (true_idx, pred_idx) matches
+        """
+        matches = []
+        used_pred: Set[int] = set()
+        
+        for true_idx, true_prop in enumerate(true_props):
+            best_dist = float('inf')
+            best_pred_idx = None
+            true_centroid = true_prop.centroid
+            
+            for pred_idx, pred_prop in enumerate(pred_props):
+                if pred_idx in used_pred:
+                    continue
+                pred_centroid = pred_prop.centroid
+                
+                # Calculate Euclidean distancebetween centroids
+                dist = np.sqrt(
+                    (true_centroid[0] - pred_centroid[0])**2 + 
+                    (true_centroid[1] - pred_centroid[1])**2
+                )
+                if dist < best_dist and dist <= self.tolerance:
+                    best_dist = dist
+                    best_pred_idx = pred_idx
+            
+            if best_pred_idx is not None:
+                matches.append((true_idx, best_pred_idx))
+                used_pred.add(best_pred_idx)
+        
+        return matches
 
 
 # ------------------------------------
@@ -3517,6 +3435,88 @@ class ChamferBoundarySDFLossVec(nn.Module):
 
 
 # ------------------------------------
+# losses/simple_binary_weighted_mse.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class WeightedMSELoss(nn.Module):
+    """
+    Per-pixel MSE with class-dependent weights (e.g. give roads > background).
+
+    Args
+    ----
+    road_weight : float
+        Weight applied to squared errors on road pixels.
+    bg_weight   : float
+        Weight applied to squared errors on background pixels.
+    threshold   : float
+        Threshold that separates “road” from “background” in the SDF.
+    greater_is_road : bool
+        If True, pixels **>= threshold** are treated as road.
+        If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
+    reduction : {'mean', 'sum', 'none'}
+        • 'mean' – divide the *weighted* SSE by the total number of elements  
+          (so when both weights are 1 you recover standard MSE, and
+          changing the class weights doesn’t blow up the loss scale).  
+        • 'sum'  – return the weighted sum of squared errors.  
+        • 'none' – return the full per-pixel tensor.
+    """
+
+    def __init__(
+        self,
+        road_weight: float = 5.0,
+        bg_weight:   float = 1.0,
+        threshold:   float = 0.0,
+        greater_is_road: bool = False,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.road_weight   = float(road_weight)
+        self.bg_weight     = float(bg_weight)
+        self.threshold     = float(threshold)
+        self.greater_is_road = bool(greater_is_road)
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.reduction     = reduction
+
+    # ------------------------------------------------------------------ #
+    # forward                                                             #
+    # ------------------------------------------------------------------ #
+    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        y_pred      : Tensor (N, 1, H, W)  – model output SDF
+        y_true_sdf  : Tensor (N, 1, H, W)  – ground-truth signed-distance map
+
+        Returns
+        -------
+        Tensor
+            A scalar (for 'mean' / 'sum') or a tensor shaped like the input (for 'none').
+        """
+
+        # 1) build per-pixel weights
+        if self.greater_is_road:
+            is_road = (y_true_sdf > self.threshold)
+        else:
+            is_road = (y_true_sdf <=  self.threshold)
+        weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
+
+        # 2) weighted squared error
+        wse = (y_pred - y_true_sdf) ** 2 * weight
+
+        # 3) reduction
+        if self.reduction == "mean":
+            # divide by the *number of elements* so scale matches plain MSE
+            return wse.sum() / y_pred.numel()
+        elif self.reduction == "sum":
+            return wse.sum()
+        else:                       # 'none'
+            return wse
+
+
+# ------------------------------------
 # losses/custom_loss.py
 # ------------------------------------
 """
@@ -3654,6 +3654,668 @@ class TopologicalLoss(nn.Module):
         return connectivity_error
 
 # ------------------------------------
+# unit-tests/test_helpers.py
+# ------------------------------------
+"""
+Unit tests for critical helper functions in the segmentation framework.
+Run with: pytest -xvs test_helpers.py
+"""
+
+import os
+import sys
+import pytest
+import numpy as np
+import torch
+from pathlib import Path
+
+# Add parent directory to sys.path to import modules
+sys.path.append(str(Path(__file__).parent.parent))
+
+# Import the functions to test
+from core.general_dataset import compute_distance_map, compute_sdf, custom_collate_fn
+from core.utils import (
+    noCrops,
+    noCropsPerDim,
+    cropInds,
+    coord,
+    coords,
+    cropCoords,
+    process_in_chuncks,
+)
+
+
+class TestDistanceMap:
+    """Tests for compute_distance_map function"""
+
+    def test_basic_functionality(self):
+        mask = np.zeros((5, 5), dtype=np.uint8)
+        mask[2, 2] = 1
+        distance = compute_distance_map(mask, None)
+
+        assert distance[2, 2] == 0
+        for i, j in [(0, 0), (0, 4), (4, 0), (4, 4)]:
+            assert 2.8 < distance[i, j] < 2.9
+        for i, j in [(1, 2), (3, 2), (2, 1), (2, 3)]:
+            assert distance[i, j] == 1
+
+    def test_thresholding(self):
+        mask = np.zeros((7, 7), dtype=np.uint8)
+        mask[3, 3] = 1
+        distance = compute_distance_map(mask, 2.0)
+
+        assert np.max(distance) <= 2.0
+        assert distance[3, 3] == 0
+        assert distance[2, 3] == 1
+        assert distance[4, 3] == 1
+
+    def test_binary_formats(self):
+        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
+        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
+        d1 = compute_distance_map(mask_01, None)
+        d2 = compute_distance_map(mask_0255, None)
+        assert np.array_equal(d1, d2)
+
+    def test_empty_mask(self):
+        mask = np.zeros((5, 5), dtype=np.uint8)
+        distance = compute_distance_map(mask, None)
+        assert np.all(distance > 0)
+
+    def test_full_mask(self):
+        mask = np.ones((5, 5), dtype=np.uint8)
+        distance = compute_distance_map(mask, None)
+        assert np.all(distance == 0)
+
+
+class TestSignedDistanceFunction:
+    """Tests for compute_sdf function"""
+
+    def test_basic_functionality(self):
+        mask = np.zeros((7, 7), dtype=np.uint8)
+        mask[3, 3] = 1
+        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
+
+        # Inside (where mask==1) should be negative
+        assert sdf[3, 3] < 0
+        # Far away should be positive
+        assert sdf[0, 0] > 0
+
+    def test_iterations_parameter(self):
+        mask = np.zeros((9, 9), dtype=np.uint8)
+        mask[4, 4] = 1
+
+        sdf1 = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
+        sdf3 = compute_sdf(mask, sdf_iterations=3, sdf_thresholds=None)
+
+        neg1 = np.sum(sdf1 < 0)
+        neg3 = np.sum(sdf3 < 0)
+        # More iterations should not shrink the "inside"—allow equal or larger
+        assert neg3 >= neg1
+
+    def test_thresholds_parameter(self):
+        mask = np.zeros((9, 9), dtype=np.uint8)
+        mask[4, 4] = 1
+
+        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=[-2, 2])
+        assert np.all(sdf >= -2)
+        assert np.all(sdf <= 2)
+
+    def test_binary_formats(self):
+        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
+        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
+        s1 = compute_sdf(mask_01, sdf_iterations=1, sdf_thresholds=None)
+        s2 = compute_sdf(mask_0255, sdf_iterations=1, sdf_thresholds=None)
+        assert np.array_equal(s1, s2)
+
+
+class TestCropFunctions:
+    """Tests for the crop‐related utility functions"""
+
+    def test_noCrops_basic(self):
+        assert noCrops([100, 100], [50, 50], [5, 5], startDim=0) == 9
+
+    def test_noCrops_tiny_image(self):
+        assert noCrops([10, 10], [10, 10], [3, 3], startDim=0) == 1
+
+    def test_noCropsPerDim(self):
+        per, cum = noCropsPerDim([100, 200], [50, 50], [5, 5], startDim=0)
+        assert per == [3, 5]
+        assert cum == [15, 5, 1]
+
+    def test_cropInds(self):
+        cum = [12, 3, 1]
+        assert cropInds(0, cum) == [0, 0]
+        assert cropInds(3, cum) == [1, 0]
+        assert cropInds(11, cum) == [3, 2]
+
+    def test_coord(self):
+        c, v = coord(2, 30, 5, 100)
+        assert (c.start, c.stop) == (40, 70)
+        assert (v.start, v.stop) == (5, 25)
+
+        c, v = coord(4, 30, 5, 100)
+        assert (c.start, c.stop) == (70, 100)
+        # when hitting edge, valid region is trimmed (start=15) to avoid going out of bounds
+        assert (v.start, v.stop) == (15, 30)
+
+    def test_coords(self):
+        cc, vc = coords([1, 2], [30, 30], [5, 5], [100, 100], 0)
+        assert (cc[0].start, cc[0].stop) == (20, 50)
+        assert (cc[1].start, cc[1].stop) == (40, 70)
+        assert (vc[0].start, vc[0].stop) == (5, 25)
+        assert (vc[1].start, vc[1].stop) == (5, 25)
+
+    def test_cropCoords(self):
+        cc, vc = cropCoords(7, [30, 40], [5, 5], [100, 200], 0)
+        for sl in [*cc, *vc]:
+            assert isinstance(sl, slice)
+        assert 0 <= cc[0].start < cc[0].stop <= 100
+        assert 0 <= cc[1].start < cc[1].stop <= 200
+        assert 0 <= vc[0].start < vc[0].stop <= 30
+        assert 0 <= vc[1].start < vc[1].stop <= 40
+
+
+class TestProcessInChunks:
+    """Tests for process_in_chuncks"""
+
+    def test_basic_processing(self):
+        inp = torch.ones((1, 3, 10, 10))
+        out = torch.zeros((1, 1, 10, 10))
+        def fn(x): return torch.ones((x.shape[0], 1, x.shape[2], x.shape[3]))
+        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
+        assert torch.all(res == 1)
+
+    def test_chunking_logic(self):
+        inp = torch.zeros((1, 3, 20, 20))
+        out = torch.zeros((1, 1, 20, 20))
+        def fn(x):
+            b, c, h, w = x.shape
+            t = torch.zeros((b, 1, h, w))
+            for i in range(h):
+                for j in range(w):
+                    t[0, 0, i, j] = i + j
+            return t
+        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
+        assert res[0, 0, 0, 0] == 0
+        assert res[0, 0, 6, 0] == 6
+
+    def test_shape_handling(self):
+        inp = torch.ones((1, 3, 10, 10))
+        out = torch.zeros((1, 1, 10, 10))
+        def fn(x): return torch.ones((x.shape[0], x.shape[2], x.shape[3]))
+        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
+        assert torch.all(res == 1)
+
+    def test_margin_handling(self):
+        inp = torch.zeros((1, 1, 20, 20))
+        for i in range(20):
+            for j in range(20):
+                inp[0, 0, i, j] = i * 100 + j
+        out = torch.zeros((1, 1, 20, 20))
+        def fn(x): return x
+        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
+        assert torch.all(res == inp)
+
+
+class TestDataSplitting:
+    """Tests for data splitting logic (ratio and k-fold)"""
+
+    @pytest.fixture
+    def mock_file_structure(self, tmp_path):
+        """
+        Create a mock dataset structure for testing:
+        
+        dataset/
+          source/
+            sat/  (images)
+            map/  (labels)
+        """
+        root = tmp_path / "dataset"
+        img_dir = root / "source" / "sat"
+        lbl_dir = root / "source" / "map"
+        img_dir.mkdir(parents=True)
+        lbl_dir.mkdir(parents=True)
+
+        # Create 10 dummy .tif files in each
+        for i in range(10):
+            (img_dir / f"img_{i}.tif").write_text("dummy")
+            (lbl_dir / f"img_{i}.tif").write_text("dummy")
+
+        return root
+
+    def test_ratio_splitting(self, mock_file_structure, monkeypatch):
+        """Test ratio-based splitting logic"""
+        from core.general_dataset import GeneralizedDataset
+
+        # Prevent any random shuffle
+        monkeypatch.setattr(np.random, "shuffle", lambda x: x)
+
+        base_cfg = {
+            "root_dir": str(mock_file_structure),
+            "use_splitting": True,
+            "source_folder": "source",
+            "split_ratios": {"train": 0.6, "valid": 0.2, "test": 0.2},
+            "modalities": {"image": "sat", "label": "map"},
+        }
+
+        # Create each split explicitly
+        train_ds = GeneralizedDataset({**base_cfg, "split": "train"})
+        valid_ds = GeneralizedDataset({**base_cfg, "split": "valid"})
+        test_ds  = GeneralizedDataset({**base_cfg, "split": "test"})
+
+        # Should be 6,2,2 images respectively
+        assert len(train_ds.modality_files["image"]) == 6
+        assert len(valid_ds.modality_files["image"]) == 2
+        assert len(test_ds.modality_files["image"])  == 2
+
+        # No overlap
+        t = set(train_ds.modality_files["image"])
+        v = set(valid_ds.modality_files["image"])
+        s = set(test_ds.modality_files["image"])
+        assert t.isdisjoint(v)
+        assert t.isdisjoint(s)
+        assert v.isdisjoint(s)
+
+    def test_kfold_splitting(self, mock_file_structure, monkeypatch):
+        """Test k-fold splitting logic"""
+        from core.general_dataset import GeneralizedDataset
+
+        # Mock KFold to return a single fixed split (first 8 train, last 2 valid)
+        class MockKFold:
+            def __init__(self, n_splits, shuffle, random_state):
+                pass
+            def split(self, X):
+                return [(np.arange(8), np.arange(8, 10))]
+
+        monkeypatch.setattr("sklearn.model_selection.KFold", MockKFold)
+
+        base_cfg = {
+            "root_dir": str(mock_file_structure),
+            "use_splitting": True,
+            "split_mode": "kfold",
+            "num_folds": 5,
+            "source_folder": "source",
+            "modalities": {"image": "sat", "label": "map"},
+        }
+
+        # Train fold 0
+        tr_cfg = {**base_cfg, "split": "train", "fold": 0}
+        train_ds = GeneralizedDataset(tr_cfg)
+        assert len(train_ds.modality_files["image"]) == 8
+
+        # Valid fold 0
+        va_cfg = {**base_cfg, "split": "valid", "fold": 0}
+        valid_ds = GeneralizedDataset(va_cfg)
+        assert len(valid_ds.modality_files["image"]) == 2
+
+
+class TestCustomCollate:
+    """Tests for custom_collate_fn"""
+
+    def test_basic(self):
+        batch = [
+            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
+            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
+        ]
+        c = custom_collate_fn(batch)
+        assert c["image"].shape == (2,3,10,10)
+        assert c["label"].shape == (2,1,10,10)
+
+    def test_mixed_types(self):
+        batch = [
+            {"image": torch.ones(3,10,10), "meta": {"id":1}},
+            {"image": torch.ones(3,10,10), "meta": {"id":2}},
+        ]
+        c = custom_collate_fn(batch)
+        assert isinstance(c["meta"], list)
+        assert c["meta"][0]["id"] == 1
+
+    def test_filter_none(self):
+        def imp(batch):
+            batch = [b for b in batch if b is not None]
+            if not batch:
+                return {"image": torch.zeros(0,3,10,10)}
+            return custom_collate_fn(batch)
+        b = [None, {"image": torch.ones(3,10,10)}]
+        c1 = imp(b)
+        assert c1["image"].shape[0] == 1
+        c2 = imp([None,None])
+        assert c2["image"].shape[0] == 0
+
+
+# ------------------------------------
+# unit-tests/smoke_test.py
+# ------------------------------------
+"""
+Integration smoke test for the entire segmentation pipeline.
+This creates a minimal synthetic dataset and runs a few training steps.
+Run with: python smoke_test.py
+"""
+
+import os
+import shutil
+import tempfile
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from tqdm import tqdm
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Import core modules
+from core.general_dataset import GeneralizedDataset, custom_collate_fn, worker_init_fn
+from core.model_loader import load_model
+from core.loss_loader import load_loss
+from core.mix_loss import MixedLoss
+from core.metric_loader import load_metrics
+from core.dataloader import SegmentationDataModule
+from seglit_module import SegLitModule
+
+
+def create_synthetic_dataset(root_dir, num_samples=10, img_size=32):
+    """Create a synthetic dataset with roads for testing"""
+    logger.info(f"Creating synthetic dataset in {root_dir} with {num_samples} samples")
+    
+    # Create directory structure
+    os.makedirs(os.path.join(root_dir, 'train', 'sat'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'train', 'map'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'valid', 'sat'), exist_ok=True)
+    os.makedirs(os.path.join(root_dir, 'valid', 'map'), exist_ok=True)
+    
+    # Create test images with simple road patterns
+    for split in ['train', 'valid']:
+        for i in range(num_samples):
+            # Create image with random noise
+            img = np.random.randint(0, 255, (img_size, img_size, 3), dtype=np.uint8)
+            
+            # Create binary mask with horizontal and vertical lines (roads)
+            mask = np.zeros((img_size, img_size), dtype=np.uint8)
+            
+            # Horizontal road
+            h_pos = np.random.randint(5, img_size-5)
+            mask[h_pos-2:h_pos+2, :] = 1
+            
+            # Vertical road
+            v_pos = np.random.randint(5, img_size-5)
+            mask[:, v_pos-2:v_pos+2] = 1
+            
+            # Add brightness to the roads in the image for realism
+            for c in range(3):
+                img[:, :, c] = np.where(mask > 0, 
+                                        np.minimum(img[:, :, c] + 100, 255),
+                                        img[:, :, c])
+            
+            # Save files
+            np.save(os.path.join(root_dir, split, 'sat', f'img_{i}.npy'), img)
+            np.save(os.path.join(root_dir, split, 'map', f'img_{i}.npy'), mask * 255)  # 0/255 format
+    
+    logger.info(f"Created {num_samples} samples each for train and validation")
+
+
+class SimpleBinaryUNet(nn.Module):
+    """A very simple UNet for testing purposes"""
+    
+    def __init__(self, in_channels=3, out_channels=1):
+        super().__init__()
+        
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        
+        # Decoder
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(32, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 16, 2, stride=2)
+        )
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(16, 8, 3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(8, 8, 2, stride=2)
+        )
+        
+        # Final layer
+        self.final = nn.Conv2d(8, out_channels, 1)
+    
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        
+        # Decoder
+        d1 = self.dec1(e2)
+        d2 = self.dec2(d1)
+        
+        # Final layer
+        out = torch.sigmoid(self.final(d2))
+        return out
+
+
+def create_configs(dataset_path):
+    """Create configuration dictionaries for testing"""
+    # Dataset configuration
+    dataset_config = {
+        "root_dir": dataset_path,
+        "split_mode": "folder",
+        "patch_size": 16,
+        "small_window_size": 2,
+        "validate_road_ratio": False,  # Don't filter patches for quick testing
+        "train_batch_size": 2,
+        "val_batch_size": 1,
+        "num_workers": 0,  # Use 0 for easier debugging
+        "pin_memory": False,
+        "modalities": {
+            "image": "sat",
+            "label": "map"
+        }
+    }
+    
+    # Model configuration using our simple test model
+    model_config = {
+        "simple_unet": True,  # Flag for our smoke test
+        "in_channels": 3,
+        "out_channels": 1
+    }
+    
+    # Loss configuration
+    loss_config = {
+        "primary_loss": {
+            "class": "BCELoss",
+            "params": {}
+        },
+        "alpha": 1.0  # Only use primary loss
+    }
+    
+    # Metrics configuration
+    metrics_config = {
+        "metrics": [
+            {
+                "alias": "dice",
+                "path": "torchmetrics.classification",
+                "class": "Dice",
+                "params": {
+                    "threshold": 0.5,
+                    "zero_division": 1.0
+                }
+            }
+        ]
+    }
+    
+    # Inference configuration
+    inference_config = {
+        "patch_size": [16, 16],
+        "patch_margin": [2, 2]
+    }
+    
+    return dataset_config, model_config, loss_config, metrics_config, inference_config
+
+
+def run_smoke_test():
+    """Run a complete smoke test of the segmentation pipeline"""
+    logger.info("Starting smoke test")
+    
+    # Create temporary directory for dataset
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create synthetic dataset
+        create_synthetic_dataset(tmp_dir, num_samples=5, img_size=32)
+        
+        # Create configurations
+        dataset_config, model_config, loss_config, metrics_config, inference_config = create_configs(tmp_dir)
+        
+        # Set up data module
+        logger.info("Setting up data module")
+        data_module = SegmentationDataModule(dataset_config)
+        data_module.setup()
+        
+        # Create model manually for smoke test
+        logger.info("Creating model")
+        if model_config.get("simple_unet", False):
+            model = SimpleBinaryUNet(
+                in_channels=model_config["in_channels"],
+                out_channels=model_config["out_channels"]
+            )
+        else:
+            model = load_model(model_config)
+        
+        # Create loss function
+        logger.info("Creating loss function")
+        primary_loss = load_loss(loss_config["primary_loss"])
+        secondary_loss = None
+        if "secondary_loss" in loss_config:
+            secondary_loss = load_loss(loss_config["secondary_loss"])
+        
+        mixed_loss = MixedLoss(primary_loss, secondary_loss, loss_config.get("alpha", 0.5), 
+                              loss_config.get("start_epoch", 0))
+        
+        # Create metrics
+        logger.info("Loading metrics")
+        metrics = load_metrics(metrics_config.get("metrics", []))
+        
+        # Create optimizer config
+        optimizer_config = {
+            "name": "Adam",
+            "params": {"lr": 0.001}
+        }
+        
+        # Create Lightning module
+        logger.info("Creating Lightning module")
+        lit_module = SegLitModule(
+            model=model,
+            loss_fn=mixed_loss,
+            metrics=metrics,
+            optimizer_config=optimizer_config,
+            inference_config=inference_config
+        )
+        
+        # Create a simple trainer for testing
+        logger.info("Creating trainer")
+        trainer = pl.Trainer(
+            max_epochs=2,
+            log_every_n_steps=1,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=True,
+            accelerator="cpu"
+        )
+        
+        # Run a few training steps
+        logger.info("Running training")
+        trainer.fit(lit_module, datamodule=data_module)
+        
+        logger.info("Smoke test complete!")
+
+
+def inspect_dataset_samples():
+    """Create and inspect dataset samples for debugging"""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create synthetic dataset
+        create_synthetic_dataset(tmp_dir, num_samples=3, img_size=32)
+        
+        # Create configurations
+        dataset_config, _, _, _, _ = create_configs(tmp_dir)
+        
+        # Override for detailed inspection
+        dataset_config["train_batch_size"] = 1
+        
+        # Create dataset directly
+        train_config = dataset_config.copy()
+        train_config["split"] = "train"
+        
+        # Fix the None sample issue in __getitem__
+        from core.general_dataset import GeneralizedDataset
+        
+        # Patch the class to fix the None return issue
+        original_getitem = GeneralizedDataset.__getitem__
+        
+        def safe_getitem(self, idx):
+            result = original_getitem(self, idx)
+            if result is None:
+                # Try another index
+                logger.warning(f"Got None for index {idx}, trying next index")
+                return self.__getitem__((idx + 1) % len(self))
+            return result
+        
+        # Apply the monkey patch
+        GeneralizedDataset.__getitem__ = safe_getitem
+        
+        # Create and inspect dataset
+        train_dataset = GeneralizedDataset(train_config)
+        
+        # Check dataset length
+        logger.info(f"Dataset length: {len(train_dataset)}")
+        
+        # Iterate through a few samples
+        for i in range(min(3, len(train_dataset))):
+            sample = train_dataset[i]
+            logger.info(f"Sample {i} keys: {sample.keys()}")
+            
+            # Check shapes
+            for key, value in sample.items():
+                if isinstance(value, np.ndarray):
+                    logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}, range: [{value.min()}, {value.max()}]")
+        
+        # Create dataloader and inspect a batch
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=2,
+            shuffle=True,
+            collate_fn=custom_collate_fn,
+            num_workers=0
+        )
+        
+        # Get a batch
+        batch = next(iter(train_loader))
+        logger.info(f"Batch keys: {batch.keys()}")
+        
+        # Check shapes
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}")
+
+
+if __name__ == "__main__":
+    # First inspect dataset
+    logger.info("Inspecting dataset samples...")
+    inspect_dataset_samples()
+    
+    # Then run full smoke test
+    logger.info("\nRunning full smoke test...")
+    run_smoke_test()
+
+# ------------------------------------
 # configs/main.yaml
 # ------------------------------------
 # Main configuration file for segmentation experiments
@@ -3754,7 +4416,7 @@ metrics:
 
   # Connected-components quality
   - alias: ccq
-    path: metrics.connected_components
+    path: metrics.ccq
     class: ConnectedComponentsQuality
     params:
       min_size: 15
