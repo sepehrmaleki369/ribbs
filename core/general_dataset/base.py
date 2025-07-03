@@ -15,6 +15,7 @@ from core.general_dataset.augments    import get_augmentation_metadata, extract_
 from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
 from core.general_dataset.normalizations import normalize_image
 from core.general_dataset.visualizations import visualize_batch
+from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
 
 
@@ -63,9 +64,15 @@ class GeneralizedDataset(Dataset):
         self.num_workers: int = config.get("num_workers", 4)
         self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
         self.use_splitting: bool = config.get("use_splitting", False)
-        self.modalities: Dict[str, str] = config.get("modalities", {"image":"sat","label":"map"})
         self.source_folder: str = config.get("source_folder", "")
         self.save_computed: bool = config.get("save_computed", False)
+        self.base_modality = config.get('base_modality')
+        self.compute_again_modalities = config.get('compute_again_modalities', False)
+        self.split_cfg = config["split_cfg"]
+        self.split_cfg['seed'] = self.seed
+        self.split_cfg['base_modality'] = self.base_modality
+        splitter = Split(self.split_cfg)
+        
 
         if self.root_dir is None:
             raise ValueError("root_dir must be specified in the config.")
@@ -75,137 +82,55 @@ class GeneralizedDataset(Dataset):
         random.seed(self.seed)
         np.random.seed(self.seed)
 
-        split_dir = os.path.join(self.root_dir, self.split)
-        if self.use_splitting and self.split != 'test':
-            split_dir = os.path.join(self.root_dir, self.source_folder)
-        self.data_dir: str = split_dir
+        split_cfg = config["split_cfg"]
+        split_cfg['seed'] = self.seed
+        splitter = Split(split_cfg)
+        self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
+        self.modalities = list(self.modality_files.keys())
+        
+        # sanity check
+        if 'image' not in self.modality_files or 'label' not in self.modality_files:
+            raise ValueError("Split must define both 'image' and 'label' modalities in split_cfg.")
+        if 'image' in self.modality_files and 'label' in self.modality_files:
+            assert len(self.modality_files['image']) == len(self.modality_files['label']), f"len(images): {len(self.modality_files['image'])}, len(labels): {len(self.modality_files['label'])}"
 
-        self.modality_dirs: Dict[str, str] = {}
-        self.modality_files: Dict[str, List[str]] = {}
-        exts = ['.tiff', '.tif', '.png', '.jpg', '.npy']
-
-        # Process "image" modality.
-        folder_name = self.modalities['image']
-        mod_dir = os.path.join(self.data_dir, folder_name)
-        if not os.path.isdir(mod_dir):
-            raise ValueError(f"Modality directory {mod_dir} not found.")
-        self.modality_dirs['image'] = mod_dir
-        files = sorted(
-            f for f in os.listdir(mod_dir)
-            if any(f.endswith(ext) for ext in exts)
-        )
-        self.modality_files['image'] = files
-
-        if self.max_images is not None:
-            self.modality_files['image'] = self.modality_files['image'][:self.max_images]
-
-        # Process "label" modality.
-        if "label" in self.modalities:
-            folder_name = self.modalities['label']
-            mod_dir = os.path.join(self.data_dir, folder_name)
-            if not os.path.isdir(mod_dir):
-                raise ValueError(f"Modality directory {mod_dir} not found.")
-            self.modality_dirs['label'] = mod_dir
-            files = sorted(
-                f for f in os.listdir(mod_dir)
-                if any(f.endswith(ext) for ext in exts)
-            )
-            self.modality_files['label'] = files
-
-            if self.max_images is not None:
-                self.modality_files['label'] = self.modality_files['label'][:self.max_images]
-
-        # Precompute additional modalities (e.g., distance, sdf).
-        for key in [modal for modal in self.modalities if modal not in ['image', 'label']]:
-            folder_name = self.modalities[key]
-            mod_dir = os.path.join(self.data_dir, folder_name)
-            os.makedirs(mod_dir, exist_ok=True)
-            sdf_comp_again = False
-            config_path = os.path.join(mod_dir, "config.json")
-            # if os.path.exists(config_path):
-            #     with open(config_path, "r") as config_file:
-            #         saved_config = json.load(config_file)
-            #         sdf_comp_again = self.sdf_iterations != saved_config.get("sdf_iterations", None)
-
-            logger.info(f"Generating {key} modality maps...")
-            for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
-                                       total=len(self.modality_files["label"]),
-                                       desc=f"Processing {key} maps"):
-                lbl_path = os.path.join(self.modality_dirs['label'], self.modality_files["label"][file_idx])
-                lbl = load_array_from_file(lbl_path)
-                base, _ = os.path.splitext(file)
-                modality_filename = f"{base}_{key}.npy"
-                modality_path = os.path.join(mod_dir, modality_filename)
-                if self.save_computed:
-                    if key == "distance":
-                        if not os.path.exists(modality_path):
-                            processed_map = compute_distance_map(lbl, None)
-                            np.save(modality_path, processed_map)
-                    elif key == "sdf":
-                        if not os.path.exists(modality_path) or sdf_comp_again:
-                            processed_map = compute_sdf(lbl, self.sdf_iterations, None)
-                            np.save(modality_path, processed_map)
-                    else:
-                        raise ValueError(f"Modality {key} not supported.")
-            with open(config_path, "w") as config_file:
-                json.dump(self.config, config_file, indent=4)
-            self.modality_dirs[key] = mod_dir
-            files = sorted([f for f in os.listdir(mod_dir) if any(f.endswith(ext) for ext in exts)])
-            self.modality_files[key] = files
-
-        # Perform dataset splitting if requested.
-        if self.use_splitting:
-            if self.fold is not None and self.num_folds is not None:
-                # ----- KFold Splitting -----
-                files = self.modality_files["image"]
-                kf = KFold(n_splits=self.num_folds, shuffle=True, random_state=self.seed)
-                splits = list(kf.split(files))
-                if self.split == "train":
-                    selected_indices = splits[self.fold][0].tolist()
-                elif self.split == "valid":
-                    selected_indices = splits[self.fold][1].tolist()
-                elif self.split == "test":
-                    selected_indices = [i for i in range(len(files))]
-                else:
-                    raise ValueError("For KFold splitting, split must be 'train' or 'valid' or 'test'.", self.split)
-                for key in self.modality_files:
-                    all_files = self.modality_files[key]
-                    self.modality_files[key] = [all_files[i] for i in selected_indices]
-            else:
-                # ----- Split by Ratios -----
-                files = self.modality_files["label"]
-                num_files = len(files)
-                indices = np.arange(num_files)
-                np.random.shuffle(indices)
-                train_count = int(num_files * self.split_ratios["train"])
-                valid_count = int(num_files * self.split_ratios["valid"])
-                if self.split == "train":
-                    selected_indices = indices[:train_count]
-                elif self.split == "valid":
-                    selected_indices = indices[train_count:train_count + valid_count]
-                elif self.split == "test":
-                    selected_indices = indices[train_count + valid_count:]
-                else:
-                    raise ValueError("For an 'entire' folder, split must be one of 'train', 'valid', or 'test'.")
-                for key in self.modality_files:
-                    all_files = self.modality_files[key]
-                    self.modality_files[key] = [all_files[i] for i in selected_indices]
+        # exts = ['.tiff', '.tif', '.png', '.jpg', '.npy']
 
         if self.max_images is not None:
             for key in self.modality_files:
                 self.modality_files[key] = self.modality_files[key][:self.max_images]
 
+        # Precompute additional modalities (e.g., distance, sdf).
+        if self.save_computed:
+            for key in [modal for modal in self.modalities if modal not in ['image', 'label']]:
+                logger.info(f"Generating {key} modality maps...")
+                for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
+                                        total=len(self.modality_files["label"]),
+                                        desc=f"Processing {key} maps"):
+                    lbl = load_array_from_file(self.modality_files['label'][file_idx])
+                    modality_path = self.modality_files[key][file_idx]
+                    dirpath = os.path.dirname(modality_path)
+                    os.makedirs(dirpath, exist_ok=True)
+                    if key == "distance":
+                        if not os.path.exists(modality_path) or self.compute_again_modalities:
+                            processed_map = compute_distance_map(lbl, None)
+                            np.save(modality_path, processed_map)
+                    elif key == "sdf":
+                        if not os.path.exists(modality_path) or self.compute_again_modalities:
+                            processed_map = compute_sdf(lbl, self.sdf_iterations, None)
+                            np.save(modality_path, processed_map)
+                    else:
+                        raise ValueError(f"Modality {key} not supported.")
+
     def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
         imgs: Dict[str, np.ndarray] = {}
         for key in self.modalities:
-            if file_idx < len(self.modality_files[key]):
-                file_path = os.path.join(self.modality_dirs[key], self.modality_files[key][file_idx])
-                arr = load_array_from_file(file_path)
+            if os.path.exists(self.modality_files[key][file_idx]):
+                arr = load_array_from_file(self.modality_files[key][file_idx])
                 if arr is None:            # <- corrupted TIFF
                     return None            # signal caller to skip this index
             else:
-                lbl_path = os.path.join(self.modality_dirs['label'], self.modality_files["label"][file_idx])
-                lbl = load_array_from_file(lbl_path)
+                lbl = load_array_from_file(self.modality_files["label"][file_idx])
                 if key == "distance":
                     arr = compute_distance_map(lbl, None)
                 elif key == "sdf":
@@ -303,15 +228,47 @@ class GeneralizedDataset(Dataset):
     
 
 if __name__ == "__main__":
+    split_cfg = {
+        "mode": "folder",
+        # "ratios": {"train": 0.8, "valid": 0.1, "test": 0.1},
+        # "ratio_folders": [
+        #     {
+        #         "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/flat",
+        #         "layout": "flat",
+        #         "modalities": {
+        #             "image": {"pattern": r".*_sat\.tif"},
+        #             "label": {"pattern": r".*_map\.png"}
+        #         }
+        #     }
+        # ]
+        "source_folders": [
+        {
+            "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "sat"},
+                "label": {"folder": "label"},
+                "sdf":   {"folder": "sdf"}  
+            },
+            "splits": {
+                "train": "train",
+                "valid": "valid",
+                "test":  "test"
+            }
+        },
+    ]
+
+    }
     config = {
         "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
         "split": "train",
         # "split": "valid",
+        "split_cfg": split_cfg,
         "patch_size": 256,
         "small_window_size": 8,
         "validate_road_ratio": True,
         "threshold": 0.025,
-        "max_images": 1,  # For quick testing.
+        "max_images": 5,  # For quick testing.
         "seed": 42,
         "fold": None,
         "num_folds": None,
@@ -332,7 +289,10 @@ if __name__ == "__main__":
             "label": "map",
             "distance": "distance",
             "sdf": "sdf"
-        }
+        },
+        "base_modality": 'image',
+        'compute_again_modalities': False,
+        'save_computed': True
     }
 
     # Create dataset and dataloader.

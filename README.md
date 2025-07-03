@@ -1349,3 +1349,218 @@ segmentation_loss = nn.BCELoss()
 ```
 
 This approach allows you to leverage unsupervised and semi-supervised learning techniques within the SegLab framework without needing to modify the dataset structure fundamentally. You just need to be careful about how the data is processed during training and how the loss functions are applied.
+
+_____
+# Dataset Splitting 
+
+Here’s an **“all-in-one” reference sheet** — six ready-to-copy config dictionaries (plus field explanations) that cover every combination you can hit with the `Split` class:
+
+---
+
+## 0. Field reference (applies to every config)
+
+| key                                    | meaning                                                                                  |
+| -------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `seed`                                 | RNG seed for deterministic shuffling                                                     |
+| `mode`                                 | `"folder"` · `"kfold"` · `"ratio"`                                                       |
+| `layout`                               | `"folders"` (one sub-dir per modality) or `"flat"` (all files mixed, use regex patterns) |
+| `modalities`                           | map of modality-name → *folder name* **or** *regex pattern*                              |
+| `splits`                               | (folder-mode only) directory names that store each split **inside** the source folder    |
+| `train_valid_folders` / `test_folders` | (k-fold) lists of *source-folder* blocks                                                 |
+| `num_folds` / `fold_idx`               | (k-fold) standard sklearn KFold params                                                   |
+| `ratios`                               | (ratio) percentages that must sum to 1.0                                                 |
+
+---
+
+## 1 · Folder-mode templates
+
+### 1-A  layout = “folders”
+
+```python
+cfg_folder_folders = {
+    "seed": 42,
+    "mode": "folder",
+    "source_folders": [
+        {
+            "path": "/data/RegionA",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "sat"},
+                "label": {"folder": "map"},
+                "sdf":   {"folder": "sdf"}  # ← optional extra modality
+            },
+            "splits": {
+                "train": "train_imgs",
+                "valid": "val_imgs",
+                "test":  "test_imgs"
+            }
+        },
+        {
+            "path": "/data/RegionB",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "images"},
+                "label": {"folder": "labels"}
+            },
+            "splits": {      # names may differ per source folder
+                "train": "train",
+                "valid": "valid",
+                "test":  "test"
+            }
+        }
+    ]
+}
+```
+
+### 1-B  layout = “flat”
+
+```python
+cfg_folder_flat = {
+    "seed": 42,
+    "mode": "folder",
+    "source_folders": [
+        {
+            "path": "/data/FlatSet",
+            "layout": "flat",
+            "modalities": {
+                "image": {"pattern": r".*_RGB\.tif"},
+                "label": {"pattern": r".*_GT\.png"},
+                "distance": {"pattern": r".*_distance\.npy"}
+            },
+            "splits": {
+                "train": "split_train",
+                "valid": "split_valid",
+                "test":  "split_test"
+            }
+        }
+    ]
+}
+```
+
+---
+
+## 2 · K-fold templates
+
+### 2-A  layout = “folders”
+
+```python
+cfg_kfold_folders = {
+    "seed": 7,
+    "mode": "kfold",
+    "num_folds": 5,
+    "fold_idx":  1,
+    "train_valid_folders": [
+        {
+            "path": "/data/AllRegions",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "sat"},
+                "label": {"folder": "map"}
+            }
+        }
+    ],
+    "test_folders": [
+        {
+            "path": "/data/GoldenTest",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "img"},
+                "label": {"folder": "gt"}
+            }
+        }
+    ]
+}
+```
+
+### 2-B  layout = “flat”
+
+```python
+cfg_kfold_flat = {
+    "seed": 99,
+    "mode": "kfold",
+    "num_folds": 4,
+    "fold_idx":  2,
+    "train_valid_folders": [
+        {
+            "path": "/data/PooledFlat",
+            "layout": "flat",
+            "modalities": {
+                "image": {"pattern": r"img_\d+\.jpg"},
+                "label": {"pattern": r"lbl_\d+\.png"}
+            }
+        }
+    ],
+    "test_folders": [
+        {
+            "path": "/data/FlatHoldout",
+            "layout": "flat",
+            "modalities": {
+                "image": {"pattern": r"testimg_\d+\.jpg"},
+                "label": {"pattern": r"testlbl_\d+\.png"}
+            }
+        }
+    ]
+}
+```
+
+---
+
+## 3 · Ratio-mode templates
+
+### 3-A  layout = “folders”
+
+```python
+cfg_ratio_folders = {
+    "seed": 13,
+    "mode": "ratio",
+    "ratios": {"train": 0.7, "valid": 0.15, "test": 0.15},
+    "ratio_folders": [
+        {
+            "path": "/data/City1",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "Aerial"},
+                "label": {"folder": "Mask"}
+            }
+        },
+        {
+            "path": "/data/City2",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "RGB"},
+                "label": {"folder": "GT"}
+            }
+        }
+    ]
+}
+```
+
+### 3-B  layout = “flat”
+
+```python
+cfg_ratio_flat = {
+    "seed": 13,
+    "mode": "ratio",
+    "ratios": {"train": 0.8, "valid": 0.1, "test": 0.1},
+    "ratio_folders": [
+        {
+            "path": "/data/FlatDataset",
+            "layout": "flat",
+            "modalities": {
+                "image": {"pattern": r".*_img\d+\.tif"},
+                "label": {"pattern": r".*_mask\d+\.tif"}
+            }
+        }
+    ]
+}
+```
+
+---
+
+### How to use
+
+1. Pick the block that matches your setup (mode + layout).
+2. Adjust `path`, folder names, or regex patterns to match your real files.
+3. Pass that dict as `split_cfg` when you build the `Split` class (which your new `base.py` then consumes).
+
+Copy-paste → tweak → train. Done.

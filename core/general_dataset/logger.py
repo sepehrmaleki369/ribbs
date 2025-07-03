@@ -1,10 +1,10 @@
 import logging
 import sys
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.INFO)
+handler.setLevel(logging.ERROR)
 
 fmt = logging.Formatter(
     "%(asctime)s — %(name)s — %(levelname)s — %(message)s",

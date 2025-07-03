@@ -34,5 +34,5 @@ def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
     try:
         return loader(str(path))
     except Exception as e:
-        logger.warning("Failed to load '%s': %s", file_path, e)
+        # logger.warning("Failed to load '%s': %s", file_path, e)
         return None
