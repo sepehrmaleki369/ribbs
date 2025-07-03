@@ -99,7 +99,7 @@ def _pivot_views_no_split(records):
 
     return [st_md, md_st]
 
-def _collect_datapoints_from_source(src: Dict[str, Any], base_modalities):
+def _collect_datapoints_from_source(src: Dict[str, Any], base_modalities, rng):
     root       = src["path"]
     layout     = src.get("layout", "flat")
     modalities = src.get("modalities", {})
@@ -212,16 +212,15 @@ def _collect_datapoints_from_source(src: Dict[str, Any], base_modalities):
                 escaped_stem = re.escape(stem)
                 full_pat = pat.replace("(.*)", f"({escaped_stem})")
                 fname   = filename_from_pattern(pat, stem)
-                print(mod, stem)
-                print(fname)
-
+                # print(mod, stem)
+                # print(fname)
                 records.append({
                     "modality": mod,
                     "stem":     stem,
                     "path":     os.path.join(root, fname),
                 })
         # print(_pivot_views_no_split(records)[0])
-        records = split_records(src, records)
+        records = split_records(src, records, rng)
     
     return records
 
@@ -297,22 +296,34 @@ class Split:
             for mod in split2mod2files[sp]:
                 split2mod2files[sp][mod].sort()
 
+        # ---- print a summary of each split ----
+        for sp, mod2files in split2mod2files.items():
+            # count “stems” via the first base modality
+            if self.base_modalities:
+                base = self.base_modalities[0]
+                stem_count = len(mod2files.get(base, []))
+            else:
+                stem_count = sum(len(v) for v in mod2files.values()) // max(1, len(mod2files))
+            print(f"→ Split '{sp}': {stem_count} stems")
+            for mod, files in mod2files.items():
+                print(f"     {mod:8s}: {len(files)} files")
+            print()
+        # ---- end summary ----
+
         self._split2mod2files = split2mod2files
         self._splits_built    = True
 
     def _collect_datapoints_for(self, src: Dict[str, Any]) -> List[Dict[str, str]]:
-        records = _collect_datapoints_from_source(src, self.base_modalities)
+        records = _collect_datapoints_from_source(src, self.base_modalities, self._rng)
         if src.get('type')=='kfold':
             test_src = src.get('test_source')
-            test_records = _collect_datapoints_from_source(test_src, self.base_modalities)  
+            test_records = _collect_datapoints_from_source(test_src, self.base_modalities, self._rng)  
             for rec in test_records:
                 rec['split'] = 'test'          
             records.extend(test_records)
-
-        dp = records
-        return dp
+        return records
     
-def split_records(src, records):
+def split_records(src, records, rng):
     """
     Assigns a 'split' field to each record in `records` based on the split strategy in `src`.
 
@@ -328,11 +339,12 @@ def split_records(src, records):
         # Collect unique stems
         stems = sorted({r['stem'] for r in records})
         # Shuffle with seed if provided
-        seed = src.get('seed', None)
-        if seed is not None:
-            random.Random(seed).shuffle(stems)
-        else:
-            random.shuffle(stems)
+        # seed = src.get('seed', None)
+        # if seed is not None:
+        #     random.Random(seed).shuffle(stems)
+        # else:
+        #     random.shuffle(stems)
+        rng.shuffle(stems)
 
         ratios = src.get('ratios', {})
         train_ratio = ratios.get('train', 0)

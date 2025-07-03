@@ -323,53 +323,53 @@ if __name__ == "__main__":
         "data_dim": 2,
     }
 
-    split_cfg = {
-        "seed": 42,
-        "sources": [
-            {
-                "type": "ratio",
-                "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-                "layout": "flat",
-                "modalities": {
-                    "image":    {"pattern": r"^cube_(.*)\.npy$"},
-                    "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-                    "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-                },
-                "ratios": {
-                    "train": 0.7,
-                    "valid": 0.15,
-                    "test":  0.15,
-                }
-            }
-        ]
-    }
+    # split_cfg = {
+    #     "seed": 42,
+    #     "sources": [
+    #         {
+    #             "type": "ratio",
+    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+    #             "layout": "flat",
+    #             "modalities": {
+    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
+    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
+    #             },
+    #             "ratios": {
+    #                 "train": 0.7,
+    #                 "valid": 0.15,
+    #                 "test":  0.15,
+    #             }
+    #         }
+    #     ]
+    # }
 
-    config = {
-        "split": "train",                # one of "train","valid","test"
-        "split_cfg": split_cfg,
+    # config = {
+    #     "split": "train",                # one of "train","valid","test"
+    #     "split_cfg": split_cfg,
 
-        "data_dim": 3,                   # your .npy volumes are 3D
-        "patch_size": 90,                # XY window size
-        "patch_size_z": 90,              # Z-depth
+    #     "data_dim": 3,                   # your .npy volumes are 3D
+    #     "patch_size": 90,                # XY window size
+    #     "patch_size_z": 90,              # Z-depth
 
-        "augmentations": ["flip_h","flip_v","flip_d","rotation"],
-        "validate_road_ratio": False,    # set True if you want to enforce label coverage
-        "threshold": 0.05,
+    #     "augmentations": ["flip_h","flip_v","flip_d","rotation"],
+    #     "validate_road_ratio": False,    # set True if you want to enforce label coverage
+    #     "threshold": 0.05,
 
-        "distance_threshold": None,      # clip distance map if desired
-        "sdf_iterations": 3,             # only if you compute SDF
-        "sdf_thresholds": [-5, 5],       # ditto
+    #     "distance_threshold": None,      # clip distance map if desired
+    #     "sdf_iterations": 3,             # only if you compute SDF
+    #     "sdf_thresholds": [-5, 5],       # ditto
 
-        "save_computed": True,          # we already have distlbl_*.npy
-        "compute_again_modalities": False,
+    #     "save_computed": True,          # we already have distlbl_*.npy
+    #     "compute_again_modalities": False,
 
-        "max_images": None,
-        "max_attempts": 10,
-        "seed": 42,
-        "num_workers": 4,
-        "verbose": True,
-        "base_modalities": ['image', 'label']
-    }
+    #     "max_images": None,
+    #     "max_attempts": 10,
+    #     "seed": 42,
+    #     "num_workers": 4,
+    #     "verbose": True,
+    #     "base_modalities": ['image', 'label']
+    # }
 
 
     # Create dataset and dataloader.
