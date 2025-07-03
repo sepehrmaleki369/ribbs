@@ -299,25 +299,39 @@ if __name__ == "__main__":
             "label":    None,          # or null in JSON → skip
         },
         "augmentation_params": {
-        # "scale":             {"min": 0.5,  "max": 1.8},
-        # "elastic":           {"alpha_min": 5.0,  "alpha_max": 10.0,
-        #                       "sigma_min": 3.0,  "sigma_max": 6.0},
-        # "brightness_contrast":{"alpha_min": 0.9,"alpha_max": 1.1,
-        #                       "beta_min": -30.0,"beta_max": 30.0},
-        # "gamma":             {"min": 0.7,  "max": 1.5},
-        # "gaussian_noise":    {"min": 0.01, "max": 0.03},
-        # "gaussian_blur":     {"min": 0.5,  "max": 1.5},
-        # "bias_field":        {"min": 0.2,  "max": 0.4},
-        # "rotation":          {"min": 0.0,  "max": 360.0},
-        # flips and flip_d remain Bernoulli(0.5), no extra params needed
-    },
+            "scale":             {"min": 0.5,  "max": 1.8},
+            # "elastic":           {"alpha_min": 5.0,  "alpha_max": 10.0,
+                                # "sigma_min": 3.0,  "sigma_max": 6.0},
+            "brightness_contrast":{"alpha_min": 0.9,"alpha_max": 1.1,
+                                "beta_min": -30.0,"beta_max": 30.0},
+            "gamma":             {"min": 0.7,  "max": 1.5},
+            # "gaussian_noise":    {"min": 0.01, "max": 0.03},
+            # "gaussian_blur":     {"min": 0.5,  "max": 1.5},
+            # "bias_field":        {"min": 0.2,  "max": 0.4},
+            # "rotation":          {"min": 0.0,  "max": 360.0},
+            # flips and flip_d remain Bernoulli(0.5), no extra params needed
+        },
     }
 
     split_cfg = {
         "seed": 42,
         "sources": [
+            # {
+            #     "type": "ratio",
+            #     "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+            #     "layout": "flat",
+            #     "modalities": {
+            #         "image":    {"pattern": r"^cube_(.*)\.npy$"},
+            #         "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+            #         "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
+            #     },
+            #     "ratios": {
+            #         "train": 0.7,
+            #         "valid": 0.15,
+            #         "test":  0.15,
+            #     }
+            # }
             {
-                "type": "ratio",
                 "path": "/home/ri/Desktop/Projects/Datasets/AL175",
                 "layout": "flat",
                 "modalities": {
@@ -325,10 +339,24 @@ if __name__ == "__main__":
                     "label":    {"pattern": r"^lbl_(.*)\.npy$"},
                     "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
                 },
-                "ratios": {
-                    "train": 0.7,
-                    "valid": 0.15,
-                    "test":  0.15,
+
+                "type": "kfold",
+                "num_folds": 5,
+                "fold_idx": 0,
+                "test_source":{
+                    "type": "ratio",
+                    "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+                    "layout": "flat",
+                    "modalities": {
+                        "image":    {"pattern": r"^cube_(.*)\.npy$"},
+                        "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+                        "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
+                    },
+                    "ratios": {
+                        "train": 0.01,
+                        "valid": 0.9,
+                        "test":  0.01,
+                    }
                 }
             }
         ]

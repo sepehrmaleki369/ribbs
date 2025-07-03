@@ -318,9 +318,7 @@ class Split:
         if src.get('type')=='kfold':
             test_src = src.get('test_source')
             test_records = _collect_datapoints_from_source(test_src, self.base_modalities, self._rng)  
-            for rec in test_records:
-                rec['split'] = 'test'          
-            records.extend(test_records)
+            records.extend([rec for rec in test_records if rec['split']=='test'])
         return records
     
 def split_records(src, records, rng):
