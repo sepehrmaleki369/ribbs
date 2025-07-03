@@ -4,6 +4,8 @@
 root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
 # root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
 
+# data_dim: 3,
+# patch_size_z: 90,
 
 # Batch sizes
 train_batch_size: 64

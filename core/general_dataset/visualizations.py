@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
-def visualize_batch(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
+def visualize_batch_2d(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
     """
     Visualizes patches in a batch: image, label, distance, and SDF (if available).
 
@@ -54,5 +54,64 @@ def visualize_batch(batch: Dict[str, Any], num_per_batch: Optional[int] = None) 
             axs[3].imshow(sample_sdf[0], cmap='coolwarm')
             axs[3].set_title("SDF")
             axs[3].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+
+def visualize_batch_3d(
+    batch: Dict[str, Any],
+    projection: str = "max",
+    num_per_batch: Optional[int] = None
+) -> None:
+    """
+    Visualizes 3D patches in a batch by projecting along the Z axis.
+    
+    Args:
+        batch: dict with keys image_patch, label_patch, etc., each a Tensor [B,C,Z,H,W] or [B,Z,H,W]
+        projection: one of "max", "min", "mean"
+        num_per_batch: how many samples to plot
+    """
+    assert projection in ("max","min","mean"), "projection must be max, min, or mean"
+    
+    # which modalities?
+    mods = [k.replace("_patch","") for k in batch if k.endswith("_patch")]
+    num_to_plot = batch["image_patch"].shape[0]
+    if num_per_batch:
+        num_to_plot = min(num_to_plot, num_per_batch)
+    
+    for i in range(num_to_plot):
+        # gather each modality’s volume
+        vols = {}
+        for mod in mods:
+            arr = batch[f"{mod}_patch"][i].numpy()
+            # arr is either (Z,H,W) or (C,Z,H,W)
+            if arr.ndim == 4:
+                # collapse channels by max
+                arr = arr.max(axis=0)
+            vols[mod] = arr  # now Z×H×W
+        
+        # set up subplot grid: rows=modalities, cols=1
+        nrows = len(mods)
+        ncols = 3
+        fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows))
+
+        print(f'Patch {i} ({projection}-projection)')
+        for row, mod in enumerate(mods):
+            vol = vols[mod]  # Z,H,W
+            # compute all three projections
+            projs = {
+                "max":  vol.max(axis=0),
+                "min":  vol.min(axis=0),
+                "mean": vol.mean(axis=0),
+            }
+            for col, (name, proj) in enumerate(projs.items()):
+                ax = axs[row, col] if nrows > 1 else axs[col]
+                ax.imshow(proj)
+                ax.set_title(f"{mod} ({name})")
+                ax.axis("off")
+            
+            for mod, proj in projs.items():
+                print(f'  {mod}: min={proj.min():.3f}, max={proj.max():.3f}')
+            
         plt.tight_layout()
         plt.show()

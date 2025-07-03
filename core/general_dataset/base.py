@@ -14,7 +14,7 @@ from core.general_dataset.patch_validity       import check_min_thrsh_road
 from core.general_dataset.augments    import get_augmentation_metadata, extract_condition_augmentations
 from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
 from core.general_dataset.normalizations import normalize_image
-from core.general_dataset.visualizations import visualize_batch
+from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
 from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
 
@@ -60,19 +60,26 @@ class GeneralizedDataset(Dataset):
         self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
         self.source_folder: str = config.get("source_folder", "")
         self.save_computed: bool = config.get("save_computed", False)
-        self.base_modality = config.get('base_modality')
+        self.base_modalities = config.get('base_modalities')
         self.compute_again_modalities = config.get('compute_again_modalities', False)
+        self.data_dim    = config.get("data_dim", 2)
         self.split_cfg = config["split_cfg"]
         self.split_cfg['seed'] = self.seed
-        self.split_cfg['base_modality'] = self.base_modality
+        self.split_cfg['base_modalities'] = self.base_modalities
         splitter = Split(self.split_cfg)
+        self.patch_size_z = config.get("patch_size_z", 1)
         
 
         if self.root_dir is None:
             raise ValueError("root_dir must be specified in the config.")
         if self.patch_size is None:
             raise ValueError("patch_size must be specified in the config.")
+        if self.data_dim not in (2, 3):
+            raise ValueError(f"data_dim must be 2 or 3, got {self.data_dim}")
+        if self.data_dim == 3 and self.patch_size_z < 2:
+            raise ValueError("patch_size_z must > 1 for 3D")
 
+        
         random.seed(self.seed)
         np.random.seed(self.seed)
 
@@ -167,13 +174,24 @@ class GeneralizedDataset(Dataset):
         if imgs is None:           # corrupted file detected
             # pick a different index (cyclic) so DataLoader doesn’t crash
             return self.__getitem__((idx + 1) % len(self))
-
-        if imgs['image'].ndim == 3:
-            _, H, W = imgs['image'].shape
-        elif imgs['image'].ndim == 2:
-            H, W = imgs['image'].shape
-        else:
-            raise ValueError("Unsupported image dimensions")
+        
+        img = imgs['image']
+        if self.data_dim == 3:
+            # expect shape (C,D,H,W) or (D,H,W)
+            if img.ndim == 4:
+                _, D, H, W = img.shape
+            elif img.ndim == 3:
+                D, H, W = img.shape
+            else:
+                raise ValueError(f"Expected 3- or 4-dim image for data_dim=3; got {img.ndim}D")
+        else:  # 2-D
+            if img.ndim == 2:
+                D, H, W = 1, *img.shape
+            elif img.ndim == 3:
+                _, H, W = img.shape
+                D = 1
+            else:
+                raise ValueError(f"Expected 2- or 3-dim image for data_dim=2; got {img.ndim}D")
 
         if self.split != 'train':
             data = {}
@@ -195,10 +213,26 @@ class GeneralizedDataset(Dataset):
         while not valid_patch_found and attempts < self.max_attempts:
             x = np.random.randint(0, W - self.patch_size + 1)
             y = np.random.randint(0, H - self.patch_size + 1)
-            patch_meta = {"image_idx": idx, "x": x, "y": y}
+            if self.data_dim == 3:
+                z = np.random.randint(0, D - self.patch_size_z + 1)
+            else:
+                z = 0
+            # patch_meta = {"image_idx": idx, "x": x, "y": y}
+            patch_meta = {"image_idx": idx, "x": x, "y": y, "z": z}
+
             if self.augmentations:
-                patch_meta.update(get_augmentation_metadata(self.augmentations))
-            data = extract_condition_augmentations(imgs, patch_meta, self.patch_size, self.augmentations)
+                patch_meta.update(
+                    get_augmentation_metadata(self.augmentations, self.data_dim)
+                )
+            data = extract_condition_augmentations(
+                imgs, patch_meta,
+                patch_size_xy=self.patch_size,
+                patch_size_z=(self.patch_size_z if self.data_dim == 3 else 1),
+                augmentations=self.augmentations,
+                data_dim=self.data_dim
+            )
+
+
             if self.validate_road_ratio:
                 if check_min_thrsh_road(data['label_patch'], self.patch_size, self.threshold):
                     valid_patch_found = True
@@ -222,71 +256,112 @@ class GeneralizedDataset(Dataset):
     
 
 if __name__ == "__main__":
-    split_cfg = {
-        "mode": "folder",
-        # "ratios": {"train": 0.8, "valid": 0.1, "test": 0.1},
-        # "ratio_folders": [
-        #     {
-        #         "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/flat",
-        #         "layout": "flat",
-        #         "modalities": {
-        #             "image": {"pattern": r".*_sat\.tif"},
-        #             "label": {"pattern": r".*_map\.png"}
-        #         }
-        #     }
-        # ]
-        "source_folders": [
-        {
-            "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset",
-            "layout": "folders",
-            "modalities": {
-                "image": {"folder": "sat"},
-                "label": {"folder": "label"},
-                "sdf":   {"folder": "sdf"}  
-            },
-            "splits": {
-                "train": "train",
-                "valid": "valid",
-                "test":  "test"
-            }
-        },
-    ]
+    # split_cfg = {
+    #     "mode": "folder",
+    #     "source_folders": [
+    #     {
+    #         "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset",
+    #         "layout": "folders",
+    #         "modalities": {
+    #             "image": {"folder": "sat"},
+    #             "label": {"folder": "label"},
+    #             "sdf":   {"folder": "sdf"}  
+    #         },
+    #         "splits": {
+    #             "train": "train",
+    #             "valid": "valid",
+    #             "test":  "test"
+    #         }
+    #     },
+    # ]
+    # }
+    # config = {
+    #     "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
+    #     "split": "train",
+    #     # "split": "valid",
+    #     "split_cfg": split_cfg,
+    #     "patch_size": 256,
+    #     "small_window_size": 8,
+    #     "validate_road_ratio": True,
+    #     "threshold": 0.025,
+    #     "max_images": 5,  # For quick testing.
+    #     "seed": 42,
+    #     "fold": None,
+    #     "num_folds": None,
+    #     "verbose": True,
+    #     "augmentations": ["flip_h", "flip_v", 
+    #                       "rotation"],
+    #     "distance_threshold": 15.0,
+    #     "sdf_iterations": 3,
+    #     "sdf_thresholds": [-7, 7],
+    #     "num_workers": 4,
+    #     "split_ratios": {
+    #         "train": 0.7,
+    #         "valid": 0.15,
+    #         "test": 0.15
+    #     },
+    #     "modalities": {
+    #         "image": "sat",
+    #         "label": "map",
+    #         "distance": "distance",
+    #         "sdf": "sdf"
+    #     },
+    #     "base_modalities": ['image', 'label'],
+    #     'compute_again_modalities': False,
+    #     'save_computed': True,
+    #     "data_dim": 2,
+    #     "patch_size_z": 16,
+    # }
 
-    }
-    config = {
-        "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
-        "split": "train",
-        # "split": "valid",
-        "split_cfg": split_cfg,
-        "patch_size": 256,
-        "small_window_size": 8,
-        "validate_road_ratio": True,
-        "threshold": 0.025,
-        "max_images": 5,  # For quick testing.
+    split_cfg = {
         "seed": 42,
-        "fold": None,
-        "num_folds": None,
-        "verbose": True,
-        "augmentations": ["flip_h", "flip_v", "rotation"],
-        "distance_threshold": 15.0,
-        "sdf_iterations": 3,
-        "sdf_thresholds": [-7, 7],
-        "num_workers": 4,
-        "split_ratios": {
-            "train": 0.7,
-            "valid": 0.15,
-            "test": 0.15
-        },
-        "modalities": {
-            "image": "sat",
-            "label": "map",
-            "distance": "distance",
-            "sdf": "sdf"
-        },
-        "base_modality": 'image',
-        'compute_again_modalities': False,
-        'save_computed': True
+        "sources": [
+            {
+                "type": "ratio",
+                "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+                "layout": "flat",
+                "modalities": {
+                    "image":    {"pattern": r"^cube_.*\.npy$"},
+                    "label":    {"pattern": r"^lbl_.*\.npy$"},
+                    "distance": {"pattern": r"^distlbl_.*\.npy$"},
+                },
+                "ratios": {
+                    "train": 0.7,
+                    "valid": 0.15,
+                    "test":  0.15,
+                }
+            }
+        ]
     }
+
+    config = {
+        "root_dir": "/home/ri/Desktop/Projects/Datasets/AL175",
+        "split": "train",                # one of "train","valid","test"
+        "split_cfg": split_cfg,
+
+        "data_dim": 3,                   # your .npy volumes are 3D
+        "patch_size": 64,                # XY window size
+        "patch_size_z": 16,              # Z-depth
+
+        "augmentations": ["flip_h","flip_v","flip_d","rotation"],
+        "validate_road_ratio": False,    # set True if you want to enforce label coverage
+        "threshold": 0.05,
+
+        "distance_threshold": None,      # clip distance map if desired
+        "sdf_iterations": 3,             # only if you compute SDF
+        "sdf_thresholds": [-5, 5],       # ditto
+
+        "save_computed": False,          # we already have distlbl_*.npy
+        "compute_again_modalities": False,
+
+        "max_images": None,
+        "max_attempts": 10,
+        "seed": 42,
+        "num_workers": 4,
+        "verbose": True,
+        "base_modalities": ['image', 'label']
+    }
+
 
     # Create dataset and dataloader.
     dataset = GeneralizedDataset(config)
@@ -306,5 +381,9 @@ if __name__ == "__main__":
             logger.info("Batch keys: %s", batch.keys())
             logger.info("Image shape: %s", batch["image_patch"].shape)
             logger.info("Label shape: %s", batch["label_patch"].shape)
-            visualize_batch(batch)
+            if config["data_dim"] == 2:
+                visualize_batch_2d(batch, num_per_batch=2)
+            else:
+                visualize_batch_3d(batch, projection='max', num_per_batch=2)
+
             # break  # Uncomment to visualize only one batch.
