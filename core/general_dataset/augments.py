@@ -13,18 +13,22 @@ from core.general_dataset.logger import logger
 # Random‑parameter generator
 # -----------------------------------------------------------------------------
 
-def get_augmentation_metadata(augmentations: List[str], data_dim: int) -> Dict[str, Any]:
-    """Return a dict of randomly‑sampled parameters needed by the requested
-    *per‑patch* augmentations.
-    
-    Parameters that are not required by a given transform are simply omitted.
-    Existing rotation/flip keys are kept unchanged.
-    """
+def get_augmentation_metadata(
+    augmentations: List[str],
+    data_dim: int,
+    aug_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Return sampled parameters based on `augmentation_params` from config."""
+    params = aug_params or {}
     meta: Dict[str, Any] = {}
 
-    # -------- spatial (existing) --------
+    # rotation
     if "rotation" in augmentations:
-        meta["angle"] = float(np.random.uniform(0.0, 360.0))
+        rmin = params.get("rotation", {}).get("min", 0.0)
+        rmax = params.get("rotation", {}).get("max", 360.0)
+        meta["angle"] = float(np.random.uniform(rmin, rmax))
+
+    # flips (no change)
     if "flip_h" in augmentations:
         meta["flip_h"] = bool(np.random.rand() > 0.5)
     if "flip_v" in augmentations:
@@ -32,25 +36,48 @@ def get_augmentation_metadata(augmentations: List[str], data_dim: int) -> Dict[s
     if "flip_d" in augmentations and data_dim == 3:
         meta["flip_d"] = bool(np.random.rand() > 0.5)
 
-    # -------- spatial (new) -------------
+    # scale
     if "scale" in augmentations:
-        meta["scale_factor"] = float(np.random.uniform(0.8, 1.2))
-    if "elastic" in augmentations:
-        meta["alpha"] = float(np.random.uniform(5.0, 10.0))   # displacement (px)
-        meta["sigma"] = float(np.random.uniform(3.0, 6.0))   # smoothing (px)
+        smin = params.get("scale", {}).get("min", 0.8)
+        smax = params.get("scale", {}).get("max", 1.2)
+        meta["scale_factor"] = float(np.random.uniform(smin, smax))
 
-    # -------- intensity (new) -----------
+    # elastic
+    if "elastic" in augmentations:
+        e = params.get("elastic", {})
+        a_min, a_max = e.get("alpha_min",5.0), e.get("alpha_max",10.0)
+        s_min, s_max = e.get("sigma_min",3.0), e.get("sigma_max",6.0)
+        meta["alpha"] = float(np.random.uniform(a_min, a_max))
+        meta["sigma"] = float(np.random.uniform(s_min, s_max))
+
+    # brightness_contrast
     if "brightness_contrast" in augmentations:
-        meta["bc_alpha"] = float(np.random.uniform(0.9, 1.1))   # contrast scale
-        meta["bc_beta"]  = float(np.random.uniform(-30.0, 30.0)) # brightness shift (0‑255 space)
+        bc = params.get("brightness_contrast", {})
+        ca, cb = bc.get("alpha_min",0.9), bc.get("alpha_max",1.1)
+        ba, bb = bc.get("beta_min",-30.0), bc.get("beta_max",30.0)
+        meta["bc_alpha"] = float(np.random.uniform(ca, cb))
+        meta["bc_beta"]  = float(np.random.uniform(ba, bb))
+
+    # gamma
     if "gamma" in augmentations:
-        meta["gamma"] = float(np.random.uniform(0.7, 1.5))
+        gmin = params.get("gamma", {}).get("min",0.7)
+        gmax = params.get("gamma", {}).get("max",1.5)
+        meta["gamma"] = float(np.random.uniform(gmin, gmax))
+
+    # gaussian_noise
     if "gaussian_noise" in augmentations:
-        meta["noise_sigma"] = float(np.random.uniform(0.01, 0.03))  # relative to dyn‑range
+        n = params.get("gaussian_noise", {})
+        meta["noise_sigma"] = float(np.random.uniform(n.get("min",0.01), n.get("max",0.03)))
+
+    # gaussian_blur
     if "gaussian_blur" in augmentations:
-        meta["blur_sigma"] = float(np.random.uniform(0.5, 1.5))
+        gb = params.get("gaussian_blur", {})
+        meta["blur_sigma"] = float(np.random.uniform(gb.get("min",0.5), gb.get("max",1.5)))
+
+    # bias_field
     if "bias_field" in augmentations:
-        meta["bias_amp"] = float(np.random.uniform(0.2, 0.4))       # ± amplitude (×mean)
+        bf = params.get("bias_field", {})
+        meta["bias_amp"] = float(np.random.uniform(bf.get("min",0.2), bf.get("max",0.4)))
 
     return meta
 
@@ -289,71 +316,74 @@ def extract_condition_augmentations(
     patch_size_xy: int,
     patch_size_z: int,
     augmentations: List[str],
-    data_dim: int,
+    data_dim: int
 ) -> Dict[str, np.ndarray]:
-    """Extract a patch and apply the augmentations specified in `augmentations`.
-
-    Spatial transforms that affect geometry (flip/scale/elastic/rotation) are applied
-    to *all* modalities so they remain aligned.
-
-    Intensity‑only transforms are applied **only** to the "image" modality.
     """
+    Extract a patch from the full image and apply conditional augmentations.
 
-    # 1) pre‑extract the patch (no aug yet)
-    z = metadata.get("z", 0)
-    data = extract_data(imgs, metadata["x"], metadata["y"], z, patch_size_xy, patch_size_z)
+    Args:
+        imgs (Dict[str, np.ndarray]): Full images for each modality.
+        metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
+    
+    Returns:
+        Dict[str, np.ndarray]: Dictionary of extracted patches.
+    """
+    imgs_aug = imgs.copy()
+    z = metadata.get('z', 0)
+    data = extract_data(imgs,
+                        metadata['x'], metadata['y'], z,
+                        patch_size_xy,
+                        patch_size_z)
+    for key in imgs:
+        if key.endswith("_patch"):
+            modality = key.replace("_patch", "")
+            if 'flip_h' in augmentations:
+                imgs_aug[modality] = flip_h(imgs[modality])
+                data[key] = flip_h(data[key])
+            if 'flip_v' in augmentations:
+                imgs_aug[modality] = flip_v(imgs[modality])
+                data[key] = flip_v(data[key])
+            if 'flip_d' in augmentations and data_dim == 3:
+                imgs_aug[modality] = flip_d(imgs_aug[modality])
+                data[key]          = flip_d(data[key])
+#######
+            if "scale" in augmentations:
+                sf: float = metadata.get("scale_factor")
+                imgs_aug[modality] = scale_patch(imgs_aug[modality], sf, data_dim)
+                patch = scale_patch(patch, sf, data_dim)
 
-    # 2) geometric augmentations ------------------------------------------------
-    for key in list(data.keys()):
-        if not key.endswith("_patch"):
-            continue
-        modality = key.replace("_patch", "")
-        patch = data[key]
+            if "elastic" in augmentations:
+                alpha: float = metadata.get("alpha")
+                sigma: float = metadata.get("sigma")
+                imgs_aug[modality] = elastic_deform_patch(imgs_aug[modality], alpha, sigma, data_dim)
+                patch = elastic_deform_patch(patch, alpha, sigma, data_dim)
 
-        # (a) flips – we also flip the *full* image so that rotation below sees the correct orientation
-        if modality in imgs:
-            if "flip_h" in augmentations and metadata.get("flip_h", False):
-                imgs[modality] = flip_h(imgs[modality])
-                patch = flip_h(patch)
-            if "flip_v" in augmentations and metadata.get("flip_v", False):
-                imgs[modality] = flip_v(imgs[modality])
-                patch = flip_v(patch)
-            if data_dim == 3 and "flip_d" in augmentations and metadata.get("flip_d", False):
-                imgs[modality] = flip_d(imgs[modality])
-                patch = flip_d(patch)
+            # -----------------------------
+            # Intensity augmentations (patch‑only)
+            # -----------------------------
+            if "brightness_contrast" in augmentations:
+                patch = adjust_brightness_contrast(
+                    patch,
+                    metadata.get("bc_alpha"),
+                    metadata.get("bc_beta"),
+                )
+            if "gamma" in augmentations:
+                patch = gamma_correction(patch, metadata.get("gamma"))
+            if "gaussian_noise" in augmentations:
+                patch = add_gaussian_noise(patch, metadata.get("noise_sigma"))
+            if "gaussian_blur" in augmentations:
+                patch = gaussian_blur_patch(patch, metadata.get("blur_sigma"), data_dim)
+            if "bias_field" in augmentations:
+                patch = bias_field_patch(patch, metadata.get("bias_amp"), data_dim)
 
-        # (b) rotation – uses *full* (possibly flipped) image to avoid holes
-        if "rotation" in augmentations:
-            patch = rotate_(imgs[modality], metadata, patch_size_xy, patch_size_z, data_dim)
+            if 'rotation' in augmentations:
+                data[key] = rotate_(imgs_aug[modality], metadata, patch_size_xy, patch_size_z, data_dim)
 
-        # (c) scale (zoom)
-        if "scale" in augmentations:
-            patch = scale_patch(patch, metadata["scale_factor"], data_dim)
-
-        # (d) elastic warp
-        if "elastic" in augmentations:
-            patch = elastic_deform_patch(patch, metadata["alpha"], metadata["sigma"], data_dim)
-
-        data[key] = patch  # write back
-
-    # 3) intensity‑only transforms (image modality *only*) ----------------------
-    if "image_patch" in data:
-        img_patch = data["image_patch"].astype(np.float32)
-
-        if "brightness_contrast" in augmentations:
-            img_patch = adjust_brightness_contrast(img_patch, metadata["bc_alpha"], metadata["bc_beta"])
-        if "gamma" in augmentations:
-            img_patch = gamma_correction(img_patch, metadata["gamma"])
-        if "gaussian_noise" in augmentations:
-            img_patch = add_gaussian_noise(img_patch, metadata["noise_sigma"])
-        if "gaussian_blur" in augmentations:
-            img_patch = gaussian_blur_patch(img_patch, metadata["blur_sigma"], data_dim)
-        if "bias_field" in augmentations:
-            img_patch = bias_field_patch(img_patch, metadata["bias_amp"], data_dim)
-
-        data["image_patch"] = img_patch.astype(data["image_patch"].dtype)
-
+            # Store the fully augmented patch back
+            data[key] = patch    
+    
     return data
+
 
 # -----------------------------------------------------------------------------
 # Public re‑exports

@@ -10,7 +10,7 @@ def visualize_batch_2d(batch: Dict[str, Any], num_per_batch: Optional[int] = Non
         batch (Dict[str, Any]): Dictionary containing batched patches.
         num_per_batch (Optional[int]): Maximum number of patches to visualize.
     """
-
+    print('batch["image_patch"].shape:', batch["image_patch"].shape)
     num_to_plot = batch["image_patch"].shape[0]
     if num_per_batch:
         num_to_plot = min(num_to_plot, num_per_batch)
@@ -76,6 +76,7 @@ def visualize_batch_3d(
     # which modalities?
     print('batch', batch.keys())
     mods = [k.replace("_patch","") for k in batch if k.endswith("_patch")]
+    print('batch["image_patch"].shape:', batch["image_patch"].shape)
     num_to_plot = batch["image_patch"].shape[0]
     if num_per_batch:
         num_to_plot = min(num_to_plot, num_per_batch)

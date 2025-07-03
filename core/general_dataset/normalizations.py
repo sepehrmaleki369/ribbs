@@ -6,18 +6,31 @@ Define multiple strategies and a unified `normalize` dispatcher.
 """
 import numpy as np
 from core.general_dataset.logger import logger
+from typing import Optional
 
 
-def min_max_normalize(image: np.ndarray, new_min: float = 0.0, new_max: float = 1.0) -> np.ndarray:
+def min_max_normalize(
+    image: np.ndarray,
+    new_min: float = 0.0,
+    new_max: float = 1.0,
+    old_min: Optional[float] = None,
+    old_max: Optional[float] = None,
+) -> np.ndarray:
     """
-    Scale image intensities to the [new_min, new_max] range.
+    Scale image intensities to [new_min, new_max].
+    If old_min/old_max are provided, use them as the original bounds;
+    otherwise compute from the image itself.
     """
     img = image.astype(np.float32)
-    old_min, old_max = img.min(), img.max()
-    if old_max == old_min:
-        logger.warning("Min-Max normalization: constant image, returning zeros.")
+    lo = old_min if old_min is not None else float(img.min())
+    hi = old_max if old_max is not None else float(img.max())
+    if hi <= lo:
+        logger.warning(
+            "Min-Max normalization: invalid range old_min=%s, old_max=%s; returning new_min.",
+            lo, hi
+        )
         return np.full_like(img, new_min)
-    scaled = (img - old_min) / (old_max - old_min)
+    scaled = (img - lo) / (hi - lo)
     return scaled * (new_max - new_min) + new_min
 
 
