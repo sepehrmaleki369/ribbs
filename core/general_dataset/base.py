@@ -67,6 +67,7 @@ class GeneralizedDataset(Dataset):
         self.split_cfg['base_modalities'] = self.base_modalities
         splitter = Split(self.split_cfg)
         self.patch_size_z = config.get("patch_size_z", 1)
+        self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
         
 
         if self.patch_size is None:
@@ -140,25 +141,52 @@ class GeneralizedDataset(Dataset):
 
     def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
-        Normalize image patch values and binarize label patch if needed.
-        Args:
-            data (Dict[str, np.ndarray]): Dictionary containing patches.
-        Returns:
-            Dict[str, np.ndarray]: Postprocessed patches.
+        1) Binarize/clip per modality
+        2) Apply config‐driven normalization for any modality with a dict in self.norm_cfg
         """
-        for key in data:
-            if key == "image_patch":
-                data[key] = normalize_image(data[key])
-            elif key == "label_patch":
-                if data[key].max() > 1:
-                    data[key] = (data[key] > 127).astype(np.uint8)
-            elif key == "distance_patch":
-                if self.distance_threshold:
-                    data[key] = np.clip(data[key], 0, self.distance_threshold)
-            elif key == "sdf_patch":
-                if self.sdf_thresholds:
-                    data[key] = np.clip(data[key], self.sdf_thresholds[0], self.sdf_thresholds[1])
+        # --- 1) modality‐specific postprocessing ---
+        for key, arr in data.items():
+            if not key.endswith("_patch"):
+                continue
+
+            modality = key[:-6]  # strip "_patch"
+            patch = arr.astype(np.float32)
+
+            if modality == "label":
+                # binarize everything >127 (or >0 if already 0/1)
+                thresh = 127 if patch.max() > 1 else 0
+                data[key] = (patch > thresh).astype(np.uint8)
+
+            elif modality == "distance" and self.distance_threshold is not None:
+                data[key] = np.clip(patch, 0, self.distance_threshold)
+
+            elif modality == "sdf" and self.sdf_thresholds is not None:
+                lo, hi = self.sdf_thresholds
+                data[key] = np.clip(patch, lo, hi)
+
+            else:
+                # leave other modalities (e.g. image) as float32 for now
+                data[key] = patch
+
+        # --- 2) config‐driven normalization ---
+        for key, arr in data.items():
+            if not key.endswith("_patch"):
+                continue
+
+            modality = key[:-6]
+            cfg = self.norm_cfg.get(modality, None)
+
+            # only normalize when cfg is a dict
+            if isinstance(cfg, dict):
+                method = cfg.get("method", "minmax")
+                params = {k: v for k, v in cfg.items() if k != "method"}
+                # run in float32
+                data[key] = normalize_image(arr.astype(np.float32),
+                                            method=method,
+                                            **params)
+
         return data
+
 
     
 
@@ -321,6 +349,13 @@ if __name__ == "__main__":
 
         # 2D vs 3D
         "data_dim": 2,
+
+        "normalization": {
+            "image":    {"method": "minmax", "new_min": 0.0, "new_max": 1.0},
+            "distance": {"method": "zscore"},
+            "sdf":      {},            # empty → no normalization
+            "label":    None,          # or null in JSON → skip
+        },
     }
 
     # split_cfg = {
