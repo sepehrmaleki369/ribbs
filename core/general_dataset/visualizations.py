@@ -74,6 +74,7 @@ def visualize_batch_3d(
     assert projection in ("max","min","mean"), "projection must be max, min, or mean"
     
     # which modalities?
+    print('batch', batch.keys())
     mods = [k.replace("_patch","") for k in batch if k.endswith("_patch")]
     num_to_plot = batch["image_patch"].shape[0]
     if num_per_batch:
@@ -94,24 +95,32 @@ def visualize_batch_3d(
         nrows = len(mods)
         ncols = 3
         fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows))
-
+        project = {
+            "max": np.max,
+            "min": np.min,
+            "mean": np.mean
+        }[projection]
         print(f'Patch {i} ({projection}-projection)')
         for row, mod in enumerate(mods):
-            vol = vols[mod]  # Z,H,W
-            # compute all three projections
-            projs = {
-                "max":  vol.max(axis=0),
-                "min":  vol.min(axis=0),
-                "mean": vol.mean(axis=0),
-            }
+            vol = vols[mod]
+            # Compute projections along axes:
+            #   XY: collapse Z axis -> (H, W)
+            #   XZ: collapse Y axis -> (Z, W)
+            #   YZ: collapse X axis -> (Z, H) then transpose for display (H, Z)
+            proj_xy = project(vol, axis=0)
+            proj_xz = project(vol, axis=1)
+            proj_yz = project(vol, axis=2).T
+
+            projs = {"XY": proj_xy, "XZ": proj_xz, "YZ": proj_yz}
+
             for col, (name, proj) in enumerate(projs.items()):
                 ax = axs[row, col] if nrows > 1 else axs[col]
-                ax.imshow(proj)
-                ax.set_title(f"{mod} ({name})")
+                ax.imshow(proj, cmap='gray')
+                ax.set_title(f"{mod} - {name} view")
                 ax.axis("off")
-            
-            for mod, proj in projs.items():
-                print(f'  {mod}: min={proj.min():.3f}, max={proj.max():.3f}')
-            
+
+                # Print projection stats
+                print(f'  {mod} {name}: min={proj.min():.3f}, max={proj.max():.3f}, mean={proj.mean():.3f}')
+
         plt.tight_layout()
         plt.show()

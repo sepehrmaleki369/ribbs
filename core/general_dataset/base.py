@@ -40,7 +40,6 @@ class GeneralizedDataset(Dataset):
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__()
         self.config = config
-        self.root_dir: str = config.get("root_dir")
         self.split: str = config.get("split", "train")
         self.patch_size: int = config.get("patch_size", 128)
         self.small_window_size: int = config.get("small_window_size", 8)
@@ -70,8 +69,6 @@ class GeneralizedDataset(Dataset):
         self.patch_size_z = config.get("patch_size_z", 1)
         
 
-        if self.root_dir is None:
-            raise ValueError("root_dir must be specified in the config.")
         if self.patch_size is None:
             raise ValueError("patch_size must be specified in the config.")
         if self.data_dim not in (2, 3):
@@ -88,7 +85,6 @@ class GeneralizedDataset(Dataset):
         splitter = Split(split_cfg)
         self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
         self.modalities = list(self.modality_files.keys())
-        
         # sanity check
         if 'image' not in self.modality_files or 'label' not in self.modality_files:
             raise ValueError("Split must define both 'image' and 'label' modalities in split_cfg.")
@@ -256,62 +252,76 @@ class GeneralizedDataset(Dataset):
     
 
 if __name__ == "__main__":
-    # split_cfg = {
-    #     "mode": "folder",
-    #     "source_folders": [
-    #     {
-    #         "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset",
-    #         "layout": "folders",
-    #         "modalities": {
-    #             "image": {"folder": "sat"},
-    #             "label": {"folder": "label"},
-    #             "sdf":   {"folder": "sdf"}  
-    #         },
-    #         "splits": {
-    #             "train": "train",
-    #             "valid": "valid",
-    #             "test":  "test"
-    #         }
-    #     },
-    # ]
-    # }
-    # config = {
-    #     "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
-    #     "split": "train",
-    #     # "split": "valid",
-    #     "split_cfg": split_cfg,
-    #     "patch_size": 256,
-    #     "small_window_size": 8,
-    #     "validate_road_ratio": True,
-    #     "threshold": 0.025,
-    #     "max_images": 5,  # For quick testing.
-    #     "seed": 42,
-    #     "fold": None,
-    #     "num_folds": None,
-    #     "verbose": True,
-    #     "augmentations": ["flip_h", "flip_v", 
-    #                       "rotation"],
-    #     "distance_threshold": 15.0,
-    #     "sdf_iterations": 3,
-    #     "sdf_thresholds": [-7, 7],
-    #     "num_workers": 4,
-    #     "split_ratios": {
-    #         "train": 0.7,
-    #         "valid": 0.15,
-    #         "test": 0.15
-    #     },
-    #     "modalities": {
-    #         "image": "sat",
-    #         "label": "map",
-    #         "distance": "distance",
-    #         "sdf": "sdf"
-    #     },
-    #     "base_modalities": ['image', 'label'],
-    #     'compute_again_modalities': False,
-    #     'save_computed': True,
-    #     "data_dim": 2,
-    #     "patch_size_z": 16,
-    # }
+    split_cfg = {
+        "seed": 42,
+        "sources": [
+            {
+                "type": "folder",
+                "path": "/home/ri/Desktop/Projects/Datasets/RRRR/dataset",
+                "layout": "folders",
+                "modalities": {
+                    "image":    {"folder": "sat"},
+                    "label":    {"folder": "label"},
+                    "distance": {"folder": "distance"},
+                    "sdf":      {"folder": "sdf"},
+                },
+                "splits": {
+                    "train": "train",
+                    "valid": "valid",
+                    "test":  "test",
+                }
+            }
+        ]
+    }
+
+    # ------------------------------------
+    # full config for GeneralizedDataset
+    # ------------------------------------
+    config = {
+        # which split to load
+        "split": "train",
+
+        # pass the splitter cfg here
+        "split_cfg": split_cfg,
+
+        # patch extraction params
+        "patch_size": 256,
+        "patch_size_z": 1,             # keep at 1 for 2D data
+
+        # optional small‐window check
+        "small_window_size": 8,
+
+        # require a minimum fraction of road pixels in each patch
+        "validate_road_ratio": True,
+        "threshold": 0.025,
+
+        # if you want to limit to just N images (for debugging), set here
+        "max_images": 5,
+
+        # random seeds & workers
+        "seed": 42,
+        "num_workers": 4,
+        "verbose": True,
+
+        # train‐time augmentations
+        "augmentations": ["flip_h", "flip_v", "rotation"],
+
+        # distance & SDF modalities: compute if missing
+        "distance_threshold": 15.0,
+        "sdf_iterations": 3,
+        "sdf_thresholds": [-7, 7],
+        "compute_again_modalities": False,
+        "save_computed": True,
+
+        # only used if you ever switch to ratio‐based splitting
+        "split_ratios": {"train": 0.7, "valid": 0.15, "test": 0.15},
+
+        # these are the “base” modalities that must all be present
+        "base_modalities": ["image", "label"],
+
+        # 2D vs 3D
+        "data_dim": 2,
+    }
 
     split_cfg = {
         "seed": 42,
@@ -321,9 +331,9 @@ if __name__ == "__main__":
                 "path": "/home/ri/Desktop/Projects/Datasets/AL175",
                 "layout": "flat",
                 "modalities": {
-                    "image":    {"pattern": r"^cube_.*\.npy$"},
-                    "label":    {"pattern": r"^lbl_.*\.npy$"},
-                    "distance": {"pattern": r"^distlbl_.*\.npy$"},
+                    "image":    {"pattern": r"^cube_(.*)\.npy$"},
+                    "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+                    "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
                 },
                 "ratios": {
                     "train": 0.7,
@@ -335,13 +345,12 @@ if __name__ == "__main__":
     }
 
     config = {
-        "root_dir": "/home/ri/Desktop/Projects/Datasets/AL175",
         "split": "train",                # one of "train","valid","test"
         "split_cfg": split_cfg,
 
         "data_dim": 3,                   # your .npy volumes are 3D
-        "patch_size": 64,                # XY window size
-        "patch_size_z": 16,              # Z-depth
+        "patch_size": 90,                # XY window size
+        "patch_size_z": 90,              # Z-depth
 
         "augmentations": ["flip_h","flip_v","flip_d","rotation"],
         "validate_road_ratio": False,    # set True if you want to enforce label coverage
@@ -351,7 +360,7 @@ if __name__ == "__main__":
         "sdf_iterations": 3,             # only if you compute SDF
         "sdf_thresholds": [-5, 5],       # ditto
 
-        "save_computed": False,          # we already have distlbl_*.npy
+        "save_computed": True,          # we already have distlbl_*.npy
         "compute_again_modalities": False,
 
         "max_images": None,
