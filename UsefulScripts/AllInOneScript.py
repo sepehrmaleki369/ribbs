@@ -573,702 +573,6 @@ def setup_logger(
     return logger
 
 # ------------------------------------
-# core/general_dataset.py
-# ------------------------------------
-import os
-import json
-import warnings
-import logging
-import random
-import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
-
-import numpy as np
-from sklearn.model_selection import KFold
-from scipy.ndimage import distance_transform_edt, rotate, binary_dilation
-from tqdm import tqdm
-
-import torch
-from torch.utils.data import Dataset, DataLoader
-
-import rasterio
-from rasterio.errors import NotGeoreferencedWarning
-warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-"""
-assumptions:
-    - lbl can be binary or int (thresholded by 127)
-    - roads are 1 on lbl
-    - image modality must be defined 
-    - label modality is not required necessarily (even it's possible to define one folder to more than one modality) 
-    - for modalities other that label and image: 
-        - file names must be in this format: modality_filename = f"{base}_{key}.npy"
-        - if the computed modality's folder does not contain file "config.json" it will be computed again
-    - if use_splitting then there is two options:
-        - 1) kfold -> source_folder, num_folds and fold is required
-        - 2) split_ratio -> source_folder, ratios are required
-    - there is two optiona overall: 
-        - 1) setting stride -> so dataloader extracts all valid patches per image (removed in this version)
-        - 2) if stride was None -> extracts just one patch per image
-"""
-
-def compute_distance_map(lbl: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
-    """
-    Compute a distance map from a label image.
-
-    Args:
-        lbl (np.ndarray): Input label image.
-        distance_threshold (Optional[float]): Maximum distance value.
-    
-    Returns:
-        np.ndarray: Distance map.
-    """
-    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
-    distance_map = distance_transform_edt(lbl_bin == 0)
-    if distance_threshold is not None:
-        np.minimum(distance_map, distance_threshold, out=distance_map)
-    return distance_map
-
-def compute_sdf(lbl: np.ndarray, sdf_iterations: int, sdf_thresholds: List[float]) -> np.ndarray:
-    """
-    Compute the signed distance function (SDF) for a label image.
-
-    Args:
-        lbl (np.ndarray): Input label image.
-        sdf_iterations (int): Number of iterations for dilation.
-        sdf_thresholds (List[float]): [min, max] thresholds for the SDF.
-    
-    Returns:
-        np.ndarray: The SDF computed.
-    """
-    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
-    dilated = binary_dilation(lbl_bin, iterations=sdf_iterations)
-    dist_out = distance_transform_edt(1 - dilated)
-    dist_in  = distance_transform_edt(lbl_bin)
-    sdf = dist_out - dist_in
-    if sdf_thresholds is not None:
-        sdf = np.clip(sdf, sdf_thresholds[0], sdf_thresholds[1])
-    return sdf
-
-def _is_readable_tiff(path: str) -> bool:
-    """
-    Stubbed-out for tests (and general use):
-    never drop .tif/.tiff files based on rasterio.
-    """
-    return True
-
-def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
-    """
-    Load an array from disk.  If the file is unreadable, return None.
-    """
-    try:
-        if file_path.endswith(".npy"):
-            return np.load(file_path)
-        else:
-            with rasterio.open(file_path) as src:
-                return src.read().astype(np.float32)
-    except Exception:
-        return None
-
-class GeneralizedDataset(Dataset):
-    """
-    PyTorch Dataset for generalized remote sensing or segmentation datasets.
-    """
-    def __init__(self, config: Dict[str, Any]) -> None:
-        super().__init__()
-        self.config = config
-        self.root_dir: str = config.get("root_dir")
-        self.split: str = config.get("split", "train")
-        self.patch_size: int = config.get("patch_size", 128)
-        self.small_window_size: int = config.get("small_window_size", 8)
-        self.threshold: float = config.get("threshold", 0.05)
-        self.max_images: Optional[int] = config.get("max_images")
-        self.max_attempts: int = config.get("max_attempts", 10)
-        self.validate_road_ratio: bool = config.get("validate_road_ratio", False)
-        self.seed: int = config.get("seed", 42)
-        self.fold = config.get("fold")
-        self.num_folds = config.get("num_folds")
-        self.verbose: bool = config.get("verbose", False)
-        self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
-        self.distance_threshold: Optional[float] = config.get("distance_threshold")
-        self.sdf_iterations: int = config.get("sdf_iterations")
-        self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
-        self.num_workers: int = config.get("num_workers", 4)
-        self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
-        self.use_splitting: bool = config.get("use_splitting", False)
-        self.modalities: Dict[str, str] = config.get("modalities", {"image":"sat","label":"map"})
-        self.source_folder: str = config.get("source_folder", "")
-        self.save_computed: bool = config.get("save_computed", False)
-
-        if self.root_dir is None:
-            raise ValueError("root_dir must be specified in the config.")
-        if self.patch_size is None:
-            raise ValueError("patch_size must be specified in the config.")
-
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-
-        split_dir = os.path.join(self.root_dir, self.split)
-        if self.use_splitting and self.split != 'test':
-            split_dir = os.path.join(self.root_dir, self.source_folder)
-        self.data_dir: str = split_dir
-
-        self.modality_dirs: Dict[str, str] = {}
-        self.modality_files: Dict[str, List[str]] = {}
-        exts = ['.tiff', '.tif', '.png', '.jpg', '.npy']
-
-        # Process "image" modality.
-        folder_name = self.modalities['image']
-        mod_dir = os.path.join(self.data_dir, folder_name)
-        if not os.path.isdir(mod_dir):
-            raise ValueError(f"Modality directory {mod_dir} not found.")
-        self.modality_dirs['image'] = mod_dir
-        files = sorted(
-            f for f in os.listdir(mod_dir)
-            if any(f.endswith(ext) for ext in exts)
-        )
-        self.modality_files['image'] = files
-
-        if self.max_images is not None:
-            self.modality_files['image'] = self.modality_files['image'][:self.max_images]
-
-        # Process "label" modality.
-        if "label" in self.modalities:
-            folder_name = self.modalities['label']
-            mod_dir = os.path.join(self.data_dir, folder_name)
-            if not os.path.isdir(mod_dir):
-                raise ValueError(f"Modality directory {mod_dir} not found.")
-            self.modality_dirs['label'] = mod_dir
-            files = sorted(
-                f for f in os.listdir(mod_dir)
-                if any(f.endswith(ext) for ext in exts)
-            )
-            self.modality_files['label'] = files
-
-            if self.max_images is not None:
-                self.modality_files['label'] = self.modality_files['label'][:self.max_images]
-
-        # Precompute additional modalities (e.g., distance, sdf).
-        for key in [modal for modal in self.modalities if modal not in ['image', 'label']]:
-            folder_name = self.modalities[key]
-            mod_dir = os.path.join(self.data_dir, folder_name)
-            os.makedirs(mod_dir, exist_ok=True)
-            sdf_comp_again = False
-            config_path = os.path.join(mod_dir, "config.json")
-            # if os.path.exists(config_path):
-            #     with open(config_path, "r") as config_file:
-            #         saved_config = json.load(config_file)
-            #         sdf_comp_again = self.sdf_iterations != saved_config.get("sdf_iterations", None)
-
-            logger.info(f"Generating {key} modality maps...")
-            for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
-                                       total=len(self.modality_files["label"]),
-                                       desc=f"Processing {key} maps"):
-                lbl_path = os.path.join(self.modality_dirs['label'], self.modality_files["label"][file_idx])
-                lbl = load_array_from_file(lbl_path)
-                base, _ = os.path.splitext(file)
-                modality_filename = f"{base}_{key}.npy"
-                modality_path = os.path.join(mod_dir, modality_filename)
-                if self.save_computed:
-                    if key == "distance":
-                        if not os.path.exists(modality_path):
-                            processed_map = compute_distance_map(lbl, None)
-                            np.save(modality_path, processed_map)
-                    elif key == "sdf":
-                        if not os.path.exists(modality_path) or sdf_comp_again:
-                            processed_map = compute_sdf(lbl, self.sdf_iterations, None)
-                            np.save(modality_path, processed_map)
-                    else:
-                        raise ValueError(f"Modality {key} not supported.")
-            with open(config_path, "w") as config_file:
-                json.dump(self.config, config_file, indent=4)
-            self.modality_dirs[key] = mod_dir
-            files = sorted([f for f in os.listdir(mod_dir) if any(f.endswith(ext) for ext in exts)])
-            self.modality_files[key] = files
-
-        # Perform dataset splitting if requested.
-        if self.use_splitting:
-            if self.fold is not None and self.num_folds is not None:
-                # ----- KFold Splitting -----
-                files = self.modality_files["image"]
-                kf = KFold(n_splits=self.num_folds, shuffle=True, random_state=self.seed)
-                splits = list(kf.split(files))
-                if self.split == "train":
-                    selected_indices = splits[self.fold][0].tolist()
-                elif self.split == "valid":
-                    selected_indices = splits[self.fold][1].tolist()
-                elif self.split == "test":
-                    selected_indices = [i for i in range(len(files))]
-                else:
-                    raise ValueError("For KFold splitting, split must be 'train' or 'valid' or 'test'.", self.split)
-                for key in self.modality_files:
-                    all_files = self.modality_files[key]
-                    self.modality_files[key] = [all_files[i] for i in selected_indices]
-            else:
-                # ----- Split by Ratios -----
-                files = self.modality_files["label"]
-                num_files = len(files)
-                indices = np.arange(num_files)
-                np.random.shuffle(indices)
-                train_count = int(num_files * self.split_ratios["train"])
-                valid_count = int(num_files * self.split_ratios["valid"])
-                if self.split == "train":
-                    selected_indices = indices[:train_count]
-                elif self.split == "valid":
-                    selected_indices = indices[train_count:train_count + valid_count]
-                elif self.split == "test":
-                    selected_indices = indices[train_count + valid_count:]
-                else:
-                    raise ValueError("For an 'entire' folder, split must be one of 'train', 'valid', or 'test'.")
-                for key in self.modality_files:
-                    all_files = self.modality_files[key]
-                    self.modality_files[key] = [all_files[i] for i in selected_indices]
-
-        if self.max_images is not None:
-            for key in self.modality_files:
-                self.modality_files[key] = self.modality_files[key][:self.max_images]
-
-    def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
-        imgs: Dict[str, np.ndarray] = {}
-        for key in self.modalities:
-            if file_idx < len(self.modality_files[key]):
-                file_path = os.path.join(self.modality_dirs[key], self.modality_files[key][file_idx])
-                arr = load_array_from_file(file_path)
-                if arr is None:            # <- corrupted TIFF
-                    return None            # signal caller to skip this index
-            else:
-                lbl_path = os.path.join(self.modality_dirs['label'], self.modality_files["label"][file_idx])
-                lbl = load_array_from_file(lbl_path)
-                if key == "distance":
-                    arr = compute_distance_map(lbl, None)
-                elif key == "sdf":
-                    arr = compute_sdf(lbl, self.sdf_iterations, None)
-                else:
-                    raise ValueError(f"Modality {key} not supported.")
-                
-            imgs[key] = arr
-        return imgs
-
-    def _check_small_window(self, image_patch: np.ndarray) -> bool:
-        """
-        Check that no small window in the image patch is entirely black or white.
-
-        Args:
-            image_patch (np.ndarray): Input patch (H x W) or (C x H x W)
-
-        Returns:
-            bool: True if valid, False if any window is all black or white.
-        """
-        sw = self.small_window_size
-
-        # Ensure image has shape (C, H, W)
-        if image_patch.ndim == 2:
-            image_patch = image_patch[None, :, :]  # Add channel dimension
-
-        C, H, W = image_patch.shape
-        if H < sw or W < sw:
-            return False
-
-        # Set thresholds
-        max_val = image_patch.max()
-        if max_val > 1.0:
-            high_thresh = 255
-            low_thresh = 0
-        else:
-            high_thresh = 255 / 255.0
-            low_thresh = 0 / 255.0
-
-        # Slide window over spatial dimensions
-        for c in range(C):
-            for y in range(0, H - sw + 1):
-                for x in range(0, W - sw + 1):
-                    window = image_patch[c, y:y + sw, x:x + sw]
-                    window_var = np.var(window)
-                    if window_var < 0.01:
-                        return False
-                    # print(window)
-                    if np.all(window >= high_thresh):
-                        return False  # Found an all-white window
-                    if np.all(window <= low_thresh):
-                        return False  # Found an all-black window
-
-        return True  # All windows passed
-
-
-    def _check_min_thrsh_road(self, label_patch: np.ndarray) -> bool:
-        """
-        Check if the label patch has at least a minimum percentage of road pixels.
-
-        Args:
-            label_patch (np.ndarray): The label patch.
-        
-        Returns:
-            bool: True if the patch meets the minimum threshold; False otherwise.
-        """
-        patch = label_patch
-        if patch.max() > 1:
-            patch = (patch > 127).astype(np.uint8)
-        road_percentage = np.sum(patch) / (self.patch_size * self.patch_size)
-        return road_percentage >= self.threshold
-
-    def __len__(self) -> int:
-        return len(self.modality_files['image'])
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        imgs = self._load_datapoint(idx)
-        if imgs is None:           # corrupted file detected
-            # pick a different index (cyclic) so DataLoader doesn’t crash
-            return self.__getitem__((idx + 1) % len(self))
-
-        if imgs['image'].ndim == 3:
-            _, H, W = imgs['image'].shape
-        elif imgs['image'].ndim == 2:
-            H, W = imgs['image'].shape
-        else:
-            raise ValueError("Unsupported image dimensions")
-
-        if self.split != 'train':
-            data = {}
-            patch_meta = {"image_idx": idx, "x": -1, "y": -1}
-            for key, array in imgs.items():
-                if array.ndim == 3:
-                    data[f"{key}_patch"] = array
-                elif array.ndim == 2:
-                    data[f"{key}_patch"] = array
-                else:
-                    raise ValueError("Unsupported array dimensions in _extract_data")
-            data['metadata'] = patch_meta
-            data = self._postprocess_patch(data)
-            
-            return data
-
-        valid_patch_found = False
-        attempts = 0
-        while not valid_patch_found and attempts < self.max_attempts:
-            x = np.random.randint(0, W - self.patch_size + 1)
-            y = np.random.randint(0, H - self.patch_size + 1)
-            patch_meta = {"image_idx": idx, "x": x, "y": y}
-            if self.augmentations:
-                patch_meta.update(self._get_augmentation_metadata())
-            data = self._extract_condition_augmentations(imgs, patch_meta)
-            if self.validate_road_ratio:
-                if self._check_min_thrsh_road(data['label_patch']):
-                    valid_patch_found = True
-                    data['metadata'] = patch_meta
-                    data = self._postprocess_patch(data)
-                    return data
-            else:
-                valid_patch_found = True
-                data['metadata'] = patch_meta
-                data = self._postprocess_patch(data)
-                return data
-            
-            attempts += 1
-
-        # If a valid patch isn't found after max_attempts, fallback to the last sampled patch
-        if not valid_patch_found:
-            logger.warning("No valid patch found after %d attempts; trying next image", self.max_attempts)
-            return self.__getitem__((idx + 1) % len(self))
-        return None
-        
-    def _get_augmentation_metadata(self) -> Dict[str, Any]:
-        """
-        Generate random augmentation parameters for a patch.
-
-        Returns:
-            Dict[str, Any]: Augmentation metadata.
-        """
-        meta: Dict[str, Any] = {}
-        if 'rotation' in self.augmentations:
-            meta['angle'] = np.random.uniform(0, 360)
-        if 'flip_h' in self.augmentations:
-            meta['flip_h'] = np.random.rand() > 0.5
-        if 'flip_v' in self.augmentations:
-            meta['flip_v'] = np.random.rand() > 0.5
-        return meta
-
-    def _normalize_image(self, image: np.ndarray) -> np.ndarray:
-        return image / 255.0 if image.max() > 1.0 else image
-
-    def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """
-        Normalize image patch values and binarize label patch if needed.
-
-        Args:
-            data (Dict[str, np.ndarray]): Dictionary containing patches.
-        
-        Returns:
-            Dict[str, np.ndarray]: Postprocessed patches.
-        """
-        for key in data:
-            if key == "image_patch":
-                data[key] = self._normalize_image(data[key])
-            elif key == "label_patch":
-                if data[key].max() > 1:
-                    data[key] = (data[key] > 127).astype(np.uint8)
-            elif key == "distance_patch":
-                if self.distance_threshold:
-                    data[key] = np.clip(data[key], 0, self.distance_threshold)
-            elif key == "sdf_patch":
-                if self.sdf_thresholds:
-                    data[key] = np.clip(data[key], self.sdf_thresholds[0], self.sdf_thresholds[1])
-        return data
-
-    def _extract_condition_augmentations(self, imgs: Dict[str, np.ndarray], metadata: Dict[str, Any]) -> Dict[str, np.ndarray]:
-        """
-        Extract a patch from the full image and apply conditional augmentations.
-
-        Args:
-            imgs (Dict[str, np.ndarray]): Full images for each modality.
-            metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
-        
-        Returns:
-            Dict[str, np.ndarray]: Dictionary of extracted patches.
-        """
-        imgs_aug = imgs.copy()
-        data = self._extract_data(imgs, metadata['x'], metadata['y'])
-        for key in imgs:
-            if key.endswith("_patch"):
-                modality = key.replace("_patch", "")
-                if 'flip_h' in self.augmentations:
-                    imgs_aug[modality] = self._flip_h(imgs[modality])
-                    data[key] = self._flip_h(data[key])
-                if 'flip_v' in self.augmentations:
-                    imgs_aug[modality] = self._flip_v(imgs[modality])
-                    data[key] = self._flip_v(data[key])
-                if 'rotation' in self.augmentations:
-                    data[key] = self._rotate(imgs_aug[modality], metadata)
-        return data
-
-    def _extract_data(self, imgs: Dict[str, np.ndarray], x: int, y: int) -> Dict[str, np.ndarray]:
-        """
-        Extract a patch from each modality starting at (x, y) with size self.patch_size.
-
-        Args:
-            imgs (Dict[str, np.ndarray]): Full images.
-            x (int): x-coordinate.
-            y (int): y-coordinate.
-        
-        Returns:
-            Dict[str, np.ndarray]: Extracted patch for each modality.
-        """
-        data: Dict[str, np.ndarray] = {}
-        for key, array in imgs.items():
-            if array.ndim == 3:
-                data[f"{key}_patch"] = array[:, y:y + self.patch_size, x:x + self.patch_size]
-            elif array.ndim == 2:
-                data[f"{key}_patch"] = array[y:y + self.patch_size, x:x + self.patch_size]
-            else:
-                raise ValueError("Unsupported array dimensions in _extract_data")
-        return data
-
-    def _flip_h(self, full_array: np.ndarray) -> np.ndarray:
-        return np.flip(full_array, axis=-1)
-    
-    def _flip_v(self, full_array: np.ndarray) -> np.ndarray:
-        return np.flip(full_array, axis=-2)
-    
-    def _rotate(self, full_array: np.ndarray, patch_meta: Dict[str, Any]) -> np.ndarray:
-        """
-        Rotate a patch using an expanded crop to avoid border effects.
-        If the crop is too small, log a warning and return a zero patch.
-
-        Args:
-            full_array (np.ndarray): Full image array.
-            patch_meta (Dict[str, Any]): Contains patch coordinates and angle.
-        
-        Returns:
-            np.ndarray: Rotated patch.
-        """
-        patch_size = self.patch_size
-        L = int(np.ceil(patch_size * math.sqrt(2)))
-        x = patch_meta["x"]
-        y = patch_meta["y"]
-        angle = patch_meta["angle"]
-
-        cx = x + patch_size // 2
-        cy = y + patch_size // 2
-        half_L = L // 2
-        x0 = max(0, cx - half_L)
-        y0 = max(0, cy - half_L)
-        x1 = min(full_array.shape[-1], cx + half_L)
-        y1 = min(full_array.shape[-2], cy + half_L)
-
-        if full_array.ndim == 3:
-            crop = full_array[:, y0:y1, x0:x1]
-            if crop.shape[1] < L or crop.shape[2] < L:
-                logger.warning("Crop too small for 3D patch rotation; returning zero patch.")
-                return np.zeros((full_array.shape[0], patch_size, patch_size), dtype=full_array.dtype)
-            rotated_channels = [rotate(crop[c], angle, reshape=False, order=1) for c in range(full_array.shape[0])]
-            rotated = np.stack(rotated_channels)
-            start = (L - patch_size) // 2
-            return rotated[:, start:start + patch_size, start:start + patch_size]
-        elif full_array.ndim == 2:
-            crop = full_array[y0:y1, x0:x1]
-            if crop.shape[0] < L or crop.shape[1] < L:
-                logger.warning("Crop too small for 2D patch rotation; returning zero patch.")
-                return np.zeros((patch_size, patch_size), dtype=full_array.dtype)
-            rotated = rotate(crop, angle, reshape=False, order=1)
-            start = (L - patch_size) // 2
-            return rotated[start:start + patch_size, start:start + patch_size]
-        else:
-            raise ValueError("Unsupported array shape")
-
-        
-def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Custom collate function with None filtering.
-    """
-    # Filter out None samples
-    batch = [sample for sample in batch if sample is not None]
-    
-    # Handle empty batch case
-    if not batch:
-        logger.warning("Empty batch after filtering None values")
-        return {}  # Or return a default empty batch structure
-    
-    # Original collation logic
-    collated: Dict[str, Any] = {}
-    for key in batch[0]:
-        items = []
-        for sample in batch:
-            value = sample[key]
-            if isinstance(value, np.ndarray):
-                value = torch.from_numpy(value)
-            items.append(value)
-        if isinstance(items[0], torch.Tensor):
-            collated[key] = torch.stack(items)
-        else:
-            collated[key] = items
-    return collated
-
-def worker_init_fn(worker_id):
-    """
-    DataLoader worker initialization to ensure different random seeds for each worker.
-    """
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
-
-
-def visualize_batch(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
-    """
-    Visualizes patches in a batch: image, label, distance, and SDF (if available).
-
-    Args:
-        batch (Dict[str, Any]): Dictionary containing batched patches.
-        num_per_batch (Optional[int]): Maximum number of patches to visualize.
-    """
-    import matplotlib.pyplot as plt
-
-    num_to_plot = batch["image_patch"].shape[0]
-    if num_per_batch:
-        num_to_plot = min(num_to_plot, num_per_batch)
-    for i in range(num_to_plot):
-        sample_image = batch["image_patch"][i].numpy()
-        if sample_image.shape[0] == 3:  # CHW to HWC
-            sample_image = sample_image.transpose(1, 2, 0)
-        elif sample_image.shape[0] == 1:
-            sample_image = sample_image[0]  # grayscale
-        else:
-            sample_image = sample_image.transpose(1, 2, 0)
-
-        sample_label = np.squeeze(batch["label_patch"][i].numpy())
-        sample_distance = batch["distance_patch"][i].numpy() if "distance_patch" in batch else None
-        sample_sdf = batch["sdf_patch"][i].numpy() if "sdf_patch" in batch else None
-
-        print(f'Patch {i}')
-        print('  image:', sample_image.min(), sample_image.max())
-        print('  label:', sample_label.min(), sample_label.max())
-        if sample_distance is not None:
-            print('  distance:', sample_distance.min(), sample_distance.max())
-        if sample_sdf is not None:
-            print('  sdf:', sample_sdf.min(), sample_sdf.max())
-
-        num_subplots = 3 + (1 if sample_sdf is not None else 0)
-        fig, axs = plt.subplots(1, num_subplots, figsize=(12, 4))
-        axs[0].imshow(sample_image, cmap='gray' if sample_image.ndim == 2 else None)
-        axs[0].set_title("Image")
-        axs[0].axis("off")
-        axs[1].imshow(sample_label, cmap='gray')
-        axs[1].set_title("Label")
-        axs[1].axis("off")
-        if sample_distance is not None:
-            axs[2].imshow(sample_distance[0], cmap='gray')
-            axs[2].set_title("Distance")
-            axs[2].axis("off")
-        else:
-            axs[2].text(0.5, 0.5, "No Distance", ha='center', va='center')
-            axs[2].axis("off")
-        if sample_sdf is not None:
-            axs[3].imshow(sample_sdf[0], cmap='coolwarm')
-            axs[3].set_title("SDF")
-            axs[3].axis("off")
-        plt.tight_layout()
-        plt.show()
-
-
-if __name__ == "__main__":
-    config = {
-        "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
-        "split": "train",
-        # "split": "valid",
-        "patch_size": 256,
-        "small_window_size": 8,
-        "validate_road_ratio": True,
-        "threshold": 0.025,
-        "max_images": 1,  # For quick testing.
-        "seed": 42,
-        "fold": None,
-        "num_folds": None,
-        "verbose": True,
-        "augmentations": ["flip_h", "flip_v", "rotation"],
-        "distance_threshold": 100.0,
-        "sdf_iterations": 3,
-        "sdf_thresholds": [-20, 20],
-        "num_workers": 4,
-        "use_splitting": False,
-        "split_ratios": {
-            "train": 0.7,
-            "valid": 0.15,
-            "test": 0.15
-        },
-        "modalities": {
-            "image": "sat",
-            "label": "map",
-            "distance": "distance",
-            "sdf": "sdf"
-        }
-    }
-
-    # Create dataset and dataloader.
-    dataset = GeneralizedDataset(config)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=8,
-        shuffle=True,
-        collate_fn=custom_collate_fn,
-        num_workers=4,
-        # worker_init_fn=worker_init_fn
-    )
-    logger.info('len(dataloader): %d', len(dataloader))
-    for epoch in range(10):
-        for i, batch in enumerate(dataloader):
-            if batch is None:
-                continue
-            logger.info("Batch keys: %s", batch.keys())
-            logger.info("Image shape: %s", batch["image_patch"].shape)
-            logger.info("Label shape: %s", batch["label_patch"].shape)
-            visualize_batch(batch)
-            # break  # Uncomment to visualize only one batch.
-
-
-# ------------------------------------
 # core/validator.py
 # ------------------------------------
 # core/validator.py
@@ -1757,162 +1061,91 @@ class CheckpointManager:
 # ------------------------------------
 # core/dataloader.py
 # ------------------------------------
-"""
-Dataloader module for wrapping GeneralizedDataset.
-
-This module provides functionality to load and configure datasets for training, validation, and testing.
-"""
-
-import os
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional
 
-import torch
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
-# Import the existing GeneralizedDataset
-from core.general_dataset import GeneralizedDataset, custom_collate_fn, worker_init_fn
+from core.general_dataset.base import GeneralizedDataset
+from core.general_dataset.collate import custom_collate_fn, worker_init_fn
 
 
-class SegmentationDataModule((pl.LightningDataModule)):
+class SegmentationDataModule(pl.LightningDataModule):
     """
-    DataModule for segmentation tasks that wraps GeneralizedDataset.
-    
-    This class handles dataset creation and dataloader configuration for training,
-    validation, and testing, ensuring that validation/testing use full images without cropping.
+    Lightning DataModule for segmentation tasks wrapping GeneralizedDataset.
     """
-    
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the SegmentationDataModule.
-        
-        Args:
-            config: Configuration dictionary with dataset parameters
-        """
         super().__init__()
-        self.config = config
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
-        self.logger = logging.getLogger(__name__)
-        
-        # Extract important config parameters
-        self.root_dir = config.get("root_dir")
-        self.split_mode = config.get("split_mode", "folder")  # "folder" or "kfold"
-        self.fold = config.get("fold", 0)
-        self.num_folds = config.get("num_folds", 5)
+        self.config = config.copy()
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        # Dataloader parameters
         self.batch_size = {
-            "train": config.get("train_batch_size", 8),
-            "val": config.get("val_batch_size", 1),
-            "test": config.get("test_batch_size", 1)
+            'train': config.get('train_batch_size', 8),
+            'val':   config.get('val_batch_size', 1),
+            'test':  config.get('test_batch_size', 1)
         }
-        self.num_workers = config.get("num_workers", 4)
-        self.pin_memory = config.get("pin_memory", True)
-        
+        self.num_workers = config.get('num_workers', 4)
+        self.pin_memory = config.get('pin_memory', True)
+
     def setup(self, stage: Optional[str] = None):
         """
-        Set up datasets for the specified stage.
-        
-        Args:
-            stage: Stage to set up ('fit' or 'test')
+        Instantiate datasets for training, validation, and testing.
         """
-        if stage == 'fit' or stage is None:
-            # Training dataset
-            train_config = self._get_dataset_config("train")
-            self.train_dataset = GeneralizedDataset(train_config)
-            
-            # Validation dataset - ensure no cropping in validation
-            val_config = self._get_dataset_config("valid")
-            val_config["validate_road_ratio"] = False  # Don't filter patches by road content
-            # For validation, we want to process full images, not crops
-            self.val_dataset = GeneralizedDataset(val_config)
-            
-        if stage == 'test' or stage is None:
-            # Test dataset - ensure no cropping in test
-            test_config = self._get_dataset_config("test")
-            test_config["validate_road_ratio"] = False  # Don't filter patches by road content
-            # For testing, we want to process full images, not crops
-            self.test_dataset = GeneralizedDataset(test_config)
-    
-    def _get_dataset_config(self, split: str) -> Dict[str, Any]:
-        """
-        Get configuration for a specific dataset split.
-        
-        Args:
-            split: Dataset split ('train', 'valid', or 'test')
-            
-        Returns:
-            Configuration dictionary for the specified split
-        """
-        config = self.config.copy()
-        config["split"] = split
-        
-        # Set split-specific parameters
-        if split in ("valid", "test"):
-            # For validation and test, we want to process full images when possible
-            config["validate_road_ratio"] = False
-        
-        if self.split_mode == "kfold":
-            config["use_splitting"] = True
-            config["fold"] = self.fold
-            config["num_folds"] = self.num_folds
-        
-        return config
-    
+        def make_cfg(split: str) -> Dict[str, Any]:
+            cfg = self.config.copy()
+            cfg['split'] = split
+            # disable sampling and augmentations for val/test
+            if split in ('valid', 'test'):
+                cfg['validate_road_ratio'] = False
+                cfg['max_attempts'] = 1
+                cfg['augmentations'] = []  # no augmentations
+            return cfg
+
+        if stage in ('fit', None):
+            self.train_dataset = GeneralizedDataset(make_cfg('train'))
+            self.val_dataset = GeneralizedDataset(make_cfg('valid'))
+
+        if stage in ('test', None):
+            self.test_dataset = GeneralizedDataset(make_cfg('test'))
+
     def train_dataloader(self) -> DataLoader:
-        """
-        Create training dataloader.
-        
-        Returns:
-            DataLoader for training
-        """
         return DataLoader(
             self.train_dataset,
-            batch_size=self.batch_size["train"],
+            batch_size=self.batch_size['train'],
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
+            collate_fn=custom_collate_fn,
             worker_init_fn=worker_init_fn,
             persistent_workers=True,
         )
-    
+
     def val_dataloader(self) -> DataLoader:
-        """
-        Create validation dataloader.
-        
-        Returns:
-            DataLoader for validation
-        """
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size["val"],
+            batch_size=self.batch_size['val'],
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
+            collate_fn=custom_collate_fn,
             worker_init_fn=worker_init_fn,
             persistent_workers=True,
         )
-    
+
     def test_dataloader(self) -> DataLoader:
-        """
-        Create test dataloader.
-        
-        Returns:
-            DataLoader for testing
-        """
         return DataLoader(
             self.test_dataset,
-            batch_size=self.batch_size["test"],
+            batch_size=self.batch_size['test'],
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=custom_collate_fn,
             pin_memory=self.pin_memory,
+            collate_fn=custom_collate_fn,
             worker_init_fn=worker_init_fn,
             persistent_workers=True,
         )
+
 
 # ------------------------------------
 # core/loss_loader.py
@@ -2501,6 +1734,1042 @@ __all__ = [
     'custom_collate_fn',
     'worker_init_fn'
 ]
+
+# ------------------------------------
+# core/general_dataset/augments.py
+# ------------------------------------
+
+from typing import Any, Dict, List, Optional
+import numpy as np
+from core.general_dataset.logger import logger
+
+import math
+from scipy.ndimage import rotate
+
+def get_augmentation_metadata(augmentations) -> Dict[str, Any]:
+    """
+    Generate random augmentation parameters for a patch.
+
+    Returns:
+        Dict[str, Any]: Augmentation metadata.
+    """
+    meta: Dict[str, Any] = {}
+    if 'rotation' in augmentations:
+        meta['angle'] = np.random.uniform(0, 360)
+    if 'flip_h' in augmentations:
+        meta['flip_h'] = np.random.rand() > 0.5
+    if 'flip_v' in augmentations:
+        meta['flip_v'] = np.random.rand() > 0.5
+    return meta
+
+
+def flip_h(full_array: np.ndarray) -> np.ndarray:
+    return np.flip(full_array, axis=-1)
+
+def flip_v(full_array: np.ndarray) -> np.ndarray:
+    return np.flip(full_array, axis=-2)
+
+def rotate_(full_array: np.ndarray, patch_meta: Dict[str, Any], patch_size) -> np.ndarray:
+    """
+    Rotate a patch using an expanded crop to avoid border effects.
+    If the crop is too small, log a warning and return a zero patch.
+
+    Args:
+        full_array (np.ndarray): Full image array.
+        patch_meta (Dict[str, Any]): Contains patch coordinates and angle.
+    
+    Returns:
+        np.ndarray: Rotated patch.
+    """
+    L = int(np.ceil(patch_size * math.sqrt(2)))
+    x = patch_meta["x"]
+    y = patch_meta["y"]
+    angle = patch_meta["angle"]
+
+    cx = x + patch_size // 2
+    cy = y + patch_size // 2
+    half_L = L // 2
+    x0 = max(0, cx - half_L)
+    y0 = max(0, cy - half_L)
+    x1 = min(full_array.shape[-1], cx + half_L)
+    y1 = min(full_array.shape[-2], cy + half_L)
+
+    if full_array.ndim == 3:
+        crop = full_array[:, y0:y1, x0:x1]
+        if crop.shape[1] < L or crop.shape[2] < L:
+            logger.warning("Crop too small for 3D patch rotation; returning zero patch.")
+            return np.zeros((full_array.shape[0], patch_size, patch_size), dtype=full_array.dtype)
+        rotated_channels = [rotate(crop[c], angle, reshape=False, order=1) for c in range(full_array.shape[0])]
+        rotated = np.stack(rotated_channels)
+        start = (L - patch_size) // 2
+        return rotated[:, start:start + patch_size, start:start + patch_size]
+    elif full_array.ndim == 2:
+        crop = full_array[y0:y1, x0:x1]
+        if crop.shape[0] < L or crop.shape[1] < L:
+            logger.warning("Crop too small for 2D patch rotation; returning zero patch.")
+            return np.zeros((patch_size, patch_size), dtype=full_array.dtype)
+        rotated = rotate(crop, angle, reshape=False, order=1)
+        start = (L - patch_size) // 2
+        return rotated[start:start + patch_size, start:start + patch_size]
+    else:
+        raise ValueError("Unsupported array shape")
+    
+
+def extract_condition_augmentations(imgs: Dict[str, np.ndarray], metadata: Dict[str, Any], patch_size, augmentations) -> Dict[str, np.ndarray]:
+    """
+    Extract a patch from the full image and apply conditional augmentations.
+
+    Args:
+        imgs (Dict[str, np.ndarray]): Full images for each modality.
+        metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
+    
+    Returns:
+        Dict[str, np.ndarray]: Dictionary of extracted patches.
+    """
+    imgs_aug = imgs.copy()
+    data = extract_data(imgs, metadata['x'], metadata['y'], patch_size)
+    for key in imgs:
+        if key.endswith("_patch"):
+            modality = key.replace("_patch", "")
+            if 'flip_h' in augmentations:
+                imgs_aug[modality] = flip_h(imgs[modality])
+                data[key] = flip_h(data[key])
+            if 'flip_v' in augmentations:
+                imgs_aug[modality] = flip_v(imgs[modality])
+                data[key] = flip_v(data[key])
+            if 'rotation' in augmentations:
+                data[key] = rotate_(imgs_aug[modality], metadata, patch_size)
+    return data
+
+def extract_data(imgs: Dict[str, np.ndarray], x: int, y: int, patch_size) -> Dict[str, np.ndarray]:
+    """
+    Extract a patch from each modality starting at (x, y) with size patch_size.
+
+    Args:
+        imgs (Dict[str, np.ndarray]): Full images.
+        x (int): x-coordinate.
+        y (int): y-coordinate.
+    
+    Returns:
+        Dict[str, np.ndarray]: Extracted patch for each modality.
+    """
+    data: Dict[str, np.ndarray] = {}
+    for key, array in imgs.items():
+        if array.ndim == 3:
+            data[f"{key}_patch"] = array[:, y:y + patch_size, x:x + patch_size]
+        elif array.ndim == 2:
+            data[f"{key}_patch"] = array[y:y + patch_size, x:x + patch_size]
+        else:
+            raise ValueError("Unsupported array dimensions in _extract_data")
+    return data
+
+# ------------------------------------
+# core/general_dataset/logger.py
+# ------------------------------------
+import logging
+import sys
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.ERROR)
+
+fmt = logging.Formatter(
+    "%(asctime)s — %(name)s — %(levelname)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+handler.setFormatter(fmt)
+
+# (re)attach handler
+if not logger.handlers:
+    logger.addHandler(handler)
+
+# ------------------------------------
+# core/general_dataset/collate.py
+# ------------------------------------
+import torch
+from typing import Any, Dict, List, Optional
+import random
+import numpy as np
+from core.general_dataset.logger import logger
+
+
+def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Custom collate function with None filtering.
+    """
+    # Filter out None samples
+    batch = [sample for sample in batch if sample is not None]
+    
+    # Handle empty batch case
+    if not batch:
+        logger.warning("Empty batch after filtering None values")
+        return {}  # Or return a default empty batch structure
+    
+    # Original collation logic
+    collated: Dict[str, Any] = {}
+    for key in batch[0]:
+        items = []
+        for sample in batch:
+            value = sample[key]
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            items.append(value)
+        if isinstance(items[0], torch.Tensor):
+            collated[key] = torch.stack(items)
+        else:
+            collated[key] = items
+    return collated
+
+def worker_init_fn(worker_id):
+    """
+    DataLoader worker initialization to ensure different random seeds for each worker.
+    """
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+
+# ------------------------------------
+# core/general_dataset/modalities.py
+# ------------------------------------
+import numpy as np
+from scipy.ndimage import distance_transform_edt, binary_dilation
+from typing import Any, Dict, List, Optional
+from core.general_dataset.logger import logger
+
+
+
+
+def compute_distance_map(lbl: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
+    """
+    Compute a distance map from a label image.
+
+    Args:
+        lbl (np.ndarray): Input label image.
+        distance_threshold (Optional[float]): Maximum distance value.
+    
+    Returns:
+        np.ndarray: Distance map.
+    """
+    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
+    distance_map = distance_transform_edt(lbl_bin == 0)
+    if distance_threshold is not None:
+        np.minimum(distance_map, distance_threshold, out=distance_map)
+    return distance_map
+
+def compute_sdf(lbl: np.ndarray, sdf_iterations: int, sdf_thresholds: List[float]) -> np.ndarray:
+    """
+    Compute the signed distance function (SDF) for a label image.
+
+    Args:
+        lbl (np.ndarray): Input label image.
+        sdf_iterations (int): Number of iterations for dilation.
+        sdf_thresholds (List[float]): [min, max] thresholds for the SDF.
+    
+    Returns:
+        np.ndarray: The SDF computed.
+    """
+    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
+    dilated = binary_dilation(lbl_bin, iterations=sdf_iterations)
+    dist_out = distance_transform_edt(1 - dilated)
+    dist_in  = distance_transform_edt(lbl_bin)
+    sdf = dist_out - dist_in
+    if sdf_thresholds is not None:
+        sdf = np.clip(sdf, sdf_thresholds[0], sdf_thresholds[1])
+    return sdf
+
+# ------------------------------------
+# core/general_dataset/base.py
+# ------------------------------------
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+import os
+import json
+import random
+import numpy as np
+from tqdm import tqdm
+from sklearn.model_selection import KFold
+from torch.utils.data import Dataset, DataLoader
+
+from core.general_dataset.io          import load_array_from_file
+from core.general_dataset.modalities  import compute_distance_map, compute_sdf
+from core.general_dataset.patch_validity       import check_min_thrsh_road
+from core.general_dataset.augments    import get_augmentation_metadata, extract_condition_augmentations
+from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
+from core.general_dataset.normalizations import normalize_image
+from core.general_dataset.visualizations import visualize_batch
+from core.general_dataset.splits import Split
+from core.general_dataset.logger import logger
+
+
+"""
+assumptions:
+    - lbl can be binary or int (thresholded by 127)
+    - roads are 1 on lbl
+    - image modality must be defined 
+    - label modality is not required necessarily (even it's possible to define one folder to more than one modality) 
+    - for modalities other that label and image: 
+        - file names must be in this format: modality_filename = f"{base}_{key}.npy"
+        - if the computed modality's folder does not contain file "config.json" it will be computed again
+    - Read Split explanation for more details
+"""
+
+
+
+class GeneralizedDataset(Dataset):
+    """
+    PyTorch Dataset for generalized remote sensing or segmentation datasets.
+    """
+    def __init__(self, config: Dict[str, Any]) -> None:
+        super().__init__()
+        self.config = config
+        self.root_dir: str = config.get("root_dir")
+        self.split: str = config.get("split", "train")
+        self.patch_size: int = config.get("patch_size", 128)
+        self.small_window_size: int = config.get("small_window_size", 8)
+        self.threshold: float = config.get("threshold", 0.05)
+        self.max_images: Optional[int] = config.get("max_images")
+        self.max_attempts: int = config.get("max_attempts", 10)
+        self.validate_road_ratio: bool = config.get("validate_road_ratio", False)
+        self.seed: int = config.get("seed", 42)
+        self.fold = config.get("fold")
+        self.num_folds = config.get("num_folds")
+        self.verbose: bool = config.get("verbose", False)
+        self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
+        self.distance_threshold: Optional[float] = config.get("distance_threshold")
+        self.sdf_iterations: int = config.get("sdf_iterations")
+        self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
+        self.num_workers: int = config.get("num_workers", 4)
+        self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
+        self.source_folder: str = config.get("source_folder", "")
+        self.save_computed: bool = config.get("save_computed", False)
+        self.base_modality = config.get('base_modality')
+        self.compute_again_modalities = config.get('compute_again_modalities', False)
+        self.split_cfg = config["split_cfg"]
+        self.split_cfg['seed'] = self.seed
+        self.split_cfg['base_modality'] = self.base_modality
+        splitter = Split(self.split_cfg)
+        
+
+        if self.root_dir is None:
+            raise ValueError("root_dir must be specified in the config.")
+        if self.patch_size is None:
+            raise ValueError("patch_size must be specified in the config.")
+
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+
+        split_cfg = config["split_cfg"]
+        split_cfg['seed'] = self.seed
+        splitter = Split(split_cfg)
+        self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
+        self.modalities = list(self.modality_files.keys())
+        
+        # sanity check
+        if 'image' not in self.modality_files or 'label' not in self.modality_files:
+            raise ValueError("Split must define both 'image' and 'label' modalities in split_cfg.")
+        if 'image' in self.modality_files and 'label' in self.modality_files:
+            assert len(self.modality_files['image']) == len(self.modality_files['label']), f"len(images): {len(self.modality_files['image'])}, len(labels): {len(self.modality_files['label'])}"
+
+        # exts = ['.tiff', '.tif', '.png', '.jpg', '.npy']
+
+        if self.max_images is not None:
+            for key in self.modality_files:
+                self.modality_files[key] = self.modality_files[key][:self.max_images]
+
+        # Precompute additional modalities (e.g., distance, sdf).
+        if self.save_computed:
+            for key in [modal for modal in self.modalities if modal not in ['image', 'label']]:
+                logger.info(f"Generating {key} modality maps...")
+                for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
+                                        total=len(self.modality_files["label"]),
+                                        desc=f"Processing {key} maps"):
+                    lbl = load_array_from_file(self.modality_files['label'][file_idx])
+                    modality_path = self.modality_files[key][file_idx]
+                    dirpath = os.path.dirname(modality_path)
+                    os.makedirs(dirpath, exist_ok=True)
+                    if key == "distance":
+                        if not os.path.exists(modality_path) or self.compute_again_modalities:
+                            processed_map = compute_distance_map(lbl, None)
+                            np.save(modality_path, processed_map)
+                    elif key == "sdf":
+                        if not os.path.exists(modality_path) or self.compute_again_modalities:
+                            processed_map = compute_sdf(lbl, self.sdf_iterations, None)
+                            np.save(modality_path, processed_map)
+                    else:
+                        raise ValueError(f"Modality {key} not supported.")
+
+    def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
+        imgs: Dict[str, np.ndarray] = {}
+        for key in self.modalities:
+            if os.path.exists(self.modality_files[key][file_idx]):
+                arr = load_array_from_file(self.modality_files[key][file_idx])
+                if arr is None:            # <- corrupted TIFF
+                    return None            # signal caller to skip this index
+            else:
+                lbl = load_array_from_file(self.modality_files["label"][file_idx])
+                if key == "distance":
+                    arr = compute_distance_map(lbl, None)
+                elif key == "sdf":
+                    arr = compute_sdf(lbl, self.sdf_iterations, None)
+                else:
+                    raise ValueError(f"Modality {key} not supported.")
+                
+            imgs[key] = arr
+        return imgs
+
+    def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Normalize image patch values and binarize label patch if needed.
+        Args:
+            data (Dict[str, np.ndarray]): Dictionary containing patches.
+        Returns:
+            Dict[str, np.ndarray]: Postprocessed patches.
+        """
+        for key in data:
+            if key == "image_patch":
+                data[key] = normalize_image(data[key])
+            elif key == "label_patch":
+                if data[key].max() > 1:
+                    data[key] = (data[key] > 127).astype(np.uint8)
+            elif key == "distance_patch":
+                if self.distance_threshold:
+                    data[key] = np.clip(data[key], 0, self.distance_threshold)
+            elif key == "sdf_patch":
+                if self.sdf_thresholds:
+                    data[key] = np.clip(data[key], self.sdf_thresholds[0], self.sdf_thresholds[1])
+        return data
+
+    
+
+    def __len__(self) -> int:
+        return len(self.modality_files['image'])
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        imgs = self._load_datapoint(idx)
+        if imgs is None:           # corrupted file detected
+            # pick a different index (cyclic) so DataLoader doesn’t crash
+            return self.__getitem__((idx + 1) % len(self))
+
+        if imgs['image'].ndim == 3:
+            _, H, W = imgs['image'].shape
+        elif imgs['image'].ndim == 2:
+            H, W = imgs['image'].shape
+        else:
+            raise ValueError("Unsupported image dimensions")
+
+        if self.split != 'train':
+            data = {}
+            patch_meta = {"image_idx": idx, "x": -1, "y": -1}
+            for key, array in imgs.items():
+                if array.ndim == 3:
+                    data[f"{key}_patch"] = array
+                elif array.ndim == 2:
+                    data[f"{key}_patch"] = array
+                else:
+                    raise ValueError("Unsupported array dimensions in _extract_data")
+            data['metadata'] = patch_meta
+            data = self._postprocess_patch(data)
+            
+            return data
+
+        valid_patch_found = False
+        attempts = 0
+        while not valid_patch_found and attempts < self.max_attempts:
+            x = np.random.randint(0, W - self.patch_size + 1)
+            y = np.random.randint(0, H - self.patch_size + 1)
+            patch_meta = {"image_idx": idx, "x": x, "y": y}
+            if self.augmentations:
+                patch_meta.update(get_augmentation_metadata(self.augmentations))
+            data = extract_condition_augmentations(imgs, patch_meta, self.patch_size, self.augmentations)
+            if self.validate_road_ratio:
+                if check_min_thrsh_road(data['label_patch'], self.patch_size, self.threshold):
+                    valid_patch_found = True
+                    data['metadata'] = patch_meta
+                    data = self._postprocess_patch(data)
+                    return data
+            else:
+                valid_patch_found = True
+                data['metadata'] = patch_meta
+                data = self._postprocess_patch(data)
+                return data
+            
+            attempts += 1
+
+        # If a valid patch isn't found after max_attempts, fallback to the last sampled patch
+        if not valid_patch_found:
+            logger.warning("No valid patch found after %d attempts; trying next image", self.max_attempts)
+            return self.__getitem__((idx + 1) % len(self))
+        return None
+        
+    
+
+if __name__ == "__main__":
+    split_cfg = {
+        "mode": "folder",
+        # "ratios": {"train": 0.8, "valid": 0.1, "test": 0.1},
+        # "ratio_folders": [
+        #     {
+        #         "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/flat",
+        #         "layout": "flat",
+        #         "modalities": {
+        #             "image": {"pattern": r".*_sat\.tif"},
+        #             "label": {"pattern": r".*_map\.png"}
+        #         }
+        #     }
+        # ]
+        "source_folders": [
+        {
+            "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset",
+            "layout": "folders",
+            "modalities": {
+                "image": {"folder": "sat"},
+                "label": {"folder": "label"},
+                "sdf":   {"folder": "sdf"}  
+            },
+            "splits": {
+                "train": "train",
+                "valid": "valid",
+                "test":  "test"
+            }
+        },
+    ]
+
+    }
+    config = {
+        "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
+        "split": "train",
+        # "split": "valid",
+        "split_cfg": split_cfg,
+        "patch_size": 256,
+        "small_window_size": 8,
+        "validate_road_ratio": True,
+        "threshold": 0.025,
+        "max_images": 5,  # For quick testing.
+        "seed": 42,
+        "fold": None,
+        "num_folds": None,
+        "verbose": True,
+        "augmentations": ["flip_h", "flip_v", "rotation"],
+        "distance_threshold": 15.0,
+        "sdf_iterations": 3,
+        "sdf_thresholds": [-7, 7],
+        "num_workers": 4,
+        "split_ratios": {
+            "train": 0.7,
+            "valid": 0.15,
+            "test": 0.15
+        },
+        "modalities": {
+            "image": "sat",
+            "label": "map",
+            "distance": "distance",
+            "sdf": "sdf"
+        },
+        "base_modality": 'image',
+        'compute_again_modalities': False,
+        'save_computed': True
+    }
+
+    # Create dataset and dataloader.
+    dataset = GeneralizedDataset(config)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=True,
+        collate_fn=custom_collate_fn,
+        num_workers=4,
+        # worker_init_fn=worker_init_fn
+    )
+    logger.info('len(dataloader): %d', len(dataloader))
+    for epoch in range(10):
+        for i, batch in enumerate(dataloader):
+            if batch is None:
+                continue
+            logger.info("Batch keys: %s", batch.keys())
+            logger.info("Image shape: %s", batch["image_patch"].shape)
+            logger.info("Label shape: %s", batch["label_patch"].shape)
+            visualize_batch(batch)
+            # break  # Uncomment to visualize only one batch.
+
+
+# ------------------------------------
+# core/general_dataset/splits.py
+# ------------------------------------
+# core/general_dataset/split.py
+# ---------------------------------------------------------------------
+"""
+Flexible dataset-splitting helper.
+
+  • folder-based         (pre-made train/valid/test dirs)
+  • k-fold cross-val     (plus optional dedicated test roots)
+  • ratio-based shuffle  (train/valid/test percentages)
+
+Each source folder may store modalities either
+  • "folders" – one subdir per modality (sat/, map/, …)
+  • "flat"    – all files mixed; regex distinguishes modalities
+
+The stem (basename without extension) identifies a datapoint.
+Returned structure: {modality: [absolute_paths …]}, aligned by stem.
+
+Every pass through the filesystem skips any file named **index.html**
+(case-insensitive).
+"""
+from __future__ import annotations
+import os
+import re
+import random
+import pathlib
+from collections import defaultdict
+from typing import Dict, List, Any
+import numpy as np
+from sklearn.model_selection import KFold
+
+# -------- helpers --------------------------------------------------- #
+def _is_junk(fname: str) -> bool:
+    return fname.lower() in ("index.html", "config.json")
+
+def _listdir_safe(folder: str) -> List[str]:
+    try:
+        return os.listdir(folder)
+    except FileNotFoundError:
+        return []
+
+# -------- main class ------------------------------------------------ #
+class Split:
+    def __init__(self, cfg: Dict[str, Any]) -> None:
+        self.cfg        = cfg
+        self.seed       = cfg.get("seed", 0)
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+
+        # expose these for get_split
+        src0           = cfg["source_folders"][0]
+        self._all_mods = list(src0["modalities"].keys())
+        self._source_root = src0["path"]
+        self._is_folder_layout = src0["layout"] == "folders"
+        self._modality_to_folder = {
+            mod: meta.get("folder")
+            for mod, meta in src0["modalities"].items()
+        }
+
+        # collect + build raw split_map
+        mode = cfg["mode"]
+        if mode == "folder":
+            self._collect_datapoints(cfg["source_folders"])
+            self.split_map = self._prepare_folder_based(cfg["source_folders"])
+        elif mode == "kfold":
+            self.split_map = self._prepare_kfold(cfg)
+        elif mode == "ratio":
+            self.split_map = self._prepare_ratio(cfg)
+        else:
+            raise ValueError(f"Unknown split mode: {mode}")
+
+    def get_split(self, split: str) -> Dict[str, List[str]]:
+        """
+        For a given split, return a dict mapping every modality to a list
+        of file paths.  Missing modalities are synthesised from the
+        base_modality + the source layout rules.
+        """
+        if split not in self.split_map:
+            raise KeyError(f"Split '{split}' not found; choose from {list(self.split_map)}")
+
+        # 1) start with whatever files were found on disk
+        raw = {m: paths[:] for m, paths in self.split_map[split].items()}
+
+        # 2) drop junk & build stem→path dicts per modality
+        by_mod_stem: Dict[str, Dict[str, str]] = {}
+        for mod, paths in raw.items():
+            clean = [p for p in paths if not _is_junk(os.path.basename(p))]
+            by_mod_stem[mod] = { pathlib.Path(p).stem: p for p in clean }
+
+        # 3) figure out which stems to keep (those that have the base_modality)
+        base = self.cfg.get("base_modality", "image")
+        if base not in by_mod_stem:
+            raise KeyError(f"No '{base}' files found in split '{split}'")
+        stems = sorted(by_mod_stem[base].keys())
+
+        # 4) for each stem, collect real or synthed paths for all modalities
+        filemap: Dict[str, List[str]] = {m: [] for m in self._all_mods}
+        for stem in stems:
+            base_path = by_mod_stem[base][stem]
+            base_dir  = os.path.dirname(base_path)
+            for mod in self._all_mods:
+                if stem in by_mod_stem.get(mod, {}):
+                    # already on disk
+                    filemap[mod].append(by_mod_stem[mod][stem])
+                else:
+                    # synthesize
+                    if self._is_folder_layout:
+                        split_root = os.path.join(self._source_root, split)
+                        mod_dir    = os.path.join(split_root, self._modality_to_folder[mod])
+                        fname      = f"{stem}_{mod}.npy"
+                    else:
+                        mod_dir = base_dir
+                        if mod in ("image","label"):
+                            # look for any matching existing file
+                            candidates = [
+                                p for p in os.listdir(mod_dir)
+                                if pathlib.Path(p).stem == stem and mod in p
+                            ]
+                            fname = candidates[0] if candidates else f"{stem}_{mod}"
+                        else:
+                            fname = f"{stem}_{mod}.npy"
+                    filemap[mod].append(os.path.join(mod_dir, fname))
+
+        return filemap
+
+    def iter_datapoints(self):
+        for stem, mods in self._all_datapoints.items():
+            yield stem, mods
+
+    # -------- split-builders ---------------------------------------- #
+    def _prepare_folder_based(self, src_cfg):
+        smap = defaultdict(lambda: defaultdict(list))
+        for sf in src_cfg:
+            for split, subdir in sf["splits"].items():
+                files = self._scan_folder(os.path.join(sf["path"], subdir), sf)
+                for m, plist in files.items():
+                    smap[split][m].extend(plist)
+        return smap
+
+    def _prepare_kfold(self, cfg):
+        tr_cfg, test_cfg = cfg["train_valid_folders"], cfg["test_folders"]
+        n_fold, idx      = cfg["num_folds"], cfg["fold_idx"]
+        dp = self._collect_datapoints(tr_cfg)
+        stems = sorted(dp)
+        kf = KFold(n_splits=n_fold, shuffle=True, random_state=self.seed)
+        tr_ids, val_ids = list(kf.split(stems))[idx]
+
+        smap = {s: defaultdict(list) for s in ("train","valid","test")}
+        for i in tr_ids:
+            for m,p in dp[stems[i]].items(): smap["train"][m].append(p)
+        for i in val_ids:
+            for m,p in dp[stems[i]].items(): smap["valid"][m].append(p)
+        for sf in test_cfg:
+            files = self._scan_folder(sf["path"], sf, ignore_splits=True)
+            for m,plist in files.items(): smap["test"][m].extend(plist)
+        return smap
+
+    def _prepare_ratio(self, cfg):
+        folders, ratios = cfg["ratio_folders"], cfg["ratios"]
+        if abs(sum(ratios.values()) - 1) > 1e-6:
+            raise ValueError("ratios must sum to 1")
+        dp = self._collect_datapoints(folders)
+        stems = list(dp); random.shuffle(stems)
+        n   = len(stems)
+        n_tr = int(n * ratios["train"])
+        n_va = int(n * ratios["valid"])
+
+        idx = {
+            "train": stems[:n_tr],
+            "valid": stems[n_tr:n_tr+n_va],
+            "test":  stems[n_tr+n_va:]
+        }
+        smap = {s: defaultdict(list) for s in idx}
+        for split, slist in idx.items():
+            for s in slist:
+                for m,p in dp[s].items(): smap[split][m].append(p)
+        return smap
+
+    # -------- filesystem utils -------------------------------------- #
+    def _collect_datapoints(self, folders_cfg):
+        local = defaultdict(dict)
+        for sf in folders_cfg:
+            root, layout = sf["path"], sf["layout"]
+            if layout == "folders":
+                for mod, meta in sf["modalities"].items():
+                    mdir = os.path.join(root, meta["folder"])
+                    for fname in _listdir_safe(mdir):
+                        if _is_junk(fname): continue
+                        stem = pathlib.Path(fname).stem
+                        path = os.path.join(mdir, fname)
+                        local[stem][mod] = path
+                        self._all_datapoints[stem][mod] = path
+            else:
+                for fname in _listdir_safe(root):
+                    if _is_junk(fname): continue
+                    for mod, meta in sf["modalities"].items():
+                        if re.fullmatch(meta["pattern"], fname):
+                            stem = pathlib.Path(fname).stem
+                            path = os.path.join(root, fname)
+                            local[stem][mod] = path
+                            self._all_datapoints[stem][mod] = path
+        return local
+
+    def _scan_folder(self, folder, sf_cfg, ignore_splits=False):
+        res = defaultdict(list)
+        if sf_cfg["layout"] == "folders":
+            for mod, meta in sf_cfg["modalities"].items():
+                mdir = folder if ignore_splits else os.path.join(folder, meta["folder"])
+                for fname in _listdir_safe(mdir):
+                    if _is_junk(fname): continue
+                    res[mod].append(os.path.join(mdir, fname))
+        else:
+            for fname in _listdir_safe(folder):
+                if _is_junk(fname): continue
+                for mod, meta in sf_cfg["modalities"].items():
+                    if re.fullmatch(meta["pattern"], fname):
+                        res[mod].append(os.path.join(folder, fname))
+        return res
+
+# ------------------------------------------------------------------ #
+# quick demo                                                          #
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    demo_cfg = {
+        "seed": 1,
+        "mode": "folder",
+        "base_modality": "image",
+        "source_folders": [
+            {
+                "path": "/path/to/dataset",
+                "layout": "folders",
+                "modalities": {
+                    "image": {"folder": "sat"},
+                    "label": {"folder": "label"},
+                    "sdf":   {"folder": "sdf"},
+                },
+                "splits": {"train": "train", "valid": "valid", "test": "test"}
+            }
+        ]
+    }
+    splitter = Split(demo_cfg)
+    for s in ("train", "valid", "test"):
+        filemap = splitter.get_split(s)
+        print(f"{s}:")
+        for mod, paths in filemap.items():
+            print(f"  {mod}: {len(paths)} samples")
+
+# ------------------------------------------------------------------ #
+# sanity check                                                       #
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    cfg_demo = {
+        "seed": 1,
+        "base_modality": 'image',
+        "mode": "ratio",
+        "ratios": {"train": .8, "valid": .1, "test": .1},
+        "ratio_folders": [
+            {
+                "path": "dummy_dataset",
+                "layout": "flat",
+                "modalities": {
+                    "image": {"pattern": r".*_sat\.tif"},
+                    "label": {"pattern": r".*_map\.png"}
+                }
+            }
+        ]
+    }
+    sp = Split(cfg_demo)
+    for s in ("train", "valid", "test"):
+        print(s, {m: len(v) for m, v in sp.get_split(s).items()})
+
+
+# ------------------------------------
+# core/general_dataset/normalizations.py
+# ------------------------------------
+import numpy as np
+from core.general_dataset.logger import logger
+
+
+def normalize_image(image: np.ndarray) -> np.ndarray:
+    return image / 255.0 if image.max() > 1.0 else image
+
+
+# ------------------------------------
+# core/general_dataset/patch_validity.py
+# ------------------------------------
+from typing import Any, Dict, List, Optional
+import numpy as np
+from core.general_dataset.logger import logger
+
+
+def check_min_thrsh_road(label_patch: np.ndarray, patch_size, threshold) -> bool:
+    """
+    Check if the label patch has at least a minimum percentage of road pixels.
+
+    Args:
+        label_patch (np.ndarray): The label patch.
+    
+    Returns:
+        bool: True if the patch meets the minimum threshold; False otherwise.
+    """
+    patch = label_patch
+    if patch.max() > 1:
+        patch = (patch > 127).astype(np.uint8)
+    road_percentage = np.sum(patch) / (patch_size * patch_size)
+    return road_percentage >= threshold
+
+
+def check_small_window(image_patch: np.ndarray, small_window_size) -> bool:
+    """
+    Check that no small window in the image patch is entirely black or white.
+
+    Args:
+        image_patch (np.ndarray): Input patch (H x W) or (C x H x W)
+
+    Returns:
+        bool: True if valid, False if any window is all black or white.
+    """
+    sw = small_window_size
+
+    # Ensure image has shape (C, H, W)
+    if image_patch.ndim == 2:
+        image_patch = image_patch[None, :, :]  # Add channel dimension
+
+    C, H, W = image_patch.shape
+    if H < sw or W < sw:
+        return False
+
+    # Set thresholds
+    max_val = image_patch.max()
+    if max_val > 1.0:
+        high_thresh = 255
+        low_thresh = 0
+    else:
+        high_thresh = 255 / 255.0
+        low_thresh = 0 / 255.0
+
+    # Slide window over spatial dimensions
+    for c in range(C):
+        for y in range(0, H - sw + 1):
+            for x in range(0, W - sw + 1):
+                window = image_patch[c, y:y + sw, x:x + sw]
+                window_var = np.var(window)
+                if window_var < 0.01:
+                    return False
+                # print(window)
+                if np.all(window >= high_thresh):
+                    return False  # Found an all-white window
+                if np.all(window <= low_thresh):
+                    return False  # Found an all-black window
+
+    return True  # All windows passed
+
+
+
+
+# ------------------------------------
+# core/general_dataset/io.py
+# ------------------------------------
+from pathlib import Path
+from typing import Optional
+import numpy as np
+import rasterio
+import logging
+import warnings
+from rasterio.errors import NotGeoreferencedWarning
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
+logger = logging.getLogger(__name__)
+
+def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
+    """
+    Load an array from disk. Supports:
+      - .npy      → numpy.load
+      - .tif/.tiff → rasterio.open + read
+    Returns:
+      np.ndarray on success, or None if the file cannot be read.
+    """
+    path = Path(file_path)
+    ext = path.suffix.lower()
+    
+    loaders = {
+        '.npy': lambda p: np.load(p),
+        '.tif': lambda p: rasterio.open(p).read().astype(np.float32),
+        '.tiff': lambda p: rasterio.open(p).read().astype(np.float32),
+    }
+    
+    loader = loaders.get(ext)
+    if loader is None:
+        logger.warning("Unsupported file extension '%s' for %s", ext, file_path)
+        return None
+
+    try:
+        return loader(str(path))
+    except Exception as e:
+        # logger.warning("Failed to load '%s': %s", file_path, e)
+        return None
+
+# ------------------------------------
+# core/general_dataset/__init__.py
+# ------------------------------------
+# core/general_dataset/__init__.py
+
+from .base    import GeneralizedDataset
+from .collate import custom_collate_fn, worker_init_fn
+
+# Optionally, define __all__
+__all__ = [
+    "GeneralizedDataset",
+    "custom_collate_fn",
+    "worker_init_fn",
+]
+
+
+# ------------------------------------
+# core/general_dataset/visualizations.py
+# ------------------------------------
+from typing import Any, Dict, List, Optional
+import matplotlib.pyplot as plt
+import numpy as np
+
+def visualize_batch(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
+    """
+    Visualizes patches in a batch: image, label, distance, and SDF (if available).
+
+    Args:
+        batch (Dict[str, Any]): Dictionary containing batched patches.
+        num_per_batch (Optional[int]): Maximum number of patches to visualize.
+    """
+
+    num_to_plot = batch["image_patch"].shape[0]
+    if num_per_batch:
+        num_to_plot = min(num_to_plot, num_per_batch)
+    for i in range(num_to_plot):
+        sample_image = batch["image_patch"][i].numpy()
+        if sample_image.shape[0] == 3:  # CHW to HWC
+            sample_image = sample_image.transpose(1, 2, 0)
+        elif sample_image.shape[0] == 1:
+            sample_image = sample_image[0]  # grayscale
+        else:
+            sample_image = sample_image.transpose(1, 2, 0)
+
+        sample_label = np.squeeze(batch["label_patch"][i].numpy())
+        sample_distance = batch["distance_patch"][i].numpy() if "distance_patch" in batch else None
+        sample_sdf = batch["sdf_patch"][i].numpy() if "sdf_patch" in batch else None
+
+        print(f'Patch {i}')
+        print('  image:', sample_image.min(), sample_image.max())
+        print('  label:', sample_label.min(), sample_label.max())
+        if sample_distance is not None:
+            print('  distance:', sample_distance.min(), sample_distance.max())
+        if sample_sdf is not None:
+            print('  sdf:', sample_sdf.min(), sample_sdf.max())
+
+        num_subplots = 3 + (1 if sample_sdf is not None else 0)
+        fig, axs = plt.subplots(1, num_subplots, figsize=(12, 4))
+        axs[0].imshow(sample_image, cmap='gray' if sample_image.ndim == 2 else None)
+        axs[0].set_title("Image")
+        axs[0].axis("off")
+        axs[1].imshow(sample_label, cmap='gray')
+        axs[1].set_title("Label")
+        axs[1].axis("off")
+        if sample_distance is not None:
+            axs[2].imshow(sample_distance[0], cmap='gray')
+            axs[2].set_title("Distance")
+            axs[2].axis("off")
+        else:
+            axs[2].text(0.5, 0.5, "No Distance", ha='center', va='center')
+            axs[2].axis("off")
+        if sample_sdf is not None:
+            axs[3].imshow(sample_sdf[0], cmap='coolwarm')
+            axs[3].set_title("SDF")
+            axs[3].axis("off")
+        plt.tight_layout()
+        plt.show()
+
 
 # ------------------------------------
 # metrics/dice.py
@@ -4314,290 +4583,6 @@ if __name__ == "__main__":
     # Then run full smoke test
     logger.info("\nRunning full smoke test...")
     run_smoke_test()
-
-# ------------------------------------
-# configs/main.yaml
-# ------------------------------------
-# Main configuration file for segmentation experiments
-# This file references all sub-configs and sets high-level training parameters
-
-# Sub-config references
-dataset_config: "massroads.yaml"
-model_config: "baseline.yaml"
-loss_config: "mixed_topo.yaml"
-metrics_config: "segmentation.yaml"
-inference_config: "chunk.yaml"
-
-# Output directory
-output_dir: "outputs/base_sdf_mass_lif_640dp"
-
-# Trainer configuration
-trainer:
-  num_sanity_val_steps: 0
-  max_epochs: 10000
-  check_val_every_n_epoch: 10      # Validate every N epochs (this is redundant with val_check_interval=1.0)
-  skip_validation_until_epoch: 0  # Skip validation until this epoch
-  log_every_n_steps: 1            # log metrics every step
-  train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
-  val_metrics_every_n_epochs: 1  # compute/log val   metrics every epoch
-  save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
-  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
-  # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
-  save_checkpoints_every_n_epochs: 1
-
-  num_samples_plot: 5
-  cmap_plot: "coolwarm"
-
-  extra_args:
-    accelerator: "auto" 
-    precision: 32  
-    deterministic: false
-    # gradient_clip_val: 1.0
-    # accumulate_grad_batches: 1
-    # max_time: "24:00:00"
-
-
-
-# Optimizer configuration
-optimizer:
-  name: "Adam"
-  params:
-    lr: 0.0001
-    weight_decay: 0.0001
-  
-  # Optional learning rate scheduler
-  scheduler:
-    # name: "ReduceLROnPlateau"
-    # params:
-    #   patience: 10
-    #   factor: 0.5
-    #   monitor: "val_loss"
-    #   mode: "min"
-    #   min_lr: 0.00001
-    name: "LambdaLR"
-    params:
-      lr_decay_factor: 0.00001
-
-target_x: "image_patch"
-target_y: "sdf_patch"
-
-
-
-# ------------------------------------
-# configs/metrics/segmentation.yaml
-# ------------------------------------
-# ----------------------------------------
-# Segmentation-metrics configuration
-# ----------------------------------------
-
-metrics:
-
-  # Dice
-  - alias: dice
-    path: metrics.dice
-    class: ThresholdedDiceMetric
-    params:
-      threshold: 0          # 0 splits neg/pos
-      greater_is_road: false # neg < 0  -> road = 1
-      eps: 1e-6
-      multiclass: false
-      zero_division: 1.0
-
-  # IoU
-  - alias: iou
-    path: metrics.iou
-    class: ThresholdedIoUMetric
-    params:
-      threshold: 0
-      greater_is_road: false
-      eps: 1e-6
-      multiclass: false     
-      zero_division: 1.0
-
-  # Connected-components quality
-  - alias: ccq
-    path: metrics.ccq
-    class: ConnectedComponentsQuality
-    params:
-      min_size: 15
-      tolerance: 5           # centroid distance in px
-      threshold: 0
-      greater_is_road: false
-
-  # APLS
-  - alias: apls
-    path: metrics.apls
-    class: APLS
-    params:
-      threshold: 0
-      greater_is_road: false
-      angle_range: [135, 225]
-      max_nodes: 1000
-      max_snap_dist: 25
-      allow_renaming: true
-      min_path_length: 15
-
-# How often to compute each metric
-train_frequencies:   {dice: 1,  iou: 1,  ccq: 20, apls: 50}
-val_frequencies:     {dice: 1,  iou: 1,  ccq: 10,  apls: 10}
-
-
-# ------------------------------------
-# configs/loss/mixed_topo.yaml
-# ------------------------------------
-# Mixed Topological Loss Configuration
-
-# Primary loss (used from the beginning)
-primary_loss:
-  path: "losses.lif_weighted_mse"
-  class: "LIFWeightedMSELoss"
-  params:
-    sdf_min: -7.0
-    sdf_max: 7.0
-    n_bins: 256
-    eps: 0.02
-    freeze_after_first: False
-    reduction: "mean"
-
-  # path: "losses.weighted_mse"
-  # class: "WeightedMSELoss"
-  # params:
-  #   road_weight: 4
-  #   bg_weight: 1
-  #   threshold: 0
-  #   greater_is_road: False
-  #   reduction: mean
-
-  # class: "MSELoss"  # Built-in PyTorch loss
-  # params: {}
-
-# # Secondary loss (activated after start_epoch)
-secondary_loss:
-  path: "losses.vectorized_chamfer"  # Path to the module containing the loss
-  class: "ChamferBoundarySDFLossVec"  # Name of the loss class
-  params:
-    update_scale: 1.0     # scale applied to the gradient projection
-    dist_threshold: 3.0   # max distance (in pixels) to consider a match
-    w_inject: 1.0         # weight for the “inject” term
-    w_pixel: 1.0          # weight for the “pixel” term
-
-# # Mixing parameters
-alpha: 0.5  # Weight for the secondary loss (0 to 1)
-start_epoch: 3020  # Epoch to start using the secondary loss
-
-
-
- 
-
-# ------------------------------------
-# configs/inference/chunk.yaml
-# ------------------------------------
-# Chunked Inference Configuration
-
-# Patch size for inference [height, width]
-# Patches of this size will be processed independently 
-# and then reassembled to form the full output
-patch_size: [512, 512]
-
-# Patch margin [height, width]
-# Margin of overlap between patches to avoid edge artifacts
-# The effective stride will be (patch_size - 2*patch_margin)
-patch_margin: [100, 100]
-
-
-# ------------------------------------
-# configs/dataset/massroads.yaml
-# ------------------------------------
-# Massachusetts Roads Dataset Configuration
-
-# Dataset root directory
-root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-# root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
-
-# Dataset split mode: "folder" or "kfold"
-split_mode: "folder"  # Uses folder structure for splits
-
-# K-fold configuration (used if split_mode is "kfold")
-# fold: 0  # Current fold
-# num_folds: 3  # Total number of folds
-
-# Split ratios (used if split_mode is "folder" with "source_folder")
-# split_ratios:
-  # train: 0.7
-  # valid: 0.15
-  # test: 0.15
-
-use_splitting: false
-
-# Source folder (used if split_mode is "folder" with split_ratios)
-# source_folder: 'train'
-
-# Batch sizes
-train_batch_size: 64
-val_batch_size: 1  # Usually 1 for full-image validation
-test_batch_size: 1  # Usually 1 for full-image testing
-
-# Patch and crop settings
-patch_size: 512  # Size of training patches
-small_window_size: 8  # Size of window to check for variation
-validate_road_ratio: false  # Validate patch has enough road content
-threshold: 0.05  # Minimum road ratio threshold
-
-# Data loading settings
-num_workers: 4
-pin_memory: true
-
-# Modality settings
-modalities:
-  image: "sat"  # Satellite imagery folder
-  label: "label"  # Road map folder
-  # distance: "distance"  # Distance transform folder
-  sdf: "sdf"  # Signed distance function folder
-
-# Distance transform settings
-# distance_threshold: 20.0
-
-# Signed distance function settings
-sdf_iterations: 3
-sdf_thresholds: [-7, 7]
-
-# Augmentation settings
-augmentations:
-  - "flip_h"
-  - "flip_v"
-  - "rotation"
-
-# Misc settings
-# max_images: null  # No limit (set a number to limit images loaded)
-max_images: 2 #640  # No limit (set a number to limit images loaded)
-# max_attempts: 10  # Maximum attempts for finding valid patches
-save_computed: true  # Save computed distance maps and SDFs
-verbose: false  # Verbose output
-seed: 42  # Random seed
-
-# ------------------------------------
-# configs/model/baseline.yaml
-# ------------------------------------
-# TopoTokens Model Configuration
-
-# Model path and class
-path: "models.base_models"  # Path to the module containing the model
-class: "UNet"  # Name of the model class
-
-# Model parameters
-params:
-  three_dimensional: False
-  m_channels: 32
-  n_convs: 2
-  n_levels: 3
-  dropout: 0.1
-  batch_norm: True
-  upsampling: "bilinear"
-  pooling: "max"
-  in_channels: 3
-  out_channels: 1
-  apply_final_relu: False
-  
 
 # ------------------------------------
 # models/custom_model.py

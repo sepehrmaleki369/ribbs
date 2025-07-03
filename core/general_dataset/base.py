@@ -28,12 +28,7 @@ assumptions:
     - for modalities other that label and image: 
         - file names must be in this format: modality_filename = f"{base}_{key}.npy"
         - if the computed modality's folder does not contain file "config.json" it will be computed again
-    - if use_splitting then there is two options:
-        - 1) kfold -> source_folder, num_folds and fold is required
-        - 2) split_ratio -> source_folder, ratios are required
-    - there is two optiona overall: 
-        - 1) setting stride -> so dataloader extracts all valid patches per image (removed in this version)
-        - 2) if stride was None -> extracts just one patch per image
+    - Read Split explanation for more details
 """
 
 
@@ -63,7 +58,6 @@ class GeneralizedDataset(Dataset):
         self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
         self.num_workers: int = config.get("num_workers", 4)
         self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
-        self.use_splitting: bool = config.get("use_splitting", False)
         self.source_folder: str = config.get("source_folder", "")
         self.save_computed: bool = config.get("save_computed", False)
         self.base_modality = config.get('base_modality')
@@ -278,7 +272,6 @@ if __name__ == "__main__":
         "sdf_iterations": 3,
         "sdf_thresholds": [-7, 7],
         "num_workers": 4,
-        "use_splitting": False,
         "split_ratios": {
             "train": 0.7,
             "valid": 0.15,

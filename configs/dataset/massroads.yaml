@@ -4,23 +4,6 @@
 root_dir: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
 # root_dir: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
 
-# Dataset split mode: "folder" or "kfold"
-split_mode: "folder"  # Uses folder structure for splits
-
-# K-fold configuration (used if split_mode is "kfold")
-# fold: 0  # Current fold
-# num_folds: 3  # Total number of folds
-
-# Split ratios (used if split_mode is "folder" with "source_folder")
-# split_ratios:
-  # train: 0.7
-  # valid: 0.15
-  # test: 0.15
-
-use_splitting: false
-
-# Source folder (used if split_mode is "folder" with split_ratios)
-# source_folder: 'train'
 
 # Batch sizes
 train_batch_size: 64
@@ -38,12 +21,42 @@ num_workers: 4
 pin_memory: true
 
 # Modality settings
-modalities:
-  image: "sat"  # Satellite imagery folder
-  label: "label"  # Road map folder
-  # distance: "distance"  # Distance transform folder
-  sdf: "sdf"  # Signed distance function folder
+split_cfg:
+  mode: "folder"
+  # for ratio-based splitting:
+  # ratios:
+  #   train: 0.7
+  #   valid: 0.15
+  #   test: 0.15
 
+  # if you have flat folder structure instead:
+  # ratio_folders:
+  #   - path: "/path/to/flat/dataset"
+  #     layout: "flat"
+  #     modalities:
+  #       image:
+  #         pattern: ".*_sat\\.tif"
+  #       label:
+  #         pattern: ".*_map\\.png"
+
+  source_folders:
+    - path: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+      layout: "folders"
+      modalities:
+        image:
+          folder: "sat"
+        label:
+          folder: "map"
+        # distance:
+          # folder: "distance"
+        sdf:
+          folder: "sdf"
+      splits:
+        train: "train"
+        valid: "valid"
+        test:  "test"
+
+base_modality: "label"
 # Distance transform settings
 # distance_threshold: 20.0
 
