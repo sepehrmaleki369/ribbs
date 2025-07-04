@@ -31,7 +31,7 @@ patch_size_z: 96           # Z-depth (only for 3D)
 small_window_size: 8       # window for texture/variance check
 validate_road_ratio: false # enforce minimum label coverage
 threshold: 0.05            # minimum road fraction if above = true
-max_images: 10           # limit number of loaded images (null = no limit)
+# max_images: 10           # limit number of loaded images (null = no limit)
 # max_images: null           # limit number of loaded images (null = no limit)
 # max_attempts: 10           # retries to find a valid patch
 
@@ -48,7 +48,7 @@ distance_threshold: 20.0          # clip distance maps (null = no clip)
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 1
+train_batch_size: 16
 val_batch_size: 1
 test_batch_size: 1
 num_workers: 4

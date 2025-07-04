@@ -9,7 +9,7 @@ params:
   n_convs: 2                 # conv layers per block
   n_levels: 3                # depth of the U-Net (number of down/up steps)
   dropout: 0.1               # dropout probability in each block
-  norm_type: "batch"           # batch / group
+  norm_type: "group"           # batch / group
   num_groups: 8            # use GroupNorm (8 groups) after each conv
   upsampling: "bilinear"       # "deconv" for transposed conv; alternatives: "nearest", "bilinear"
   pooling: "max"             # pooling type in down‐blocks ("max" or "avg")

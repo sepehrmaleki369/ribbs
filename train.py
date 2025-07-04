@@ -140,10 +140,10 @@ def main():
         every_n_epochs=trainer_cfg.get("save_checkpoints_every_n_epochs", 5)
     ))
 
-    callbacks.append(SamplePlotCallback(
-        num_samples=trainer_cfg["num_samples_plot"],
-        cmap=trainer_cfg["cmap_plot"]
-    ))
+    # callbacks.append(SamplePlotCallback(
+    #     num_samples=trainer_cfg["num_samples_plot"],
+    #     cmap=trainer_cfg["cmap_plot"]
+    # ))
 
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
 
