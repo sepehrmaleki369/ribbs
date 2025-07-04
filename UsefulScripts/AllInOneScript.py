@@ -575,138 +575,187 @@ def setup_logger(
 # ------------------------------------
 # core/validator.py
 # ------------------------------------
-# core/validator.py
 """
 Validator module for handling chunked inference in validation/test phases.
-Implements the exact Road_2D_EEF approach with robust size handling.
+Now supports **both 2‑D (N, C, H, W)** and **3‑D (N, C, D, H, W)** inputs.
+Implemented with robust size handling
+and automatic dimensionality detection.
 """
 
 import logging
-import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from core.utils import process_in_chuncks
+
+from core.utils import process_in_chuncks  # unchanged – must support N‑D windows
 
 
 class Validator:
+    """Chunked, overlap‑tiled inference for 2‑D **or** 3‑D data.
+
+    • Works with arbitrary batch size and channel count.
+    • Pads the sample so every spatial dimension is divisible by a given
+      *divisor* (default: 16) before tiling, then removes the pad.
+    • Uses `patch_size` and `patch_margin` to create overlapping tiles.
+      Only the *centre* region of each model prediction is kept and
+      stitched together.
+
+    Parameters
+    ----------
+    config : dict
+        Dictionary with at least the keys:
+            ``patch_size``   – tuple/list[int] (len == 2 or 3)
+            ``patch_margin`` – tuple/list[int] same length as
+                                 ``patch_size``
+        Any other keys are ignored by this class.
     """
-    Validator class for handling chunked inference during validation/testing.
-    Uses the Road_2D_EEF process_in_chunks approach with robust size handling.
-    """
-    
+
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the Validator.
-        
-        Args:
-            config: Configuration dictionary with inference parameters such as 
-                   patch_size and patch_margin
-        """
         self.config = config
-        self.patch_size   = config.get("patch_size",   [512, 512])
-        self.patch_margin = config.get("patch_margin", [32,  32])
+        self.patch_size: Tuple[int, ...] = tuple(config.get("patch_size", (512, 512)))
+        self.patch_margin: Tuple[int, ...] = tuple(config.get("patch_margin", (32, 32)))
         self.logger = logging.getLogger(__name__)
-        
-        # Convert to tuples if provided as lists
-        if isinstance(self.patch_size, list):
-            self.patch_size = tuple(self.patch_size)
-        if isinstance(self.patch_margin, list):
-            self.patch_margin = tuple(self.patch_margin)
-            
-        # Ensure patch_size and patch_margin have the same dimensions
+
         if len(self.patch_size) != len(self.patch_margin):
-            raise ValueError(f"patch_size {self.patch_size} and patch_margin "
-                             f"{self.patch_margin} must have the same number "
-                             f"of dimensions")
-    
-    # --------------------------------------------------------------------- #
-    # helpers                                                               #
-    # --------------------------------------------------------------------- #
-    def _pad_to_valid_size(self, image: torch.Tensor, divisor: int = 16) -> tuple:
-        """
-        Pad image to ensure dimensions are divisible by `divisor`.
-        
+            raise ValueError(
+                "patch_size %s and patch_margin %s must have the same number of dimensions"
+                % (self.patch_size, self.patch_margin)
+            )
+        if len(self.patch_size) not in (2, 3):
+            raise ValueError("Only 2‑D or 3‑D data are supported (got %d‑D)" % len(self.patch_size))
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _calc_div16_pad(size: int, divisor: int = 16) -> int:
+        """Return how many voxels/pixels must be *added to the right* so that
+        *size* becomes divisible by *divisor* (default 16)."""
+        return (divisor - size % divisor) % divisor
+
+    def _pad_to_valid_size(
+        self, image: torch.Tensor, divisor: int = 16
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """Pad *image* so *all* spatial dims are divisible by ``divisor``.
+
+        Only **right/bottom/back** padding is applied (no shift of origin).
+
+        Parameters
+        ----------
+        image : torch.Tensor
+            ``(N, C, H, W)`` or ``(N, C, D, H, W)`` tensor.
+        divisor : int, optional
+            The divisor (default 16).
+
         Returns
         -------
-        image        : padded tensor
-        (pad_h, pad_w): how much was added on bottom / right
+        image_padded : torch.Tensor
+        pads         : list[int]
+            Per‑dimension pad added (*same order as image spatial dims*).
         """
-        N, C, H, W = image.shape
-        pad_h = (divisor - H % divisor) % divisor
-        pad_w = (divisor - W % divisor) % divisor
-        if pad_h or pad_w:
-            image = F.pad(image, (0, pad_w, 0, pad_h), mode="reflect")
-        return image, (pad_h, pad_w)
-    
-    # --------------------------------------------------------------------- #
-    # main entry                                                            #
-    # --------------------------------------------------------------------- #
+
+        spatial = image.shape[2:]
+        pad_each: List[int] = [self._calc_div16_pad(s, divisor) for s in spatial]
+
+        # Build pad tuple for F.pad – must be *reversed* order, one (left,right)
+        # pair per dim starting with the last spatial dim.
+        pad_tuple: List[int] = []
+        for p in reversed(pad_each):
+            pad_tuple.extend([0, p])  # (left = 0, right = p)
+
+        if any(pad_each):
+            try:
+                image = F.pad(image, pad_tuple, mode="reflect")
+            except RuntimeError:
+                # "reflect" not implemented for 5‑D – fall back gracefully.
+                image = F.pad(image, pad_tuple, mode="replicate")
+        return image, pad_each
+
+    # ------------------------------------------------------------------
+    # main API
+    # ------------------------------------------------------------------
     def run_chunked_inference(
         self,
-        model : nn.Module,
-        image : torch.Tensor,
-        device: Optional[torch.device] = None
+        model: nn.Module,
+        image: torch.Tensor,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        """
-        Full-image inference with overlapping tiles.
+        """Full‑image/volume inference with overlapping tiles.
 
-        1) Pad by `patch_margin` on all four sides (reflect).
-        2) Pad further so H and W are divisible by 16.
-        3) Slide windows of size `patch_size` with stride
-           `patch_size – 2*patch_margin`, call `model`, keep only the
-           inner (centre) region, and stitch into a canvas.
-        4) Remove the /16 pad, then remove the initial margin pad.
+        Workflow (N‑D):
+        1) **Margin pad** by ``patch_margin`` (reflect/replicate).
+        2) **Div‑16 pad** so every spatial dim is divisible by 16.
+        3) **Sliding‑window** inference:
+            • window      = ``patch_size``
+            • window step = ``patch_size − 2*patch_margin``
+            • model is applied on each window; only the *centre* region
+              is placed into the output canvas.
+        4) **Remove** the div‑16 pad.
+        5) **Remove** the initial margin pad.
+
+        Returns
+        -------
+        torch.Tensor
+            Prediction of shape ``(N, out_channels, *original_spatial*)``.
         """
+
         if device is None:
             device = next(model.parameters()).device
 
         model.eval()
         image = image.to(device)
 
-        # -------------------------------------------------------------- #
-        # (A) FIRST pad by the desired margins so borders get context    #
-        # -------------------------------------------------------------- #
-        mh, mw = self.patch_margin                                   
-        if mh or mw:                                                 
-            image = F.pad(                                           
-                image,                                               
-                pad=(mw, mw, mh, mh),  # (left, right, top, bottom)  
-                mode="reflect",                                      
-            )                                                        
+        ndim = len(self.patch_size)  # 2 or 3
+        if image.dim() != ndim + 2:
+            raise ValueError(
+                f"Input tensor dim {image.dim()} does not match patch_size ndim {ndim}"
+            )
 
-        # -------------------------------------------------------------- #
-        # (B) SECOND, pad to make H and W divisible by 16               #
-        # -------------------------------------------------------------- #
-        padded_image, (pad_h16, pad_w16) = self._pad_to_valid_size(image, 16)
-        N, C, Hpad, Wpad = padded_image.shape
+        # ----------------------------------------------------------
+        # (A) First pad by the desired margins so borders get context
+        # ----------------------------------------------------------
+        if any(self.patch_margin):
+            # Build pad tuple [ ... (left,right) per dim … ]
+            pad_tuple: List[int] = []
+            for m in reversed(self.patch_margin):
+                pad_tuple.extend([m, m])
+            try:
+                image = F.pad(image, pad_tuple, mode="reflect")
+            except RuntimeError:
+                image = F.pad(image, pad_tuple, mode="replicate")
 
-        # -------------------------------------------------------------- #
-        # (C) Determine #output channels with a dummy forward           #
-        # -------------------------------------------------------------- #
+        # ----------------------------------------------------------
+        # (B) Second pad until all dims divisible by 16
+        # ----------------------------------------------------------
+        padded_image, pad_div16 = self._pad_to_valid_size(image, 16)
+        N, C, *spatial_pad = padded_image.shape
+
+        # ----------------------------------------------------------
+        # (C) Dummy forward to figure out #out channels
+        # ----------------------------------------------------------
         with torch.no_grad():
-            test_h = min(Hpad, self.patch_size[0] + 2 * mh)
-            test_w = min(Wpad, self.patch_size[1] + 2 * mw)
-            test_patch = padded_image[:, :, :test_h, :test_w]
+            test_sizes = [
+                min(s, p + 2 * m)
+                for s, p, m in zip(spatial_pad, self.patch_size, self.patch_margin)
+            ]
+            slices: List[slice] = [slice(None), slice(None)] + [slice(0, t) for t in test_sizes]
+            test_patch = padded_image[tuple(slices)]
             test_patch, _ = self._pad_to_valid_size(test_patch, 16)
             out_channels = model(test_patch).shape[1]
 
-        # Allocate output canvas (same size as padded_image)
-        output = torch.zeros(
-            (N, out_channels, Hpad, Wpad),
-            device=device,
-            dtype=padded_image.dtype,
-        )
+        # Allocate output canvas
+        output_shape = (N, out_channels, *spatial_pad)
+        output = torch.zeros(output_shape, device=device, dtype=padded_image.dtype)
 
-        # -------------------------------------------------------------- #
-        # (D) Sliding-window inference                                  #
-        # -------------------------------------------------------------- #
-        def _process(chunk: torch.Tensor) -> torch.Tensor:
+        # ----------------------------------------------------------
+        # (D) Sliding‑window inference
+        # ----------------------------------------------------------
+        def _process(chunk: torch.Tensor) -> torch.Tensor:  # noqa: D401
             with torch.no_grad():
                 return model(chunk)
-        
+
         with torch.no_grad():
             output = process_in_chuncks(
                 padded_image,
@@ -716,19 +765,24 @@ class Validator:
                 list(self.patch_margin),
             )
 
-        # -------------------------------------------------------------- #
-        # (E) Remove the /16 pad                                         #
-        # -------------------------------------------------------------- #
-        if pad_h16 or pad_w16:
-            output = output[:, :, : -pad_h16 if pad_h16 else None,
-                                   : -pad_w16 if pad_w16 else None]
+        # ----------------------------------------------------------
+        # (E) Remove the div‑16 pad (right/bottom/back only)
+        # ----------------------------------------------------------
+        if any(pad_div16):
+            slices: List[slice] = [slice(None), slice(None)]
+            for p in pad_div16:
+                slices.append(slice(None, -p if p else None))
+            output = output[tuple(slices)]
 
-        # -------------------------------------------------------------- #
-        # (F) Remove the initial margin pad                              #
-        # -------------------------------------------------------------- #
-        if mh or mw:                                                 
-            output = output[:, :, mh : output.shape[2] - mh,         
-                                   mw : output.shape[3] - mw]       
+        # ----------------------------------------------------------
+        # (F) Remove the initial margin pad (all sides)
+        # ----------------------------------------------------------
+        if any(self.patch_margin):
+            slices = [slice(None), slice(None)]
+            for i, m in enumerate(self.patch_margin):
+                end = output.shape[2 + i] - m
+                slices.append(slice(m, end))
+            output = output[tuple(slices)]
 
         return output
 
@@ -1734,1042 +1788,6 @@ __all__ = [
     'custom_collate_fn',
     'worker_init_fn'
 ]
-
-# ------------------------------------
-# core/general_dataset/augments.py
-# ------------------------------------
-
-from typing import Any, Dict, List, Optional
-import numpy as np
-from core.general_dataset.logger import logger
-
-import math
-from scipy.ndimage import rotate
-
-def get_augmentation_metadata(augmentations) -> Dict[str, Any]:
-    """
-    Generate random augmentation parameters for a patch.
-
-    Returns:
-        Dict[str, Any]: Augmentation metadata.
-    """
-    meta: Dict[str, Any] = {}
-    if 'rotation' in augmentations:
-        meta['angle'] = np.random.uniform(0, 360)
-    if 'flip_h' in augmentations:
-        meta['flip_h'] = np.random.rand() > 0.5
-    if 'flip_v' in augmentations:
-        meta['flip_v'] = np.random.rand() > 0.5
-    return meta
-
-
-def flip_h(full_array: np.ndarray) -> np.ndarray:
-    return np.flip(full_array, axis=-1)
-
-def flip_v(full_array: np.ndarray) -> np.ndarray:
-    return np.flip(full_array, axis=-2)
-
-def rotate_(full_array: np.ndarray, patch_meta: Dict[str, Any], patch_size) -> np.ndarray:
-    """
-    Rotate a patch using an expanded crop to avoid border effects.
-    If the crop is too small, log a warning and return a zero patch.
-
-    Args:
-        full_array (np.ndarray): Full image array.
-        patch_meta (Dict[str, Any]): Contains patch coordinates and angle.
-    
-    Returns:
-        np.ndarray: Rotated patch.
-    """
-    L = int(np.ceil(patch_size * math.sqrt(2)))
-    x = patch_meta["x"]
-    y = patch_meta["y"]
-    angle = patch_meta["angle"]
-
-    cx = x + patch_size // 2
-    cy = y + patch_size // 2
-    half_L = L // 2
-    x0 = max(0, cx - half_L)
-    y0 = max(0, cy - half_L)
-    x1 = min(full_array.shape[-1], cx + half_L)
-    y1 = min(full_array.shape[-2], cy + half_L)
-
-    if full_array.ndim == 3:
-        crop = full_array[:, y0:y1, x0:x1]
-        if crop.shape[1] < L or crop.shape[2] < L:
-            logger.warning("Crop too small for 3D patch rotation; returning zero patch.")
-            return np.zeros((full_array.shape[0], patch_size, patch_size), dtype=full_array.dtype)
-        rotated_channels = [rotate(crop[c], angle, reshape=False, order=1) for c in range(full_array.shape[0])]
-        rotated = np.stack(rotated_channels)
-        start = (L - patch_size) // 2
-        return rotated[:, start:start + patch_size, start:start + patch_size]
-    elif full_array.ndim == 2:
-        crop = full_array[y0:y1, x0:x1]
-        if crop.shape[0] < L or crop.shape[1] < L:
-            logger.warning("Crop too small for 2D patch rotation; returning zero patch.")
-            return np.zeros((patch_size, patch_size), dtype=full_array.dtype)
-        rotated = rotate(crop, angle, reshape=False, order=1)
-        start = (L - patch_size) // 2
-        return rotated[start:start + patch_size, start:start + patch_size]
-    else:
-        raise ValueError("Unsupported array shape")
-    
-
-def extract_condition_augmentations(imgs: Dict[str, np.ndarray], metadata: Dict[str, Any], patch_size, augmentations) -> Dict[str, np.ndarray]:
-    """
-    Extract a patch from the full image and apply conditional augmentations.
-
-    Args:
-        imgs (Dict[str, np.ndarray]): Full images for each modality.
-        metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
-    
-    Returns:
-        Dict[str, np.ndarray]: Dictionary of extracted patches.
-    """
-    imgs_aug = imgs.copy()
-    data = extract_data(imgs, metadata['x'], metadata['y'], patch_size)
-    for key in imgs:
-        if key.endswith("_patch"):
-            modality = key.replace("_patch", "")
-            if 'flip_h' in augmentations:
-                imgs_aug[modality] = flip_h(imgs[modality])
-                data[key] = flip_h(data[key])
-            if 'flip_v' in augmentations:
-                imgs_aug[modality] = flip_v(imgs[modality])
-                data[key] = flip_v(data[key])
-            if 'rotation' in augmentations:
-                data[key] = rotate_(imgs_aug[modality], metadata, patch_size)
-    return data
-
-def extract_data(imgs: Dict[str, np.ndarray], x: int, y: int, patch_size) -> Dict[str, np.ndarray]:
-    """
-    Extract a patch from each modality starting at (x, y) with size patch_size.
-
-    Args:
-        imgs (Dict[str, np.ndarray]): Full images.
-        x (int): x-coordinate.
-        y (int): y-coordinate.
-    
-    Returns:
-        Dict[str, np.ndarray]: Extracted patch for each modality.
-    """
-    data: Dict[str, np.ndarray] = {}
-    for key, array in imgs.items():
-        if array.ndim == 3:
-            data[f"{key}_patch"] = array[:, y:y + patch_size, x:x + patch_size]
-        elif array.ndim == 2:
-            data[f"{key}_patch"] = array[y:y + patch_size, x:x + patch_size]
-        else:
-            raise ValueError("Unsupported array dimensions in _extract_data")
-    return data
-
-# ------------------------------------
-# core/general_dataset/logger.py
-# ------------------------------------
-import logging
-import sys
-
-logging.basicConfig(level=logging.ERROR)
-logger = logging.getLogger(__name__)
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.ERROR)
-
-fmt = logging.Formatter(
-    "%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-handler.setFormatter(fmt)
-
-# (re)attach handler
-if not logger.handlers:
-    logger.addHandler(handler)
-
-# ------------------------------------
-# core/general_dataset/collate.py
-# ------------------------------------
-import torch
-from typing import Any, Dict, List, Optional
-import random
-import numpy as np
-from core.general_dataset.logger import logger
-
-
-def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Custom collate function with None filtering.
-    """
-    # Filter out None samples
-    batch = [sample for sample in batch if sample is not None]
-    
-    # Handle empty batch case
-    if not batch:
-        logger.warning("Empty batch after filtering None values")
-        return {}  # Or return a default empty batch structure
-    
-    # Original collation logic
-    collated: Dict[str, Any] = {}
-    for key in batch[0]:
-        items = []
-        for sample in batch:
-            value = sample[key]
-            if isinstance(value, np.ndarray):
-                value = torch.from_numpy(value)
-            items.append(value)
-        if isinstance(items[0], torch.Tensor):
-            collated[key] = torch.stack(items)
-        else:
-            collated[key] = items
-    return collated
-
-def worker_init_fn(worker_id):
-    """
-    DataLoader worker initialization to ensure different random seeds for each worker.
-    """
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
-
-# ------------------------------------
-# core/general_dataset/modalities.py
-# ------------------------------------
-import numpy as np
-from scipy.ndimage import distance_transform_edt, binary_dilation
-from typing import Any, Dict, List, Optional
-from core.general_dataset.logger import logger
-
-
-
-
-def compute_distance_map(lbl: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
-    """
-    Compute a distance map from a label image.
-
-    Args:
-        lbl (np.ndarray): Input label image.
-        distance_threshold (Optional[float]): Maximum distance value.
-    
-    Returns:
-        np.ndarray: Distance map.
-    """
-    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
-    distance_map = distance_transform_edt(lbl_bin == 0)
-    if distance_threshold is not None:
-        np.minimum(distance_map, distance_threshold, out=distance_map)
-    return distance_map
-
-def compute_sdf(lbl: np.ndarray, sdf_iterations: int, sdf_thresholds: List[float]) -> np.ndarray:
-    """
-    Compute the signed distance function (SDF) for a label image.
-
-    Args:
-        lbl (np.ndarray): Input label image.
-        sdf_iterations (int): Number of iterations for dilation.
-        sdf_thresholds (List[float]): [min, max] thresholds for the SDF.
-    
-    Returns:
-        np.ndarray: The SDF computed.
-    """
-    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
-    dilated = binary_dilation(lbl_bin, iterations=sdf_iterations)
-    dist_out = distance_transform_edt(1 - dilated)
-    dist_in  = distance_transform_edt(lbl_bin)
-    sdf = dist_out - dist_in
-    if sdf_thresholds is not None:
-        sdf = np.clip(sdf, sdf_thresholds[0], sdf_thresholds[1])
-    return sdf
-
-# ------------------------------------
-# core/general_dataset/base.py
-# ------------------------------------
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
-import os
-import json
-import random
-import numpy as np
-from tqdm import tqdm
-from sklearn.model_selection import KFold
-from torch.utils.data import Dataset, DataLoader
-
-from core.general_dataset.io          import load_array_from_file
-from core.general_dataset.modalities  import compute_distance_map, compute_sdf
-from core.general_dataset.patch_validity       import check_min_thrsh_road
-from core.general_dataset.augments    import get_augmentation_metadata, extract_condition_augmentations
-from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
-from core.general_dataset.normalizations import normalize_image
-from core.general_dataset.visualizations import visualize_batch
-from core.general_dataset.splits import Split
-from core.general_dataset.logger import logger
-
-
-"""
-assumptions:
-    - lbl can be binary or int (thresholded by 127)
-    - roads are 1 on lbl
-    - image modality must be defined 
-    - label modality is not required necessarily (even it's possible to define one folder to more than one modality) 
-    - for modalities other that label and image: 
-        - file names must be in this format: modality_filename = f"{base}_{key}.npy"
-        - if the computed modality's folder does not contain file "config.json" it will be computed again
-    - Read Split explanation for more details
-"""
-
-
-
-class GeneralizedDataset(Dataset):
-    """
-    PyTorch Dataset for generalized remote sensing or segmentation datasets.
-    """
-    def __init__(self, config: Dict[str, Any]) -> None:
-        super().__init__()
-        self.config = config
-        self.root_dir: str = config.get("root_dir")
-        self.split: str = config.get("split", "train")
-        self.patch_size: int = config.get("patch_size", 128)
-        self.small_window_size: int = config.get("small_window_size", 8)
-        self.threshold: float = config.get("threshold", 0.05)
-        self.max_images: Optional[int] = config.get("max_images")
-        self.max_attempts: int = config.get("max_attempts", 10)
-        self.validate_road_ratio: bool = config.get("validate_road_ratio", False)
-        self.seed: int = config.get("seed", 42)
-        self.fold = config.get("fold")
-        self.num_folds = config.get("num_folds")
-        self.verbose: bool = config.get("verbose", False)
-        self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
-        self.distance_threshold: Optional[float] = config.get("distance_threshold")
-        self.sdf_iterations: int = config.get("sdf_iterations")
-        self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
-        self.num_workers: int = config.get("num_workers", 4)
-        self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
-        self.source_folder: str = config.get("source_folder", "")
-        self.save_computed: bool = config.get("save_computed", False)
-        self.base_modality = config.get('base_modality')
-        self.compute_again_modalities = config.get('compute_again_modalities', False)
-        self.split_cfg = config["split_cfg"]
-        self.split_cfg['seed'] = self.seed
-        self.split_cfg['base_modality'] = self.base_modality
-        splitter = Split(self.split_cfg)
-        
-
-        if self.root_dir is None:
-            raise ValueError("root_dir must be specified in the config.")
-        if self.patch_size is None:
-            raise ValueError("patch_size must be specified in the config.")
-
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-
-        split_cfg = config["split_cfg"]
-        split_cfg['seed'] = self.seed
-        splitter = Split(split_cfg)
-        self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
-        self.modalities = list(self.modality_files.keys())
-        
-        # sanity check
-        if 'image' not in self.modality_files or 'label' not in self.modality_files:
-            raise ValueError("Split must define both 'image' and 'label' modalities in split_cfg.")
-        if 'image' in self.modality_files and 'label' in self.modality_files:
-            assert len(self.modality_files['image']) == len(self.modality_files['label']), f"len(images): {len(self.modality_files['image'])}, len(labels): {len(self.modality_files['label'])}"
-
-        # exts = ['.tiff', '.tif', '.png', '.jpg', '.npy']
-
-        if self.max_images is not None:
-            for key in self.modality_files:
-                self.modality_files[key] = self.modality_files[key][:self.max_images]
-
-        # Precompute additional modalities (e.g., distance, sdf).
-        if self.save_computed:
-            for key in [modal for modal in self.modalities if modal not in ['image', 'label']]:
-                logger.info(f"Generating {key} modality maps...")
-                for file_idx, file in tqdm(enumerate(self.modality_files["label"]),
-                                        total=len(self.modality_files["label"]),
-                                        desc=f"Processing {key} maps"):
-                    lbl = load_array_from_file(self.modality_files['label'][file_idx])
-                    modality_path = self.modality_files[key][file_idx]
-                    dirpath = os.path.dirname(modality_path)
-                    os.makedirs(dirpath, exist_ok=True)
-                    if key == "distance":
-                        if not os.path.exists(modality_path) or self.compute_again_modalities:
-                            processed_map = compute_distance_map(lbl, None)
-                            np.save(modality_path, processed_map)
-                    elif key == "sdf":
-                        if not os.path.exists(modality_path) or self.compute_again_modalities:
-                            processed_map = compute_sdf(lbl, self.sdf_iterations, None)
-                            np.save(modality_path, processed_map)
-                    else:
-                        raise ValueError(f"Modality {key} not supported.")
-
-    def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
-        imgs: Dict[str, np.ndarray] = {}
-        for key in self.modalities:
-            if os.path.exists(self.modality_files[key][file_idx]):
-                arr = load_array_from_file(self.modality_files[key][file_idx])
-                if arr is None:            # <- corrupted TIFF
-                    return None            # signal caller to skip this index
-            else:
-                lbl = load_array_from_file(self.modality_files["label"][file_idx])
-                if key == "distance":
-                    arr = compute_distance_map(lbl, None)
-                elif key == "sdf":
-                    arr = compute_sdf(lbl, self.sdf_iterations, None)
-                else:
-                    raise ValueError(f"Modality {key} not supported.")
-                
-            imgs[key] = arr
-        return imgs
-
-    def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """
-        Normalize image patch values and binarize label patch if needed.
-        Args:
-            data (Dict[str, np.ndarray]): Dictionary containing patches.
-        Returns:
-            Dict[str, np.ndarray]: Postprocessed patches.
-        """
-        for key in data:
-            if key == "image_patch":
-                data[key] = normalize_image(data[key])
-            elif key == "label_patch":
-                if data[key].max() > 1:
-                    data[key] = (data[key] > 127).astype(np.uint8)
-            elif key == "distance_patch":
-                if self.distance_threshold:
-                    data[key] = np.clip(data[key], 0, self.distance_threshold)
-            elif key == "sdf_patch":
-                if self.sdf_thresholds:
-                    data[key] = np.clip(data[key], self.sdf_thresholds[0], self.sdf_thresholds[1])
-        return data
-
-    
-
-    def __len__(self) -> int:
-        return len(self.modality_files['image'])
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        imgs = self._load_datapoint(idx)
-        if imgs is None:           # corrupted file detected
-            # pick a different index (cyclic) so DataLoader doesn’t crash
-            return self.__getitem__((idx + 1) % len(self))
-
-        if imgs['image'].ndim == 3:
-            _, H, W = imgs['image'].shape
-        elif imgs['image'].ndim == 2:
-            H, W = imgs['image'].shape
-        else:
-            raise ValueError("Unsupported image dimensions")
-
-        if self.split != 'train':
-            data = {}
-            patch_meta = {"image_idx": idx, "x": -1, "y": -1}
-            for key, array in imgs.items():
-                if array.ndim == 3:
-                    data[f"{key}_patch"] = array
-                elif array.ndim == 2:
-                    data[f"{key}_patch"] = array
-                else:
-                    raise ValueError("Unsupported array dimensions in _extract_data")
-            data['metadata'] = patch_meta
-            data = self._postprocess_patch(data)
-            
-            return data
-
-        valid_patch_found = False
-        attempts = 0
-        while not valid_patch_found and attempts < self.max_attempts:
-            x = np.random.randint(0, W - self.patch_size + 1)
-            y = np.random.randint(0, H - self.patch_size + 1)
-            patch_meta = {"image_idx": idx, "x": x, "y": y}
-            if self.augmentations:
-                patch_meta.update(get_augmentation_metadata(self.augmentations))
-            data = extract_condition_augmentations(imgs, patch_meta, self.patch_size, self.augmentations)
-            if self.validate_road_ratio:
-                if check_min_thrsh_road(data['label_patch'], self.patch_size, self.threshold):
-                    valid_patch_found = True
-                    data['metadata'] = patch_meta
-                    data = self._postprocess_patch(data)
-                    return data
-            else:
-                valid_patch_found = True
-                data['metadata'] = patch_meta
-                data = self._postprocess_patch(data)
-                return data
-            
-            attempts += 1
-
-        # If a valid patch isn't found after max_attempts, fallback to the last sampled patch
-        if not valid_patch_found:
-            logger.warning("No valid patch found after %d attempts; trying next image", self.max_attempts)
-            return self.__getitem__((idx + 1) % len(self))
-        return None
-        
-    
-
-if __name__ == "__main__":
-    split_cfg = {
-        "mode": "folder",
-        # "ratios": {"train": 0.8, "valid": 0.1, "test": 0.1},
-        # "ratio_folders": [
-        #     {
-        #         "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/flat",
-        #         "layout": "flat",
-        #         "modalities": {
-        #             "image": {"pattern": r".*_sat\.tif"},
-        #             "label": {"pattern": r".*_map\.png"}
-        #         }
-        #     }
-        # ]
-        "source_folders": [
-        {
-            "path": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset",
-            "layout": "folders",
-            "modalities": {
-                "image": {"folder": "sat"},
-                "label": {"folder": "label"},
-                "sdf":   {"folder": "sdf"}  
-            },
-            "splits": {
-                "train": "train",
-                "valid": "valid",
-                "test":  "test"
-            }
-        },
-    ]
-
-    }
-    config = {
-        "root_dir": "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/",  # Update with your dataset path.
-        "split": "train",
-        # "split": "valid",
-        "split_cfg": split_cfg,
-        "patch_size": 256,
-        "small_window_size": 8,
-        "validate_road_ratio": True,
-        "threshold": 0.025,
-        "max_images": 5,  # For quick testing.
-        "seed": 42,
-        "fold": None,
-        "num_folds": None,
-        "verbose": True,
-        "augmentations": ["flip_h", "flip_v", "rotation"],
-        "distance_threshold": 15.0,
-        "sdf_iterations": 3,
-        "sdf_thresholds": [-7, 7],
-        "num_workers": 4,
-        "split_ratios": {
-            "train": 0.7,
-            "valid": 0.15,
-            "test": 0.15
-        },
-        "modalities": {
-            "image": "sat",
-            "label": "map",
-            "distance": "distance",
-            "sdf": "sdf"
-        },
-        "base_modality": 'image',
-        'compute_again_modalities': False,
-        'save_computed': True
-    }
-
-    # Create dataset and dataloader.
-    dataset = GeneralizedDataset(config)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=8,
-        shuffle=True,
-        collate_fn=custom_collate_fn,
-        num_workers=4,
-        # worker_init_fn=worker_init_fn
-    )
-    logger.info('len(dataloader): %d', len(dataloader))
-    for epoch in range(10):
-        for i, batch in enumerate(dataloader):
-            if batch is None:
-                continue
-            logger.info("Batch keys: %s", batch.keys())
-            logger.info("Image shape: %s", batch["image_patch"].shape)
-            logger.info("Label shape: %s", batch["label_patch"].shape)
-            visualize_batch(batch)
-            # break  # Uncomment to visualize only one batch.
-
-
-# ------------------------------------
-# core/general_dataset/splits.py
-# ------------------------------------
-# core/general_dataset/split.py
-# ---------------------------------------------------------------------
-"""
-Flexible dataset-splitting helper.
-
-  • folder-based         (pre-made train/valid/test dirs)
-  • k-fold cross-val     (plus optional dedicated test roots)
-  • ratio-based shuffle  (train/valid/test percentages)
-
-Each source folder may store modalities either
-  • "folders" – one subdir per modality (sat/, map/, …)
-  • "flat"    – all files mixed; regex distinguishes modalities
-
-The stem (basename without extension) identifies a datapoint.
-Returned structure: {modality: [absolute_paths …]}, aligned by stem.
-
-Every pass through the filesystem skips any file named **index.html**
-(case-insensitive).
-"""
-from __future__ import annotations
-import os
-import re
-import random
-import pathlib
-from collections import defaultdict
-from typing import Dict, List, Any
-import numpy as np
-from sklearn.model_selection import KFold
-
-# -------- helpers --------------------------------------------------- #
-def _is_junk(fname: str) -> bool:
-    return fname.lower() in ("index.html", "config.json")
-
-def _listdir_safe(folder: str) -> List[str]:
-    try:
-        return os.listdir(folder)
-    except FileNotFoundError:
-        return []
-
-# -------- main class ------------------------------------------------ #
-class Split:
-    def __init__(self, cfg: Dict[str, Any]) -> None:
-        self.cfg        = cfg
-        self.seed       = cfg.get("seed", 0)
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-
-        # expose these for get_split
-        src0           = cfg["source_folders"][0]
-        self._all_mods = list(src0["modalities"].keys())
-        self._source_root = src0["path"]
-        self._is_folder_layout = src0["layout"] == "folders"
-        self._modality_to_folder = {
-            mod: meta.get("folder")
-            for mod, meta in src0["modalities"].items()
-        }
-
-        # collect + build raw split_map
-        mode = cfg["mode"]
-        if mode == "folder":
-            self._collect_datapoints(cfg["source_folders"])
-            self.split_map = self._prepare_folder_based(cfg["source_folders"])
-        elif mode == "kfold":
-            self.split_map = self._prepare_kfold(cfg)
-        elif mode == "ratio":
-            self.split_map = self._prepare_ratio(cfg)
-        else:
-            raise ValueError(f"Unknown split mode: {mode}")
-
-    def get_split(self, split: str) -> Dict[str, List[str]]:
-        """
-        For a given split, return a dict mapping every modality to a list
-        of file paths.  Missing modalities are synthesised from the
-        base_modality + the source layout rules.
-        """
-        if split not in self.split_map:
-            raise KeyError(f"Split '{split}' not found; choose from {list(self.split_map)}")
-
-        # 1) start with whatever files were found on disk
-        raw = {m: paths[:] for m, paths in self.split_map[split].items()}
-
-        # 2) drop junk & build stem→path dicts per modality
-        by_mod_stem: Dict[str, Dict[str, str]] = {}
-        for mod, paths in raw.items():
-            clean = [p for p in paths if not _is_junk(os.path.basename(p))]
-            by_mod_stem[mod] = { pathlib.Path(p).stem: p for p in clean }
-
-        # 3) figure out which stems to keep (those that have the base_modality)
-        base = self.cfg.get("base_modality", "image")
-        if base not in by_mod_stem:
-            raise KeyError(f"No '{base}' files found in split '{split}'")
-        stems = sorted(by_mod_stem[base].keys())
-
-        # 4) for each stem, collect real or synthed paths for all modalities
-        filemap: Dict[str, List[str]] = {m: [] for m in self._all_mods}
-        for stem in stems:
-            base_path = by_mod_stem[base][stem]
-            base_dir  = os.path.dirname(base_path)
-            for mod in self._all_mods:
-                if stem in by_mod_stem.get(mod, {}):
-                    # already on disk
-                    filemap[mod].append(by_mod_stem[mod][stem])
-                else:
-                    # synthesize
-                    if self._is_folder_layout:
-                        split_root = os.path.join(self._source_root, split)
-                        mod_dir    = os.path.join(split_root, self._modality_to_folder[mod])
-                        fname      = f"{stem}_{mod}.npy"
-                    else:
-                        mod_dir = base_dir
-                        if mod in ("image","label"):
-                            # look for any matching existing file
-                            candidates = [
-                                p for p in os.listdir(mod_dir)
-                                if pathlib.Path(p).stem == stem and mod in p
-                            ]
-                            fname = candidates[0] if candidates else f"{stem}_{mod}"
-                        else:
-                            fname = f"{stem}_{mod}.npy"
-                    filemap[mod].append(os.path.join(mod_dir, fname))
-
-        return filemap
-
-    def iter_datapoints(self):
-        for stem, mods in self._all_datapoints.items():
-            yield stem, mods
-
-    # -------- split-builders ---------------------------------------- #
-    def _prepare_folder_based(self, src_cfg):
-        smap = defaultdict(lambda: defaultdict(list))
-        for sf in src_cfg:
-            for split, subdir in sf["splits"].items():
-                files = self._scan_folder(os.path.join(sf["path"], subdir), sf)
-                for m, plist in files.items():
-                    smap[split][m].extend(plist)
-        return smap
-
-    def _prepare_kfold(self, cfg):
-        tr_cfg, test_cfg = cfg["train_valid_folders"], cfg["test_folders"]
-        n_fold, idx      = cfg["num_folds"], cfg["fold_idx"]
-        dp = self._collect_datapoints(tr_cfg)
-        stems = sorted(dp)
-        kf = KFold(n_splits=n_fold, shuffle=True, random_state=self.seed)
-        tr_ids, val_ids = list(kf.split(stems))[idx]
-
-        smap = {s: defaultdict(list) for s in ("train","valid","test")}
-        for i in tr_ids:
-            for m,p in dp[stems[i]].items(): smap["train"][m].append(p)
-        for i in val_ids:
-            for m,p in dp[stems[i]].items(): smap["valid"][m].append(p)
-        for sf in test_cfg:
-            files = self._scan_folder(sf["path"], sf, ignore_splits=True)
-            for m,plist in files.items(): smap["test"][m].extend(plist)
-        return smap
-
-    def _prepare_ratio(self, cfg):
-        folders, ratios = cfg["ratio_folders"], cfg["ratios"]
-        if abs(sum(ratios.values()) - 1) > 1e-6:
-            raise ValueError("ratios must sum to 1")
-        dp = self._collect_datapoints(folders)
-        stems = list(dp); random.shuffle(stems)
-        n   = len(stems)
-        n_tr = int(n * ratios["train"])
-        n_va = int(n * ratios["valid"])
-
-        idx = {
-            "train": stems[:n_tr],
-            "valid": stems[n_tr:n_tr+n_va],
-            "test":  stems[n_tr+n_va:]
-        }
-        smap = {s: defaultdict(list) for s in idx}
-        for split, slist in idx.items():
-            for s in slist:
-                for m,p in dp[s].items(): smap[split][m].append(p)
-        return smap
-
-    # -------- filesystem utils -------------------------------------- #
-    def _collect_datapoints(self, folders_cfg):
-        local = defaultdict(dict)
-        for sf in folders_cfg:
-            root, layout = sf["path"], sf["layout"]
-            if layout == "folders":
-                for mod, meta in sf["modalities"].items():
-                    mdir = os.path.join(root, meta["folder"])
-                    for fname in _listdir_safe(mdir):
-                        if _is_junk(fname): continue
-                        stem = pathlib.Path(fname).stem
-                        path = os.path.join(mdir, fname)
-                        local[stem][mod] = path
-                        self._all_datapoints[stem][mod] = path
-            else:
-                for fname in _listdir_safe(root):
-                    if _is_junk(fname): continue
-                    for mod, meta in sf["modalities"].items():
-                        if re.fullmatch(meta["pattern"], fname):
-                            stem = pathlib.Path(fname).stem
-                            path = os.path.join(root, fname)
-                            local[stem][mod] = path
-                            self._all_datapoints[stem][mod] = path
-        return local
-
-    def _scan_folder(self, folder, sf_cfg, ignore_splits=False):
-        res = defaultdict(list)
-        if sf_cfg["layout"] == "folders":
-            for mod, meta in sf_cfg["modalities"].items():
-                mdir = folder if ignore_splits else os.path.join(folder, meta["folder"])
-                for fname in _listdir_safe(mdir):
-                    if _is_junk(fname): continue
-                    res[mod].append(os.path.join(mdir, fname))
-        else:
-            for fname in _listdir_safe(folder):
-                if _is_junk(fname): continue
-                for mod, meta in sf_cfg["modalities"].items():
-                    if re.fullmatch(meta["pattern"], fname):
-                        res[mod].append(os.path.join(folder, fname))
-        return res
-
-# ------------------------------------------------------------------ #
-# quick demo                                                          #
-# ------------------------------------------------------------------ #
-if __name__ == "__main__":
-    demo_cfg = {
-        "seed": 1,
-        "mode": "folder",
-        "base_modality": "image",
-        "source_folders": [
-            {
-                "path": "/path/to/dataset",
-                "layout": "folders",
-                "modalities": {
-                    "image": {"folder": "sat"},
-                    "label": {"folder": "label"},
-                    "sdf":   {"folder": "sdf"},
-                },
-                "splits": {"train": "train", "valid": "valid", "test": "test"}
-            }
-        ]
-    }
-    splitter = Split(demo_cfg)
-    for s in ("train", "valid", "test"):
-        filemap = splitter.get_split(s)
-        print(f"{s}:")
-        for mod, paths in filemap.items():
-            print(f"  {mod}: {len(paths)} samples")
-
-# ------------------------------------------------------------------ #
-# sanity check                                                       #
-# ------------------------------------------------------------------ #
-if __name__ == "__main__":
-    cfg_demo = {
-        "seed": 1,
-        "base_modality": 'image',
-        "mode": "ratio",
-        "ratios": {"train": .8, "valid": .1, "test": .1},
-        "ratio_folders": [
-            {
-                "path": "dummy_dataset",
-                "layout": "flat",
-                "modalities": {
-                    "image": {"pattern": r".*_sat\.tif"},
-                    "label": {"pattern": r".*_map\.png"}
-                }
-            }
-        ]
-    }
-    sp = Split(cfg_demo)
-    for s in ("train", "valid", "test"):
-        print(s, {m: len(v) for m, v in sp.get_split(s).items()})
-
-
-# ------------------------------------
-# core/general_dataset/normalizations.py
-# ------------------------------------
-import numpy as np
-from core.general_dataset.logger import logger
-
-
-def normalize_image(image: np.ndarray) -> np.ndarray:
-    return image / 255.0 if image.max() > 1.0 else image
-
-
-# ------------------------------------
-# core/general_dataset/patch_validity.py
-# ------------------------------------
-from typing import Any, Dict, List, Optional
-import numpy as np
-from core.general_dataset.logger import logger
-
-
-def check_min_thrsh_road(label_patch: np.ndarray, patch_size, threshold) -> bool:
-    """
-    Check if the label patch has at least a minimum percentage of road pixels.
-
-    Args:
-        label_patch (np.ndarray): The label patch.
-    
-    Returns:
-        bool: True if the patch meets the minimum threshold; False otherwise.
-    """
-    patch = label_patch
-    if patch.max() > 1:
-        patch = (patch > 127).astype(np.uint8)
-    road_percentage = np.sum(patch) / (patch_size * patch_size)
-    return road_percentage >= threshold
-
-
-def check_small_window(image_patch: np.ndarray, small_window_size) -> bool:
-    """
-    Check that no small window in the image patch is entirely black or white.
-
-    Args:
-        image_patch (np.ndarray): Input patch (H x W) or (C x H x W)
-
-    Returns:
-        bool: True if valid, False if any window is all black or white.
-    """
-    sw = small_window_size
-
-    # Ensure image has shape (C, H, W)
-    if image_patch.ndim == 2:
-        image_patch = image_patch[None, :, :]  # Add channel dimension
-
-    C, H, W = image_patch.shape
-    if H < sw or W < sw:
-        return False
-
-    # Set thresholds
-    max_val = image_patch.max()
-    if max_val > 1.0:
-        high_thresh = 255
-        low_thresh = 0
-    else:
-        high_thresh = 255 / 255.0
-        low_thresh = 0 / 255.0
-
-    # Slide window over spatial dimensions
-    for c in range(C):
-        for y in range(0, H - sw + 1):
-            for x in range(0, W - sw + 1):
-                window = image_patch[c, y:y + sw, x:x + sw]
-                window_var = np.var(window)
-                if window_var < 0.01:
-                    return False
-                # print(window)
-                if np.all(window >= high_thresh):
-                    return False  # Found an all-white window
-                if np.all(window <= low_thresh):
-                    return False  # Found an all-black window
-
-    return True  # All windows passed
-
-
-
-
-# ------------------------------------
-# core/general_dataset/io.py
-# ------------------------------------
-from pathlib import Path
-from typing import Optional
-import numpy as np
-import rasterio
-import logging
-import warnings
-from rasterio.errors import NotGeoreferencedWarning
-warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
-
-logger = logging.getLogger(__name__)
-
-def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
-    """
-    Load an array from disk. Supports:
-      - .npy      → numpy.load
-      - .tif/.tiff → rasterio.open + read
-    Returns:
-      np.ndarray on success, or None if the file cannot be read.
-    """
-    path = Path(file_path)
-    ext = path.suffix.lower()
-    
-    loaders = {
-        '.npy': lambda p: np.load(p),
-        '.tif': lambda p: rasterio.open(p).read().astype(np.float32),
-        '.tiff': lambda p: rasterio.open(p).read().astype(np.float32),
-    }
-    
-    loader = loaders.get(ext)
-    if loader is None:
-        logger.warning("Unsupported file extension '%s' for %s", ext, file_path)
-        return None
-
-    try:
-        return loader(str(path))
-    except Exception as e:
-        # logger.warning("Failed to load '%s': %s", file_path, e)
-        return None
-
-# ------------------------------------
-# core/general_dataset/__init__.py
-# ------------------------------------
-# core/general_dataset/__init__.py
-
-from .base    import GeneralizedDataset
-from .collate import custom_collate_fn, worker_init_fn
-
-# Optionally, define __all__
-__all__ = [
-    "GeneralizedDataset",
-    "custom_collate_fn",
-    "worker_init_fn",
-]
-
-
-# ------------------------------------
-# core/general_dataset/visualizations.py
-# ------------------------------------
-from typing import Any, Dict, List, Optional
-import matplotlib.pyplot as plt
-import numpy as np
-
-def visualize_batch(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
-    """
-    Visualizes patches in a batch: image, label, distance, and SDF (if available).
-
-    Args:
-        batch (Dict[str, Any]): Dictionary containing batched patches.
-        num_per_batch (Optional[int]): Maximum number of patches to visualize.
-    """
-
-    num_to_plot = batch["image_patch"].shape[0]
-    if num_per_batch:
-        num_to_plot = min(num_to_plot, num_per_batch)
-    for i in range(num_to_plot):
-        sample_image = batch["image_patch"][i].numpy()
-        if sample_image.shape[0] == 3:  # CHW to HWC
-            sample_image = sample_image.transpose(1, 2, 0)
-        elif sample_image.shape[0] == 1:
-            sample_image = sample_image[0]  # grayscale
-        else:
-            sample_image = sample_image.transpose(1, 2, 0)
-
-        sample_label = np.squeeze(batch["label_patch"][i].numpy())
-        sample_distance = batch["distance_patch"][i].numpy() if "distance_patch" in batch else None
-        sample_sdf = batch["sdf_patch"][i].numpy() if "sdf_patch" in batch else None
-
-        print(f'Patch {i}')
-        print('  image:', sample_image.min(), sample_image.max())
-        print('  label:', sample_label.min(), sample_label.max())
-        if sample_distance is not None:
-            print('  distance:', sample_distance.min(), sample_distance.max())
-        if sample_sdf is not None:
-            print('  sdf:', sample_sdf.min(), sample_sdf.max())
-
-        num_subplots = 3 + (1 if sample_sdf is not None else 0)
-        fig, axs = plt.subplots(1, num_subplots, figsize=(12, 4))
-        axs[0].imshow(sample_image, cmap='gray' if sample_image.ndim == 2 else None)
-        axs[0].set_title("Image")
-        axs[0].axis("off")
-        axs[1].imshow(sample_label, cmap='gray')
-        axs[1].set_title("Label")
-        axs[1].axis("off")
-        if sample_distance is not None:
-            axs[2].imshow(sample_distance[0], cmap='gray')
-            axs[2].set_title("Distance")
-            axs[2].axis("off")
-        else:
-            axs[2].text(0.5, 0.5, "No Distance", ha='center', va='center')
-            axs[2].axis("off")
-        if sample_sdf is not None:
-            axs[3].imshow(sample_sdf[0], cmap='coolwarm')
-            axs[3].set_title("SDF")
-            axs[3].axis("off")
-        plt.tight_layout()
-        plt.show()
-
 
 # ------------------------------------
 # metrics/dice.py
@@ -3921,668 +2939,6 @@ class TopologicalLoss(nn.Module):
         connectivity_error = F.mse_loss(dilated_pred, dilated_true)
         
         return connectivity_error
-
-# ------------------------------------
-# unit-tests/test_helpers.py
-# ------------------------------------
-"""
-Unit tests for critical helper functions in the segmentation framework.
-Run with: pytest -xvs test_helpers.py
-"""
-
-import os
-import sys
-import pytest
-import numpy as np
-import torch
-from pathlib import Path
-
-# Add parent directory to sys.path to import modules
-sys.path.append(str(Path(__file__).parent.parent))
-
-# Import the functions to test
-from core.general_dataset import compute_distance_map, compute_sdf, custom_collate_fn
-from core.utils import (
-    noCrops,
-    noCropsPerDim,
-    cropInds,
-    coord,
-    coords,
-    cropCoords,
-    process_in_chuncks,
-)
-
-
-class TestDistanceMap:
-    """Tests for compute_distance_map function"""
-
-    def test_basic_functionality(self):
-        mask = np.zeros((5, 5), dtype=np.uint8)
-        mask[2, 2] = 1
-        distance = compute_distance_map(mask, None)
-
-        assert distance[2, 2] == 0
-        for i, j in [(0, 0), (0, 4), (4, 0), (4, 4)]:
-            assert 2.8 < distance[i, j] < 2.9
-        for i, j in [(1, 2), (3, 2), (2, 1), (2, 3)]:
-            assert distance[i, j] == 1
-
-    def test_thresholding(self):
-        mask = np.zeros((7, 7), dtype=np.uint8)
-        mask[3, 3] = 1
-        distance = compute_distance_map(mask, 2.0)
-
-        assert np.max(distance) <= 2.0
-        assert distance[3, 3] == 0
-        assert distance[2, 3] == 1
-        assert distance[4, 3] == 1
-
-    def test_binary_formats(self):
-        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
-        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
-        d1 = compute_distance_map(mask_01, None)
-        d2 = compute_distance_map(mask_0255, None)
-        assert np.array_equal(d1, d2)
-
-    def test_empty_mask(self):
-        mask = np.zeros((5, 5), dtype=np.uint8)
-        distance = compute_distance_map(mask, None)
-        assert np.all(distance > 0)
-
-    def test_full_mask(self):
-        mask = np.ones((5, 5), dtype=np.uint8)
-        distance = compute_distance_map(mask, None)
-        assert np.all(distance == 0)
-
-
-class TestSignedDistanceFunction:
-    """Tests for compute_sdf function"""
-
-    def test_basic_functionality(self):
-        mask = np.zeros((7, 7), dtype=np.uint8)
-        mask[3, 3] = 1
-        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
-
-        # Inside (where mask==1) should be negative
-        assert sdf[3, 3] < 0
-        # Far away should be positive
-        assert sdf[0, 0] > 0
-
-    def test_iterations_parameter(self):
-        mask = np.zeros((9, 9), dtype=np.uint8)
-        mask[4, 4] = 1
-
-        sdf1 = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=None)
-        sdf3 = compute_sdf(mask, sdf_iterations=3, sdf_thresholds=None)
-
-        neg1 = np.sum(sdf1 < 0)
-        neg3 = np.sum(sdf3 < 0)
-        # More iterations should not shrink the "inside"—allow equal or larger
-        assert neg3 >= neg1
-
-    def test_thresholds_parameter(self):
-        mask = np.zeros((9, 9), dtype=np.uint8)
-        mask[4, 4] = 1
-
-        sdf = compute_sdf(mask, sdf_iterations=1, sdf_thresholds=[-2, 2])
-        assert np.all(sdf >= -2)
-        assert np.all(sdf <= 2)
-
-    def test_binary_formats(self):
-        mask_01 = np.zeros((5, 5), dtype=np.uint8); mask_01[2, 2] = 1
-        mask_0255 = np.zeros((5, 5), dtype=np.uint8); mask_0255[2, 2] = 255
-        s1 = compute_sdf(mask_01, sdf_iterations=1, sdf_thresholds=None)
-        s2 = compute_sdf(mask_0255, sdf_iterations=1, sdf_thresholds=None)
-        assert np.array_equal(s1, s2)
-
-
-class TestCropFunctions:
-    """Tests for the crop‐related utility functions"""
-
-    def test_noCrops_basic(self):
-        assert noCrops([100, 100], [50, 50], [5, 5], startDim=0) == 9
-
-    def test_noCrops_tiny_image(self):
-        assert noCrops([10, 10], [10, 10], [3, 3], startDim=0) == 1
-
-    def test_noCropsPerDim(self):
-        per, cum = noCropsPerDim([100, 200], [50, 50], [5, 5], startDim=0)
-        assert per == [3, 5]
-        assert cum == [15, 5, 1]
-
-    def test_cropInds(self):
-        cum = [12, 3, 1]
-        assert cropInds(0, cum) == [0, 0]
-        assert cropInds(3, cum) == [1, 0]
-        assert cropInds(11, cum) == [3, 2]
-
-    def test_coord(self):
-        c, v = coord(2, 30, 5, 100)
-        assert (c.start, c.stop) == (40, 70)
-        assert (v.start, v.stop) == (5, 25)
-
-        c, v = coord(4, 30, 5, 100)
-        assert (c.start, c.stop) == (70, 100)
-        # when hitting edge, valid region is trimmed (start=15) to avoid going out of bounds
-        assert (v.start, v.stop) == (15, 30)
-
-    def test_coords(self):
-        cc, vc = coords([1, 2], [30, 30], [5, 5], [100, 100], 0)
-        assert (cc[0].start, cc[0].stop) == (20, 50)
-        assert (cc[1].start, cc[1].stop) == (40, 70)
-        assert (vc[0].start, vc[0].stop) == (5, 25)
-        assert (vc[1].start, vc[1].stop) == (5, 25)
-
-    def test_cropCoords(self):
-        cc, vc = cropCoords(7, [30, 40], [5, 5], [100, 200], 0)
-        for sl in [*cc, *vc]:
-            assert isinstance(sl, slice)
-        assert 0 <= cc[0].start < cc[0].stop <= 100
-        assert 0 <= cc[1].start < cc[1].stop <= 200
-        assert 0 <= vc[0].start < vc[0].stop <= 30
-        assert 0 <= vc[1].start < vc[1].stop <= 40
-
-
-class TestProcessInChunks:
-    """Tests for process_in_chuncks"""
-
-    def test_basic_processing(self):
-        inp = torch.ones((1, 3, 10, 10))
-        out = torch.zeros((1, 1, 10, 10))
-        def fn(x): return torch.ones((x.shape[0], 1, x.shape[2], x.shape[3]))
-        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
-        assert torch.all(res == 1)
-
-    def test_chunking_logic(self):
-        inp = torch.zeros((1, 3, 20, 20))
-        out = torch.zeros((1, 1, 20, 20))
-        def fn(x):
-            b, c, h, w = x.shape
-            t = torch.zeros((b, 1, h, w))
-            for i in range(h):
-                for j in range(w):
-                    t[0, 0, i, j] = i + j
-            return t
-        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
-        assert res[0, 0, 0, 0] == 0
-        assert res[0, 0, 6, 0] == 6
-
-    def test_shape_handling(self):
-        inp = torch.ones((1, 3, 10, 10))
-        out = torch.zeros((1, 1, 10, 10))
-        def fn(x): return torch.ones((x.shape[0], x.shape[2], x.shape[3]))
-        res = process_in_chuncks(inp, out, fn, [5, 5], [1, 1])
-        assert torch.all(res == 1)
-
-    def test_margin_handling(self):
-        inp = torch.zeros((1, 1, 20, 20))
-        for i in range(20):
-            for j in range(20):
-                inp[0, 0, i, j] = i * 100 + j
-        out = torch.zeros((1, 1, 20, 20))
-        def fn(x): return x
-        res = process_in_chuncks(inp, out, fn, [10, 10], [2, 2])
-        assert torch.all(res == inp)
-
-
-class TestDataSplitting:
-    """Tests for data splitting logic (ratio and k-fold)"""
-
-    @pytest.fixture
-    def mock_file_structure(self, tmp_path):
-        """
-        Create a mock dataset structure for testing:
-        
-        dataset/
-          source/
-            sat/  (images)
-            map/  (labels)
-        """
-        root = tmp_path / "dataset"
-        img_dir = root / "source" / "sat"
-        lbl_dir = root / "source" / "map"
-        img_dir.mkdir(parents=True)
-        lbl_dir.mkdir(parents=True)
-
-        # Create 10 dummy .tif files in each
-        for i in range(10):
-            (img_dir / f"img_{i}.tif").write_text("dummy")
-            (lbl_dir / f"img_{i}.tif").write_text("dummy")
-
-        return root
-
-    def test_ratio_splitting(self, mock_file_structure, monkeypatch):
-        """Test ratio-based splitting logic"""
-        from core.general_dataset import GeneralizedDataset
-
-        # Prevent any random shuffle
-        monkeypatch.setattr(np.random, "shuffle", lambda x: x)
-
-        base_cfg = {
-            "root_dir": str(mock_file_structure),
-            "use_splitting": True,
-            "source_folder": "source",
-            "split_ratios": {"train": 0.6, "valid": 0.2, "test": 0.2},
-            "modalities": {"image": "sat", "label": "map"},
-        }
-
-        # Create each split explicitly
-        train_ds = GeneralizedDataset({**base_cfg, "split": "train"})
-        valid_ds = GeneralizedDataset({**base_cfg, "split": "valid"})
-        test_ds  = GeneralizedDataset({**base_cfg, "split": "test"})
-
-        # Should be 6,2,2 images respectively
-        assert len(train_ds.modality_files["image"]) == 6
-        assert len(valid_ds.modality_files["image"]) == 2
-        assert len(test_ds.modality_files["image"])  == 2
-
-        # No overlap
-        t = set(train_ds.modality_files["image"])
-        v = set(valid_ds.modality_files["image"])
-        s = set(test_ds.modality_files["image"])
-        assert t.isdisjoint(v)
-        assert t.isdisjoint(s)
-        assert v.isdisjoint(s)
-
-    def test_kfold_splitting(self, mock_file_structure, monkeypatch):
-        """Test k-fold splitting logic"""
-        from core.general_dataset import GeneralizedDataset
-
-        # Mock KFold to return a single fixed split (first 8 train, last 2 valid)
-        class MockKFold:
-            def __init__(self, n_splits, shuffle, random_state):
-                pass
-            def split(self, X):
-                return [(np.arange(8), np.arange(8, 10))]
-
-        monkeypatch.setattr("sklearn.model_selection.KFold", MockKFold)
-
-        base_cfg = {
-            "root_dir": str(mock_file_structure),
-            "use_splitting": True,
-            "split_mode": "kfold",
-            "num_folds": 5,
-            "source_folder": "source",
-            "modalities": {"image": "sat", "label": "map"},
-        }
-
-        # Train fold 0
-        tr_cfg = {**base_cfg, "split": "train", "fold": 0}
-        train_ds = GeneralizedDataset(tr_cfg)
-        assert len(train_ds.modality_files["image"]) == 8
-
-        # Valid fold 0
-        va_cfg = {**base_cfg, "split": "valid", "fold": 0}
-        valid_ds = GeneralizedDataset(va_cfg)
-        assert len(valid_ds.modality_files["image"]) == 2
-
-
-class TestCustomCollate:
-    """Tests for custom_collate_fn"""
-
-    def test_basic(self):
-        batch = [
-            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
-            {"image": torch.ones(3,10,10), "label": torch.zeros(1,10,10)},
-        ]
-        c = custom_collate_fn(batch)
-        assert c["image"].shape == (2,3,10,10)
-        assert c["label"].shape == (2,1,10,10)
-
-    def test_mixed_types(self):
-        batch = [
-            {"image": torch.ones(3,10,10), "meta": {"id":1}},
-            {"image": torch.ones(3,10,10), "meta": {"id":2}},
-        ]
-        c = custom_collate_fn(batch)
-        assert isinstance(c["meta"], list)
-        assert c["meta"][0]["id"] == 1
-
-    def test_filter_none(self):
-        def imp(batch):
-            batch = [b for b in batch if b is not None]
-            if not batch:
-                return {"image": torch.zeros(0,3,10,10)}
-            return custom_collate_fn(batch)
-        b = [None, {"image": torch.ones(3,10,10)}]
-        c1 = imp(b)
-        assert c1["image"].shape[0] == 1
-        c2 = imp([None,None])
-        assert c2["image"].shape[0] == 0
-
-
-# ------------------------------------
-# unit-tests/smoke_test.py
-# ------------------------------------
-"""
-Integration smoke test for the entire segmentation pipeline.
-This creates a minimal synthetic dataset and runs a few training steps.
-Run with: python smoke_test.py
-"""
-
-import os
-import shutil
-import tempfile
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pytorch_lightning as pl
-from tqdm import tqdm
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Import core modules
-from core.general_dataset import GeneralizedDataset, custom_collate_fn, worker_init_fn
-from core.model_loader import load_model
-from core.loss_loader import load_loss
-from core.mix_loss import MixedLoss
-from core.metric_loader import load_metrics
-from core.dataloader import SegmentationDataModule
-from seglit_module import SegLitModule
-
-
-def create_synthetic_dataset(root_dir, num_samples=10, img_size=32):
-    """Create a synthetic dataset with roads for testing"""
-    logger.info(f"Creating synthetic dataset in {root_dir} with {num_samples} samples")
-    
-    # Create directory structure
-    os.makedirs(os.path.join(root_dir, 'train', 'sat'), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, 'train', 'map'), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, 'valid', 'sat'), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, 'valid', 'map'), exist_ok=True)
-    
-    # Create test images with simple road patterns
-    for split in ['train', 'valid']:
-        for i in range(num_samples):
-            # Create image with random noise
-            img = np.random.randint(0, 255, (img_size, img_size, 3), dtype=np.uint8)
-            
-            # Create binary mask with horizontal and vertical lines (roads)
-            mask = np.zeros((img_size, img_size), dtype=np.uint8)
-            
-            # Horizontal road
-            h_pos = np.random.randint(5, img_size-5)
-            mask[h_pos-2:h_pos+2, :] = 1
-            
-            # Vertical road
-            v_pos = np.random.randint(5, img_size-5)
-            mask[:, v_pos-2:v_pos+2] = 1
-            
-            # Add brightness to the roads in the image for realism
-            for c in range(3):
-                img[:, :, c] = np.where(mask > 0, 
-                                        np.minimum(img[:, :, c] + 100, 255),
-                                        img[:, :, c])
-            
-            # Save files
-            np.save(os.path.join(root_dir, split, 'sat', f'img_{i}.npy'), img)
-            np.save(os.path.join(root_dir, split, 'map', f'img_{i}.npy'), mask * 255)  # 0/255 format
-    
-    logger.info(f"Created {num_samples} samples each for train and validation")
-
-
-class SimpleBinaryUNet(nn.Module):
-    """A very simple UNet for testing purposes"""
-    
-    def __init__(self, in_channels=3, out_channels=1):
-        super().__init__()
-        
-        # Encoder
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        
-        # Decoder
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(32, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(16, 16, 2, stride=2)
-        )
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(16, 8, 3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(8, 8, 2, stride=2)
-        )
-        
-        # Final layer
-        self.final = nn.Conv2d(8, out_channels, 1)
-    
-    def forward(self, x):
-        # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        
-        # Decoder
-        d1 = self.dec1(e2)
-        d2 = self.dec2(d1)
-        
-        # Final layer
-        out = torch.sigmoid(self.final(d2))
-        return out
-
-
-def create_configs(dataset_path):
-    """Create configuration dictionaries for testing"""
-    # Dataset configuration
-    dataset_config = {
-        "root_dir": dataset_path,
-        "split_mode": "folder",
-        "patch_size": 16,
-        "small_window_size": 2,
-        "validate_road_ratio": False,  # Don't filter patches for quick testing
-        "train_batch_size": 2,
-        "val_batch_size": 1,
-        "num_workers": 0,  # Use 0 for easier debugging
-        "pin_memory": False,
-        "modalities": {
-            "image": "sat",
-            "label": "map"
-        }
-    }
-    
-    # Model configuration using our simple test model
-    model_config = {
-        "simple_unet": True,  # Flag for our smoke test
-        "in_channels": 3,
-        "out_channels": 1
-    }
-    
-    # Loss configuration
-    loss_config = {
-        "primary_loss": {
-            "class": "BCELoss",
-            "params": {}
-        },
-        "alpha": 1.0  # Only use primary loss
-    }
-    
-    # Metrics configuration
-    metrics_config = {
-        "metrics": [
-            {
-                "alias": "dice",
-                "path": "torchmetrics.classification",
-                "class": "Dice",
-                "params": {
-                    "threshold": 0.5,
-                    "zero_division": 1.0
-                }
-            }
-        ]
-    }
-    
-    # Inference configuration
-    inference_config = {
-        "patch_size": [16, 16],
-        "patch_margin": [2, 2]
-    }
-    
-    return dataset_config, model_config, loss_config, metrics_config, inference_config
-
-
-def run_smoke_test():
-    """Run a complete smoke test of the segmentation pipeline"""
-    logger.info("Starting smoke test")
-    
-    # Create temporary directory for dataset
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Create synthetic dataset
-        create_synthetic_dataset(tmp_dir, num_samples=5, img_size=32)
-        
-        # Create configurations
-        dataset_config, model_config, loss_config, metrics_config, inference_config = create_configs(tmp_dir)
-        
-        # Set up data module
-        logger.info("Setting up data module")
-        data_module = SegmentationDataModule(dataset_config)
-        data_module.setup()
-        
-        # Create model manually for smoke test
-        logger.info("Creating model")
-        if model_config.get("simple_unet", False):
-            model = SimpleBinaryUNet(
-                in_channels=model_config["in_channels"],
-                out_channels=model_config["out_channels"]
-            )
-        else:
-            model = load_model(model_config)
-        
-        # Create loss function
-        logger.info("Creating loss function")
-        primary_loss = load_loss(loss_config["primary_loss"])
-        secondary_loss = None
-        if "secondary_loss" in loss_config:
-            secondary_loss = load_loss(loss_config["secondary_loss"])
-        
-        mixed_loss = MixedLoss(primary_loss, secondary_loss, loss_config.get("alpha", 0.5), 
-                              loss_config.get("start_epoch", 0))
-        
-        # Create metrics
-        logger.info("Loading metrics")
-        metrics = load_metrics(metrics_config.get("metrics", []))
-        
-        # Create optimizer config
-        optimizer_config = {
-            "name": "Adam",
-            "params": {"lr": 0.001}
-        }
-        
-        # Create Lightning module
-        logger.info("Creating Lightning module")
-        lit_module = SegLitModule(
-            model=model,
-            loss_fn=mixed_loss,
-            metrics=metrics,
-            optimizer_config=optimizer_config,
-            inference_config=inference_config
-        )
-        
-        # Create a simple trainer for testing
-        logger.info("Creating trainer")
-        trainer = pl.Trainer(
-            max_epochs=2,
-            log_every_n_steps=1,
-            enable_checkpointing=False,
-            logger=False,
-            enable_progress_bar=True,
-            accelerator="cpu"
-        )
-        
-        # Run a few training steps
-        logger.info("Running training")
-        trainer.fit(lit_module, datamodule=data_module)
-        
-        logger.info("Smoke test complete!")
-
-
-def inspect_dataset_samples():
-    """Create and inspect dataset samples for debugging"""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Create synthetic dataset
-        create_synthetic_dataset(tmp_dir, num_samples=3, img_size=32)
-        
-        # Create configurations
-        dataset_config, _, _, _, _ = create_configs(tmp_dir)
-        
-        # Override for detailed inspection
-        dataset_config["train_batch_size"] = 1
-        
-        # Create dataset directly
-        train_config = dataset_config.copy()
-        train_config["split"] = "train"
-        
-        # Fix the None sample issue in __getitem__
-        from core.general_dataset import GeneralizedDataset
-        
-        # Patch the class to fix the None return issue
-        original_getitem = GeneralizedDataset.__getitem__
-        
-        def safe_getitem(self, idx):
-            result = original_getitem(self, idx)
-            if result is None:
-                # Try another index
-                logger.warning(f"Got None for index {idx}, trying next index")
-                return self.__getitem__((idx + 1) % len(self))
-            return result
-        
-        # Apply the monkey patch
-        GeneralizedDataset.__getitem__ = safe_getitem
-        
-        # Create and inspect dataset
-        train_dataset = GeneralizedDataset(train_config)
-        
-        # Check dataset length
-        logger.info(f"Dataset length: {len(train_dataset)}")
-        
-        # Iterate through a few samples
-        for i in range(min(3, len(train_dataset))):
-            sample = train_dataset[i]
-            logger.info(f"Sample {i} keys: {sample.keys()}")
-            
-            # Check shapes
-            for key, value in sample.items():
-                if isinstance(value, np.ndarray):
-                    logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}, range: [{value.min()}, {value.max()}]")
-        
-        # Create dataloader and inspect a batch
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=2,
-            shuffle=True,
-            collate_fn=custom_collate_fn,
-            num_workers=0
-        )
-        
-        # Get a batch
-        batch = next(iter(train_loader))
-        logger.info(f"Batch keys: {batch.keys()}")
-        
-        # Check shapes
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                logger.info(f"  {key} shape: {value.shape}, dtype: {value.dtype}")
-
-
-if __name__ == "__main__":
-    # First inspect dataset
-    logger.info("Inspecting dataset samples...")
-    inspect_dataset_samples()
-    
-    # Then run full smoke test
-    logger.info("\nRunning full smoke test...")
-    run_smoke_test()
 
 # ------------------------------------
 # models/custom_model.py

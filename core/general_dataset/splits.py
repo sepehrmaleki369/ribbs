@@ -229,14 +229,13 @@ class Split:
     Unified splitter with support for 'folder', 'ratio', and 'kfold' sources.
     Adds base_modalities intersection and path validation.
     """
-    def __init__(self, cfg: Dict[str, Any]) -> None:
+    def __init__(self, cfg: Dict[str, Any], base_modalities: List[str]) -> None:
         self.cfg = cfg
         self.seed = cfg.get("seed", 0)
         random.seed(self.seed)
         np.random.seed(self.seed)
 
-        self.base_modalities = cfg.get("base_modalities", [])
-        
+        self.base_modalities = base_modalities
         # Make the RNG deterministic but *local* to this instance
         self._rng = random.Random(self.seed)
         np.random.seed(self.seed)

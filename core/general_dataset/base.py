@@ -38,6 +38,7 @@ class GeneralizedDataset(Dataset):
         self.num_folds = config.get("num_folds")
         self.verbose: bool = config.get("verbose", False)
         self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
+        self.augmentation_params: Dict[str, Any] = config.get("augmentation_params", {})
         self.distance_threshold: Optional[float] = config.get("distance_threshold")
         self.sdf_iterations: int = config.get("sdf_iterations")
         self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
@@ -50,10 +51,8 @@ class GeneralizedDataset(Dataset):
         self.data_dim    = config.get("data_dim", 2)
         self.split_cfg = config["split_cfg"]
         self.split_cfg['seed'] = self.seed
-        self.split_cfg['base_modalities'] = self.base_modalities
-        splitter = Split(self.split_cfg)
         self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
-
+        
         if self.patch_size is None:
             raise ValueError("patch_size must be specified in the config.")
         if self.data_dim not in (2, 3):
@@ -64,7 +63,7 @@ class GeneralizedDataset(Dataset):
         random.seed(self.seed)
         np.random.seed(self.seed)
 
-        splitter = Split(self.split_cfg)
+        splitter = Split(self.split_cfg, self.base_modalities)
         self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
         self.modalities = list(self.modality_files.keys())
         if 'image' not in self.modality_files or 'label' not in self.modality_files:
@@ -185,7 +184,7 @@ class GeneralizedDataset(Dataset):
             y = random.randint(0, H - self.patch_size)
             patch_meta: Dict[str, Any] = {"image_idx": idx, "x": x, "y": y}
             if self.augmentations:
-                patch_meta.update(get_augmentation_metadata(self.augmentations, self.data_dim))
+                patch_meta.update(get_augmentation_metadata(self.augmentations, self.data_dim, self.augmentation_params))
             # Extract patch
             if self.data_dim == 2:
                 data: Dict[str, np.ndarray] = {}
@@ -299,7 +298,7 @@ if __name__ == "__main__":
             "label":    None,          # or null in JSON → skip
         },
         "augmentation_params": {
-            "scale":             {"min": 0.5,  "max": 1.8},
+            "scale":             {"min": 1.5,  "max": 5.8},
             # "elastic":           {"alpha_min": 5.0,  "alpha_max": 10.0,
                                 # "sigma_min": 3.0,  "sigma_max": 6.0},
             "brightness_contrast":{"alpha_min": 0.9,"alpha_max": 1.1,
@@ -313,82 +312,87 @@ if __name__ == "__main__":
         },
     }
 
-    split_cfg = {
-        "seed": 42,
-        "sources": [
-            # {
-            #     "type": "ratio",
-            #     "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-            #     "layout": "flat",
-            #     "modalities": {
-            #         "image":    {"pattern": r"^cube_(.*)\.npy$"},
-            #         "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-            #         "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-            #     },
-            #     "ratios": {
-            #         "train": 0.7,
-            #         "valid": 0.15,
-            #         "test":  0.15,
-            #     }
-            # }
-            {
-                "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-                "layout": "flat",
-                "modalities": {
-                    "image":    {"pattern": r"^cube_(.*)\.npy$"},
-                    "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-                    "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-                },
+    # split_cfg = {
+    #     "seed": 42,
+    #     "sources": [
+    #         {
+    #             "type": "ratio",
+    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+    #             "layout": "flat",
+    #             "modalities": {
+    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
+    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
+    #             },
+    #             "ratios": {
+    #                 "train": 0.7,
+    #                 "valid": 0.15,
+    #                 "test":  0.15,
+    #             }
+    #         },
+    #         {
+    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+    #             "layout": "flat",
+    #             "modalities": {
+    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
+    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
+    #             },
 
-                "type": "kfold",
-                "num_folds": 5,
-                "fold_idx": 0,
-                "test_source":{
-                    "type": "ratio",
-                    "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-                    "layout": "flat",
-                    "modalities": {
-                        "image":    {"pattern": r"^cube_(.*)\.npy$"},
-                        "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-                        "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-                    },
-                    "ratios": {
-                        "train": 0.01,
-                        "valid": 0.9,
-                        "test":  0.01,
-                    }
-                }
-            }
-        ]
-    }
+    #             "type": "kfold",
+    #             "num_folds": 5,
+    #             "fold_idx": 0,
+    #             "test_source":{
+    #                 "type": "ratio",
+    #                 "path": "/home/ri/Desktop/Projects/Datasets/AL175",
+    #                 "layout": "flat",
+    #                 "modalities": {
+    #                     "image":    {"pattern": r"^cube_(.*)\.npy$"},
+    #                     "label":    {"pattern": r"^lbl_(.*)\.npy$"},
+    #                     "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
+    #                 },
+    #                 "ratios": {
+    #                     "train": 0.01,
+    #                     "valid": 0.9,
+    #                     "test":  0.01,
+    #                 }
+    #             }
+    #         }
+    #     ]
+    # }
 
-    config = {
-        "split": "train",                # one of "train","valid","test"
-        "split_cfg": split_cfg,
+    # config = {
+    #     "split": "train",                # one of "train","valid","test"
+    #     "split_cfg": split_cfg,
 
-        "data_dim": 3,                   # your .npy volumes are 3D
-        "patch_size": 90,                # XY window size
-        "patch_size_z": 90,              # Z-depth
+    #     "data_dim": 3,                   # your .npy volumes are 3D
+    #     "patch_size": 90,                # XY window size
+    #     "patch_size_z": 90,              # Z-depth
 
-        "augmentations": ["flip_h","flip_v","flip_d","rotation"],
-        "validate_road_ratio": False,    # set True if you want to enforce label coverage
-        "threshold": 0.05,
+    #     "augmentations": ["flip_h","flip_v","flip_d","rotation"],
+    #     "validate_road_ratio": False,    # set True if you want to enforce label coverage
+    #     "threshold": 0.05,
 
-        "distance_threshold": None,      # clip distance map if desired
-        "sdf_iterations": 3,             # only if you compute SDF
-        "sdf_thresholds": [-5, 5],       # ditto
+    #     "distance_threshold": None,      # clip distance map if desired
+    #     "sdf_iterations": 3,             # only if you compute SDF
+    #     "sdf_thresholds": [-5, 5],       # ditto
 
-        "save_computed": True,          # we already have distlbl_*.npy
-        "compute_again_modalities": False,
+    #     "save_computed": True,          # we already have distlbl_*.npy
+    #     "compute_again_modalities": False,
 
-        "max_images": None,
-        "max_attempts": 10,
-        "seed": 42,
-        "num_workers": 4,
-        "verbose": True,
-        "base_modalities": ['image', 'label']
-    }
+    #     "max_images": None,
+    #     "max_attempts": 10,
+    #     "seed": 42,
+    #     "num_workers": 4,
+    #     "verbose": True,
+    #     "base_modalities": ['image', 'label']
+    # }
 
+    import yaml
+    with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
+        yaml.dump(config, f_out)
+    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/massroads.yaml', 'r') as f:
+        # config = yaml.safe_load(f)
 
     # Create dataset and dataloader.
     dataset = GeneralizedDataset(config)

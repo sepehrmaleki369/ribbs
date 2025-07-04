@@ -1,135 +1,184 @@
-# core/validator.py
 """
 Validator module for handling chunked inference in validation/test phases.
-Implements the exact Road_2D_EEF approach with robust size handling.
+Now supports **both 2‑D (N, C, H, W)** and **3‑D (N, C, D, H, W)** inputs.
+Implemented with robust size handling
+and automatic dimensionality detection.
 """
 
 import logging
-import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from core.utils import process_in_chuncks
+
+from core.utils import process_in_chuncks  # unchanged – must support N‑D windows
 
 
 class Validator:
+    """Chunked, overlap‑tiled inference for 2‑D **or** 3‑D data.
+
+    • Works with arbitrary batch size and channel count.
+    • Pads the sample so every spatial dimension is divisible by a given
+      *divisor* (default: 16) before tiling, then removes the pad.
+    • Uses `patch_size` and `patch_margin` to create overlapping tiles.
+      Only the *centre* region of each model prediction is kept and
+      stitched together.
+
+    Parameters
+    ----------
+    config : dict
+        Dictionary with at least the keys:
+            ``patch_size``   – tuple/list[int] (len == 2 or 3)
+            ``patch_margin`` – tuple/list[int] same length as
+                                 ``patch_size``
+        Any other keys are ignored by this class.
     """
-    Validator class for handling chunked inference during validation/testing.
-    Uses the Road_2D_EEF process_in_chunks approach with robust size handling.
-    """
-    
+
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the Validator.
-        
-        Args:
-            config: Configuration dictionary with inference parameters such as 
-                   patch_size and patch_margin
-        """
         self.config = config
-        self.patch_size   = config.get("patch_size",   [512, 512])
-        self.patch_margin = config.get("patch_margin", [32,  32])
+        self.patch_size: Tuple[int, ...] = tuple(config.get("patch_size", (512, 512)))
+        self.patch_margin: Tuple[int, ...] = tuple(config.get("patch_margin", (32, 32)))
         self.logger = logging.getLogger(__name__)
-        
-        # Convert to tuples if provided as lists
-        if isinstance(self.patch_size, list):
-            self.patch_size = tuple(self.patch_size)
-        if isinstance(self.patch_margin, list):
-            self.patch_margin = tuple(self.patch_margin)
-            
-        # Ensure patch_size and patch_margin have the same dimensions
+
         if len(self.patch_size) != len(self.patch_margin):
-            raise ValueError(f"patch_size {self.patch_size} and patch_margin "
-                             f"{self.patch_margin} must have the same number "
-                             f"of dimensions")
-    
-    # --------------------------------------------------------------------- #
-    # helpers                                                               #
-    # --------------------------------------------------------------------- #
-    def _pad_to_valid_size(self, image: torch.Tensor, divisor: int = 16) -> tuple:
-        """
-        Pad image to ensure dimensions are divisible by `divisor`.
-        
+            raise ValueError(
+                "patch_size %s and patch_margin %s must have the same number of dimensions"
+                % (self.patch_size, self.patch_margin)
+            )
+        if len(self.patch_size) not in (2, 3):
+            raise ValueError("Only 2‑D or 3‑D data are supported (got %d‑D)" % len(self.patch_size))
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _calc_div16_pad(size: int, divisor: int = 16) -> int:
+        """Return how many voxels/pixels must be *added to the right* so that
+        *size* becomes divisible by *divisor* (default 16)."""
+        return (divisor - size % divisor) % divisor
+
+    def _pad_to_valid_size(
+        self, image: torch.Tensor, divisor: int = 16
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """Pad *image* so *all* spatial dims are divisible by ``divisor``.
+
+        Only **right/bottom/back** padding is applied (no shift of origin).
+
+        Parameters
+        ----------
+        image : torch.Tensor
+            ``(N, C, H, W)`` or ``(N, C, D, H, W)`` tensor.
+        divisor : int, optional
+            The divisor (default 16).
+
         Returns
         -------
-        image        : padded tensor
-        (pad_h, pad_w): how much was added on bottom / right
+        image_padded : torch.Tensor
+        pads         : list[int]
+            Per‑dimension pad added (*same order as image spatial dims*).
         """
-        N, C, H, W = image.shape
-        pad_h = (divisor - H % divisor) % divisor
-        pad_w = (divisor - W % divisor) % divisor
-        if pad_h or pad_w:
-            image = F.pad(image, (0, pad_w, 0, pad_h), mode="reflect")
-        return image, (pad_h, pad_w)
-    
-    # --------------------------------------------------------------------- #
-    # main entry                                                            #
-    # --------------------------------------------------------------------- #
+
+        spatial = image.shape[2:]
+        pad_each: List[int] = [self._calc_div16_pad(s, divisor) for s in spatial]
+
+        # Build pad tuple for F.pad – must be *reversed* order, one (left,right)
+        # pair per dim starting with the last spatial dim.
+        pad_tuple: List[int] = []
+        for p in reversed(pad_each):
+            pad_tuple.extend([0, p])  # (left = 0, right = p)
+
+        if any(pad_each):
+            try:
+                image = F.pad(image, pad_tuple, mode="reflect")
+            except RuntimeError:
+                # "reflect" not implemented for 5‑D – fall back gracefully.
+                image = F.pad(image, pad_tuple, mode="replicate")
+        return image, pad_each
+
+    # ------------------------------------------------------------------
+    # main API
+    # ------------------------------------------------------------------
     def run_chunked_inference(
         self,
-        model : nn.Module,
-        image : torch.Tensor,
-        device: Optional[torch.device] = None
+        model: nn.Module,
+        image: torch.Tensor,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        """
-        Full-image inference with overlapping tiles.
+        """Full‑image/volume inference with overlapping tiles.
 
-        1) Pad by `patch_margin` on all four sides (reflect).
-        2) Pad further so H and W are divisible by 16.
-        3) Slide windows of size `patch_size` with stride
-           `patch_size – 2*patch_margin`, call `model`, keep only the
-           inner (centre) region, and stitch into a canvas.
-        4) Remove the /16 pad, then remove the initial margin pad.
+        Workflow (N‑D):
+        1) **Margin pad** by ``patch_margin`` (reflect/replicate).
+        2) **Div‑16 pad** so every spatial dim is divisible by 16.
+        3) **Sliding‑window** inference:
+            • window      = ``patch_size``
+            • window step = ``patch_size − 2*patch_margin``
+            • model is applied on each window; only the *centre* region
+              is placed into the output canvas.
+        4) **Remove** the div‑16 pad.
+        5) **Remove** the initial margin pad.
+
+        Returns
+        -------
+        torch.Tensor
+            Prediction of shape ``(N, out_channels, *original_spatial*)``.
         """
+
         if device is None:
             device = next(model.parameters()).device
 
         model.eval()
         image = image.to(device)
 
-        # -------------------------------------------------------------- #
-        # (A) FIRST pad by the desired margins so borders get context    #
-        # -------------------------------------------------------------- #
-        mh, mw = self.patch_margin                                   
-        if mh or mw:                                                 
-            image = F.pad(                                           
-                image,                                               
-                pad=(mw, mw, mh, mh),  # (left, right, top, bottom)  
-                mode="reflect",                                      
-            )                                                        
+        ndim = len(self.patch_size)  # 2 or 3
+        if image.dim() != ndim + 2:
+            raise ValueError(
+                f"Input tensor dim {image.dim()} does not match patch_size ndim {ndim}"
+            )
 
-        # -------------------------------------------------------------- #
-        # (B) SECOND, pad to make H and W divisible by 16               #
-        # -------------------------------------------------------------- #
-        padded_image, (pad_h16, pad_w16) = self._pad_to_valid_size(image, 16)
-        N, C, Hpad, Wpad = padded_image.shape
+        # ----------------------------------------------------------
+        # (A) First pad by the desired margins so borders get context
+        # ----------------------------------------------------------
+        if any(self.patch_margin):
+            # Build pad tuple [ ... (left,right) per dim … ]
+            pad_tuple: List[int] = []
+            for m in reversed(self.patch_margin):
+                pad_tuple.extend([m, m])
+            try:
+                image = F.pad(image, pad_tuple, mode="reflect")
+            except RuntimeError:
+                image = F.pad(image, pad_tuple, mode="replicate")
 
-        # -------------------------------------------------------------- #
-        # (C) Determine #output channels with a dummy forward           #
-        # -------------------------------------------------------------- #
+        # ----------------------------------------------------------
+        # (B) Second pad until all dims divisible by 16
+        # ----------------------------------------------------------
+        padded_image, pad_div16 = self._pad_to_valid_size(image, 16)
+        N, C, *spatial_pad = padded_image.shape
+
+        # ----------------------------------------------------------
+        # (C) Dummy forward to figure out #out channels
+        # ----------------------------------------------------------
         with torch.no_grad():
-            test_h = min(Hpad, self.patch_size[0] + 2 * mh)
-            test_w = min(Wpad, self.patch_size[1] + 2 * mw)
-            test_patch = padded_image[:, :, :test_h, :test_w]
+            test_sizes = [
+                min(s, p + 2 * m)
+                for s, p, m in zip(spatial_pad, self.patch_size, self.patch_margin)
+            ]
+            slices: List[slice] = [slice(None), slice(None)] + [slice(0, t) for t in test_sizes]
+            test_patch = padded_image[tuple(slices)]
             test_patch, _ = self._pad_to_valid_size(test_patch, 16)
             out_channels = model(test_patch).shape[1]
 
-        # Allocate output canvas (same size as padded_image)
-        output = torch.zeros(
-            (N, out_channels, Hpad, Wpad),
-            device=device,
-            dtype=padded_image.dtype,
-        )
+        # Allocate output canvas
+        output_shape = (N, out_channels, *spatial_pad)
+        output = torch.zeros(output_shape, device=device, dtype=padded_image.dtype)
 
-        # -------------------------------------------------------------- #
-        # (D) Sliding-window inference                                  #
-        # -------------------------------------------------------------- #
-        def _process(chunk: torch.Tensor) -> torch.Tensor:
+        # ----------------------------------------------------------
+        # (D) Sliding‑window inference
+        # ----------------------------------------------------------
+        def _process(chunk: torch.Tensor) -> torch.Tensor:  # noqa: D401
             with torch.no_grad():
                 return model(chunk)
-        
+
         with torch.no_grad():
             output = process_in_chuncks(
                 padded_image,
@@ -139,18 +188,23 @@ class Validator:
                 list(self.patch_margin),
             )
 
-        # -------------------------------------------------------------- #
-        # (E) Remove the /16 pad                                         #
-        # -------------------------------------------------------------- #
-        if pad_h16 or pad_w16:
-            output = output[:, :, : -pad_h16 if pad_h16 else None,
-                                   : -pad_w16 if pad_w16 else None]
+        # ----------------------------------------------------------
+        # (E) Remove the div‑16 pad (right/bottom/back only)
+        # ----------------------------------------------------------
+        if any(pad_div16):
+            slices: List[slice] = [slice(None), slice(None)]
+            for p in pad_div16:
+                slices.append(slice(None, -p if p else None))
+            output = output[tuple(slices)]
 
-        # -------------------------------------------------------------- #
-        # (F) Remove the initial margin pad                              #
-        # -------------------------------------------------------------- #
-        if mh or mw:                                                 
-            output = output[:, :, mh : output.shape[2] - mh,         
-                                   mw : output.shape[3] - mw]       
+        # ----------------------------------------------------------
+        # (F) Remove the initial margin pad (all sides)
+        # ----------------------------------------------------------
+        if any(self.patch_margin):
+            slices = [slice(None), slice(None)]
+            for i, m in enumerate(self.patch_margin):
+                end = output.shape[2 + i] - m
+                slices.append(slice(m, end))
+            output = output[tuple(slices)]
 
         return output

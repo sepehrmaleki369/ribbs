@@ -2,7 +2,7 @@
 normalizations.py
 
 Various image normalization routines for 2D/3D numpy arrays.
-Define multiple strategies and a unified `normalize` dispatcher.
+Define multiple strategies and a unified `normalize` dispatcher, plus a binarization helper.
 """
 import numpy as np
 from core.general_dataset.logger import logger
@@ -80,16 +80,43 @@ def clip_normalize(image: np.ndarray, min_val: float, max_val: float) -> np.ndar
     return (clipped - min_val) / (max_val - min_val)
 
 
-def normalize(image: np.ndarray,
-              method: str = "minmax",
-              **kwargs) -> np.ndarray:
+def binarize(
+    image: np.ndarray,
+    threshold: float,
+    greater_is_road: bool = True
+) -> np.ndarray:
+    """
+    Binarize the image based on a threshold.
+
+    Args:
+        image:    Input array.
+        threshold: Value to threshold at.
+        greater_is_road: If True, pixels > threshold become 1; else pixels < threshold become 1.
+
+    Returns:
+        A uint8 array of 0s and 1s.
+    """
+    img = image.astype(np.float32)
+    if greater_is_road:
+        mask = img > threshold
+    else:
+        mask = img <= threshold
+    return mask.astype(np.uint8)
+
+
+def normalize(
+    image: np.ndarray,
+    method: str = "minmax",
+    **kwargs
+) -> np.ndarray:
     """
     Dispatch to a normalization method. Supported methods:
-      - 'minmax'   : min_max_normalize
-      - 'zscore'   : z_score_normalize
-      - 'robust'   : robust_normalize
+      - 'minmax'    : min_max_normalize
+      - 'zscore'    : z_score_normalize
+      - 'robust'    : robust_normalize
       - 'percentile': percentile_normalize
-      - 'clip'     : clip_normalize (requires min_val, max_val args)
+      - 'clip'      : clip_normalize (requires min_val, max_val args)
+      - 'binarize'  : binarize (requires threshold, optional greater_is_road)
     """
     method = method.lower()
     if method == "minmax":
@@ -102,12 +129,15 @@ def normalize(image: np.ndarray,
         return percentile_normalize(image, **kwargs)
     elif method == "clip":
         return clip_normalize(image, **kwargs)
+    elif method == "binarize":
+        return binarize(image, **kwargs)
     else:
         logger.error(f"Unknown normalization method '{method}', using minmax.")
         return min_max_normalize(image, **kwargs)
 
 # Alias for backward compatibility
 normalize_image = normalize
+
 
 
 # normalization_config = {
