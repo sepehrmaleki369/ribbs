@@ -71,13 +71,20 @@ class BestMetricCheckpoint(Callback):
         """
         # Create checkpoint directory if it doesn't exist
         os.makedirs(self.dirpath, exist_ok=True)
-        
+
+        # print(f"Saving best metric checkpoints to {self.dirpath}")
+        # print(f"Current epoch: {trainer.current_epoch}, Max epochs: {trainer.max_epochs}")
+        # print(f"Metrics being monitored: {self.metric_names}")
+        # print(f"Mode for metrics: {self.mode}")
+        # print(f"Best values so far: {self.best_values}")
+
         # Check each metric
         for metric in self.metric_names:
-            metric_key = f"val_metric/{metric}"
+            metric_key = f"val_metrics/{metric}"
+            # print('trainer.callback_metrics:', trainer.callback_metrics)
             if metric_key in trainer.callback_metrics:
                 current_value = trainer.callback_metrics[metric_key].item()
-                
+                print(f"Current value for {metric}: {current_value}")
                 is_better = False
                 if self.mode[metric] == "min" and current_value < self.best_values[metric]:
                     is_better = True
