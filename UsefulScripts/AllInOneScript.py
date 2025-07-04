@@ -143,10 +143,10 @@ def main():
         every_n_epochs=trainer_cfg.get("save_checkpoints_every_n_epochs", 5)
     ))
 
-    callbacks.append(SamplePlotCallback(
-        num_samples=trainer_cfg["num_samples_plot"],
-        cmap=trainer_cfg["cmap_plot"]
-    ))
+    # callbacks.append(SamplePlotCallback(
+    #     num_samples=trainer_cfg["num_samples_plot"],
+    #     cmap=trainer_cfg["cmap_plot"]
+    # ))
 
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
 
@@ -188,6 +188,11 @@ def main():
     trainer_kwargs.setdefault("default_root_dir", output_dir)
 
     trainer = pl.Trainer(**trainer_kwargs)
+
+    batch = next(iter(dm.train_dataloader()))
+    print("image_patch shape:", batch["image_patch"].shape)   # (B, C, H, W)
+    print("UNet expects    :", lit.model.in_channels)
+
 
     # --- run ---
     if args.test:
@@ -295,6 +300,8 @@ class SegLitModule(pl.LightningModule):
                 m.reset()
 
     def training_step(self, batch, batch_idx):
+        im = batch["image_patch"]
+        # print('img shape:', im.shape)
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
         y_hat = self(x)
@@ -1790,2079 +1797,1536 @@ __all__ = [
 ]
 
 # ------------------------------------
-# core/general_dataset/augments.py
+# core/callbacks copy.py
 # ------------------------------------
-# ------------------------------------
-# augments.py  (complete version – supports 2‑D & 3‑D)
-# ------------------------------------
+"""
+Callbacks module for PyTorch Lightning training.
 
-from typing import Any, Dict, List, Optional
-import math
+This module provides custom callbacks for checkpointing, visualization, 
+code archiving, and validation control.
+"""
+
+import os
+import io
+import logging
+import shutil
+import zipfile
+from glob import glob
+from typing import Any, Dict, List, Optional, Union
+
 import numpy as np
-from scipy.ndimage import rotate, zoom as ndi_zoom, gaussian_filter, map_coordinates
-
-from core.general_dataset.logger import logger
-
-# -----------------------------------------------------------------------------
-# Random‑parameter generator
-# -----------------------------------------------------------------------------
-
-def get_augmentation_metadata(
-    augmentations: List[str],
-    data_dim: int,
-    aug_params: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
-    """Return sampled parameters based on `augmentation_params` from config."""
-    params = aug_params or {}
-    meta: Dict[str, Any] = {}
-
-    # rotation
-    if "rotation" in augmentations:
-        rmin = params.get("rotation", {}).get("min", 0.0)
-        rmax = params.get("rotation", {}).get("max", 360.0)
-        meta["angle"] = float(np.random.uniform(rmin, rmax))
-
-    # flips (no change)
-    if "flip_h" in augmentations:
-        meta["flip_h"] = bool(np.random.rand() > 0.5)
-    if "flip_v" in augmentations:
-        meta["flip_v"] = bool(np.random.rand() > 0.5)
-    if "flip_d" in augmentations and data_dim == 3:
-        meta["flip_d"] = bool(np.random.rand() > 0.5)
-
-    # scale
-    if "scale" in augmentations:
-        smin = params.get("scale", {}).get("min", 0.8)
-        smax = params.get("scale", {}).get("max", 1.2)
-        meta["scale_factor"] = float(np.random.uniform(smin, smax))
-
-    # elastic
-    if "elastic" in augmentations:
-        e = params.get("elastic", {})
-        a_min, a_max = e.get("alpha_min",5.0), e.get("alpha_max",10.0)
-        s_min, s_max = e.get("sigma_min",3.0), e.get("sigma_max",6.0)
-        meta["alpha"] = float(np.random.uniform(a_min, a_max))
-        meta["sigma"] = float(np.random.uniform(s_min, s_max))
-
-    # brightness_contrast
-    if "brightness_contrast" in augmentations:
-        bc = params.get("brightness_contrast", {})
-        ca, cb = bc.get("alpha_min",0.9), bc.get("alpha_max",1.1)
-        ba, bb = bc.get("beta_min",-30.0), bc.get("beta_max",30.0)
-        meta["bc_alpha"] = float(np.random.uniform(ca, cb))
-        meta["bc_beta"]  = float(np.random.uniform(ba, bb))
-
-    # gamma
-    if "gamma" in augmentations:
-        gmin = params.get("gamma", {}).get("min",0.7)
-        gmax = params.get("gamma", {}).get("max",1.5)
-        meta["gamma"] = float(np.random.uniform(gmin, gmax))
-
-    # gaussian_noise
-    if "gaussian_noise" in augmentations:
-        n = params.get("gaussian_noise", {})
-        meta["noise_sigma"] = float(np.random.uniform(n.get("min",0.01), n.get("max",0.03)))
-
-    # gaussian_blur
-    if "gaussian_blur" in augmentations:
-        gb = params.get("gaussian_blur", {})
-        meta["blur_sigma"] = float(np.random.uniform(gb.get("min",0.5), gb.get("max",1.5)))
-
-    # bias_field
-    if "bias_field" in augmentations:
-        bf = params.get("bias_field", {})
-        meta["bias_amp"] = float(np.random.uniform(bf.get("min",0.2), bf.get("max",0.4)))
-
-    return meta
-
-# -----------------------------------------------------------------------------
-# Basic flip helpers (unchanged)
-# -----------------------------------------------------------------------------
-
-def flip_h(arr: np.ndarray) -> np.ndarray:
-    """Flip left/right (axis = −1)."""
-    return np.flip(arr, axis=-1)
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
 
 
-def flip_v(arr: np.ndarray) -> np.ndarray:
-    """Flip up/down (axis = −2)."""
-    return np.flip(arr, axis=-2)
-
-
-def flip_d(arr: np.ndarray) -> np.ndarray:
-    """Flip depth (axis = −3). Only meaningful for 3‑D volumes."""
-    return np.flip(arr, axis=-3)
-
-# -----------------------------------------------------------------------------
-# **DO NOT CHANGE** – original rotation implementation
-# -----------------------------------------------------------------------------
-
-def rotate_(
-    full_array: np.ndarray,
-    patch_meta: Dict[str, Any],
-    patch_size_xy: int,
-    patch_size_z: int,
-    data_dim: int,
-) -> np.ndarray:
-    """Rotate patch, preserving shape, for 2‑D or 3‑D (slice‑wise)."""
-    angle = patch_meta["angle"]
-    L = int(np.ceil(patch_size_xy * math.sqrt(2)))
-    x, y = patch_meta["x"], patch_meta["y"]
-    cx, cy = x + patch_size_xy // 2, y + patch_size_xy // 2
-    half_L = L // 2
-    x0, x1 = max(0, cx - half_L), min(full_array.shape[-1], cx + half_L)
-    y0, y1 = max(0, cy - half_L), min(full_array.shape[-2], cy + half_L)
-
-    if data_dim == 3:
-        z = patch_meta.get("z", 0)
-        block = full_array[:, z : z + patch_size_z, y0:y1, x0:x1]
-        if block.shape[-2] < L or block.shape[-1] < L:
-            logger.warning("Crop too small for 3D rotation; zero patch.")
-            return np.zeros_like(block[..., :patch_size_xy, :patch_size_xy])
-        rotated_slices = []
-        for d in range(block.shape[1]):
-            slice_ = block[:, d]
-            rotated = rotate(slice_, angle, reshape=False, order=1)
-            start = (L - patch_size_xy) // 2
-            cropped = rotated[start : start + patch_size_xy, start : start + patch_size_xy]
-            rotated_slices.append(cropped)
-        return np.stack(rotated_slices, axis=1)
-    else:
-        crop = (
-            full_array[y0:y1, x0:x1]
-            if full_array.ndim == 2
-            else full_array[:, y0:y1, x0:x1]
-        )
-        if crop.shape[-2] < L or crop.shape[-1] < L:
-            logger.warning("Crop too small for 2D rotation; zero patch.")
-            shp = (patch_size_xy, patch_size_xy) if crop.ndim == 2 else (crop.shape[0], patch_size_xy, patch_size_xy)
-            return np.zeros(shp, dtype=crop.dtype)
-        rotated = rotate(crop, angle, reshape=False, order=1)
-        start = (L - patch_size_xy) // 2
-        if rotated.ndim == 2:
-            return rotated[start : start + patch_size_xy, start : start + patch_size_xy]
-        else:
-            return rotated[:, start : start + patch_size_xy, start : start + patch_size_xy]
-
-# -----------------------------------------------------------------------------
-# New spatial helpers
-# -----------------------------------------------------------------------------
-
-def _center_crop_or_pad(arr: np.ndarray, out_shape: tuple) -> np.ndarray:
-    """Return `arr` centered and cropped/padded to `out_shape`. Zeros are used for padding."""
-    result = np.zeros(out_shape, dtype=arr.dtype)
-    min_shape = tuple(min(s, o) for s, o in zip(arr.shape, out_shape))
-    # slice positions in input and output
-    in_starts = [(s - m) // 2 for s, m in zip(arr.shape, min_shape)]
-    out_starts = [(o - m) // 2 for o, m in zip(out_shape, min_shape)]
-    slices_in = tuple(slice(i, i + m) for i, m in zip(in_starts, min_shape))
-    slices_out = tuple(slice(o, o + m) for o, m in zip(out_starts, min_shape))
-    result[slices_out] = arr[slices_in]
-    return result
-
-
-def scale_patch(patch: np.ndarray, scale_factor: float, data_dim: int) -> np.ndarray:
-    """Isotropic zoom of the *patch* followed by center‑crop/zero‑pad to original size."""
-    orig_shape = patch.shape
-
-    if data_dim == 3:
-        zoom_factors = (1, scale_factor, scale_factor, scale_factor) if patch.ndim == 4 else (scale_factor, scale_factor, scale_factor)
-    else:
-        zoom_factors = (1, scale_factor, scale_factor) if patch.ndim == 3 else (scale_factor, scale_factor)
-
-    scaled = ndi_zoom(patch, zoom_factors, order=1)
-    return _center_crop_or_pad(scaled, orig_shape)
-
-
-# -----------------------------------------------------------------------------
-# Elastic deformation  (B‑spline‑like random field)
-# -----------------------------------------------------------------------------
-
-def elastic_deform_patch(patch: np.ndarray, alpha: float, sigma: float, data_dim: int) -> np.ndarray:
-    """Apply elastic deformation to `patch` and return the deformed patch (same shape)."""
-
-    if data_dim == 3:
-        spatial_shape = patch.shape[-3:] if patch.ndim == 4 else patch.shape
-        dz = gaussian_filter(np.random.randn(*spatial_shape), sigma, mode="reflect") * alpha
-        dy = gaussian_filter(np.random.randn(*spatial_shape), sigma, mode="reflect") * alpha
-        dx = gaussian_filter(np.random.randn(*spatial_shape), sigma, mode="reflect") * alpha
-        z, y, x = np.meshgrid(
-            np.arange(spatial_shape[0]),
-            np.arange(spatial_shape[1]),
-            np.arange(spatial_shape[2]),
-            indexing="ij",
-        )
-        indices = (z + dz, y + dy, x + dx)
-
-        if patch.ndim == 4:  # C,Z,H,W
-            deformed = [map_coordinates(patch[c], indices, order=1, mode="reflect") for c in range(patch.shape[0])]
-            return np.stack(deformed, axis=0)
-        else:
-            return map_coordinates(patch, indices, order=1, mode="reflect")
-
-    else:  # 2‑D
-        spatial_shape = patch.shape[-2:] if patch.ndim == 3 else patch.shape
-        dy = gaussian_filter(np.random.randn(*spatial_shape), sigma, mode="reflect") * alpha
-        dx = gaussian_filter(np.random.randn(*spatial_shape), sigma, mode="reflect") * alpha
-        y, x = np.meshgrid(
-            np.arange(spatial_shape[0]),
-            np.arange(spatial_shape[1]),
-            indexing="ij",
-        )
-        indices = (y + dy, x + dx)
-
-        if patch.ndim == 3:  # C,H,W
-            deformed = [map_coordinates(patch[c], indices, order=1, mode="reflect") for c in range(patch.shape[0])]
-            return np.stack(deformed, axis=0)
-        else:
-            return map_coordinates(patch, indices, order=1, mode="reflect")
-
-# -----------------------------------------------------------------------------
-# Intensity helpers
-# -----------------------------------------------------------------------------
-
-def adjust_brightness_contrast(patch: np.ndarray, alpha: float, beta: float) -> np.ndarray:
-    """Linear brightness/contrast: I' = alpha·I + beta"""
-    return patch.astype(np.float32) * alpha + beta
-
-
-def gamma_correction(patch: np.ndarray, gamma: float) -> np.ndarray:
-    patch_f = patch.astype(np.float32)
-    max_val = patch_f.max() if patch_f.max() > 0 else 1.0
-    norm = np.clip(patch_f / max_val, 0.0, 1.0)
-    return (norm ** gamma) * max_val
-
-
-def add_gaussian_noise(patch: np.ndarray, sigma_factor: float) -> np.ndarray:
-    patch_f = patch.astype(np.float32)
-    dyn = patch_f.max() - patch_f.min()
-    sigma = sigma_factor * (dyn if dyn > 0 else 1.0)
-    noise = np.random.normal(0.0, sigma, patch_f.shape)
-    return patch_f + noise
-
-
-def gaussian_blur_patch(patch: np.ndarray, sigma: float, data_dim: int) -> np.ndarray:
-    """Apply an isotropic Gaussian blur (σ in voxels). Preserves shape."""
-    if data_dim == 3:
-        if patch.ndim == 4:  # C,Z,H,W
-            blurred = [gaussian_filter(patch[c], sigma, mode="reflect") for c in range(patch.shape[0])]
-            return np.stack(blurred, axis=0)
-        else:
-            return gaussian_filter(patch, sigma, mode="reflect")
-    else:
-        if patch.ndim == 3:  # C,H,W
-            blurred = [gaussian_filter(patch[c], sigma, mode="reflect") for c in range(patch.shape[0])]
-            return np.stack(blurred, axis=0)
-        else:
-            return gaussian_filter(patch, sigma, mode="reflect")
-
-
-def bias_field_patch(patch: np.ndarray, amplitude: float, data_dim: int) -> np.ndarray:
-    """Multiply `patch` by a smooth, low‑frequency bias field."""
-    if data_dim == 3:
-        spatial_shape = patch.shape[-3:] if patch.ndim == 4 else patch.shape
-    else:
-        spatial_shape = patch.shape[-2:] if patch.ndim == 3 else patch.shape
-
-    sigma = 0.25 * min(spatial_shape)  # fairly low‑freq
-    field = gaussian_filter(np.random.randn(*spatial_shape), sigma, mode="reflect")
-    field -= field.mean()
-    field /= np.max(np.abs(field)) + 1e-8  # → ∈ [‑1,1]
-    field *= amplitude
-    field = 1.0 + field  # multiplicative  (1±amp)
-
-    if patch.ndim == len(spatial_shape):  # no channel dim
-        return patch * field
-    else:  # prepend channel axis broadcast
-        return patch * field[np.newaxis, ...]
-
-# -----------------------------------------------------------------------------
-# Patch extraction + conditional augmentation
-# -----------------------------------------------------------------------------
-
-def extract_data(
-    imgs: Dict[str, np.ndarray],
-    x: int,
-    y: int,
-    z: int,
-    patch_size_xy: int,
-    patch_size_z: Optional[int],
-    data_dim: int,
-) -> Dict[str, np.ndarray]:
+def _gather_from_outputs(batch, outputs, pl_module):
     """
-    Slice a spatial patch from every modality in *imgs*.
+    Extract input, ground‑truth and prediction tensors from ``batch`` and
+    ``outputs`` without re‑running the model.
+    """
+    x = batch[pl_module.input_key].float()
+    y = batch[pl_module.target_key].float()
+    if y.dim() == 3:
+        y = y.unsqueeze(1)  # (B, 1, H, W)
+    preds = outputs.get("predictions").float()
+    return x.cpu(), y.cpu(), preds.detach().cpu()
+
+
+def _signed_scale(arr: torch.Tensor, pos_max: float, neg_min: float) -> torch.Tensor:
+    """Scale *signed* ``arr`` so that
+
+    * 0 → 0
+    * (arr > 0) are mapped linearly onto ``(0,  +1]`` where the *largest* value
+      becomes +1.
+    * (arr < 0) are mapped linearly onto ``[−1, 0)`` where the *most‑negative*
+      value becomes −1.
+
+    Positive and negative parts are treated independently so that sign symmetry
+    is preserved.
+    """
+    if pos_max <= 0 and neg_min >= 0:  # all‑zero tensor
+        return torch.zeros_like(arr)
+
+    scaled = arr.clone()
+    if pos_max > 0:
+        pos_mask = scaled > 0
+        scaled[pos_mask] = scaled[pos_mask] / pos_max
+    if neg_min < 0:  # remember: neg_min is ≤ 0
+        neg_mask = scaled < 0
+        scaled[neg_mask] = scaled[neg_mask] / abs(neg_min)
+    return scaled
+
+
+class SamplePlotCallback(pl.Callback):
+    """Log side‑by‑side *input | ground‑truth | prediction* panels during
+    training/validation with **independent colour scaling** for ground‑truth and
+    prediction maps.
 
     Parameters
     ----------
-    imgs : Dict[str, np.ndarray]
-        Each value is one of the following shapes
-          ─ data_dim == 2 →  (H, W)  or  (C, H, W)
-          ─ data_dim == 3 →  (D, H, W)  or  (C, D, H, W)
-    x, y : int
-        Upper-left corner of the XY window.
-    z : int
-        First slice index along the depth axis (ignored for 2-D).
-    patch_size_xy : int
-        Height and width of the square crop.
-    patch_size_z : Optional[int]
-        If given in 3-D mode, take this many slices; otherwise fall back to
-        *patch_size_xy*.
-    data_dim : int
-        2 or 3 – tells the function how to interpret array ranks.
-
-    Returns
-    -------
-    Dict[str, np.ndarray]
-        For every key in *imgs* a new entry ``f"{key}_patch"`` containing the
-        cropped patch (shape preserved except for the spatial dims).
+    num_samples:
+        Maximum number of examples to visualise each epoch.
+    cmap:
+        Colormap passed to ``matplotlib.pyplot.imshow`` for signed maps
+        (default: ``"coolwarm"``).
     """
-    data: Dict[str, np.ndarray] = {}
-    psz_z = patch_size_z or patch_size_xy
 
-    for key, arr in imgs.items():
-
-        # ───────────────────────────── 3-D CASE ───────────────────────────── #
-        if data_dim == 3:
-            if arr.ndim == 4:                             # (C, D, H, W)
-                patch = arr[:, z : z + psz_z,
-                               y : y + patch_size_xy,
-                               x : x + patch_size_xy]
-            elif arr.ndim == 3:                           # (D, H, W)
-                patch = arr[z : z + psz_z,
-                             y : y + patch_size_xy,
-                             x : x + patch_size_xy]
-            else:
-                raise ValueError(f"{key}: expected 3-D or 4-D array, got shape {arr.shape}")
-
-        # ───────────────────────────── 2-D CASE ───────────────────────────── #
-        elif data_dim == 2:
-            if arr.ndim == 3:                             # (C, H, W)
-                patch = arr[:, y : y + patch_size_xy,
-                               x : x + patch_size_xy]
-            elif arr.ndim == 2:                           # (H, W)
-                patch = arr[y : y + patch_size_xy,
-                             x : x + patch_size_xy]
-            else:
-                raise ValueError(f"{key}: expected 2-D or 3-D array, got shape {arr.shape}")
-
-        else:
-            raise ValueError(f"data_dim must be 2 or 3, got {data_dim}")
-
-        data[f"{key}_patch"] = patch
-
-    return data
-
-
-
-# -----------------------------------------------------------------------------
-# Main entry: extract + apply *conditional* augmentations
-# -----------------------------------------------------------------------------
-
-def extract_condition_augmentations(
-    imgs: Dict[str, np.ndarray],
-    metadata: Dict[str, Any],
-    patch_size_xy: int,
-    patch_size_z: int,
-    augmentations: List[str],
-    data_dim: int
-) -> Dict[str, np.ndarray]:
-    """
-    Extract a patch from the full image and apply conditional augmentations.
-
-    Args:
-        imgs (Dict[str, np.ndarray]): Full images for each modality.
-        metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
-    
-    Returns:
-        Dict[str, np.ndarray]: Dictionary of extracted patches.
-    """
-    imgs_aug = imgs.copy()
-    z = metadata.get('z', 0)
-    data = extract_data(imgs,
-                        metadata['x'], metadata['y'], z,
-                        patch_size_xy,
-                        patch_size_z,
-                        data_dim)
-    for key in imgs:
-        if key.endswith("_patch"):
-            modality = key.replace("_patch", "")
-            if 'flip_h' in augmentations:
-                imgs_aug[modality] = flip_h(imgs[modality])
-                data[key] = flip_h(data[key])
-            if 'flip_v' in augmentations:
-                imgs_aug[modality] = flip_v(imgs[modality])
-                data[key] = flip_v(data[key])
-            if 'flip_d' in augmentations and data_dim == 3:
-                imgs_aug[modality] = flip_d(imgs_aug[modality])
-                data[key]          = flip_d(data[key])
-#######
-            if "scale" in augmentations:
-                sf: float = metadata.get("scale_factor")
-                imgs_aug[modality] = scale_patch(imgs_aug[modality], sf, data_dim)
-                patch = scale_patch(patch, sf, data_dim)
-
-            if "elastic" in augmentations:
-                alpha: float = metadata.get("alpha")
-                sigma: float = metadata.get("sigma")
-                imgs_aug[modality] = elastic_deform_patch(imgs_aug[modality], alpha, sigma, data_dim)
-                patch = elastic_deform_patch(patch, alpha, sigma, data_dim)
-
-            # -----------------------------
-            # Intensity augmentations (patch‑only)
-            # -----------------------------
-            if "brightness_contrast" in augmentations:
-                patch = adjust_brightness_contrast(
-                    patch,
-                    metadata.get("bc_alpha"),
-                    metadata.get("bc_beta"),
-                )
-            if "gamma" in augmentations:
-                patch = gamma_correction(patch, metadata.get("gamma"))
-            if "gaussian_noise" in augmentations:
-                patch = add_gaussian_noise(patch, metadata.get("noise_sigma"))
-            if "gaussian_blur" in augmentations:
-                patch = gaussian_blur_patch(patch, metadata.get("blur_sigma"), data_dim)
-            if "bias_field" in augmentations:
-                patch = bias_field_patch(patch, metadata.get("bias_amp"), data_dim)
-
-            if 'rotation' in augmentations:
-                data[key] = rotate_(imgs_aug[modality], metadata, patch_size_xy, patch_size_z, data_dim)
-
-            # Store the fully augmented patch back
-            data[key] = patch    
-    
-    return data
-
-
-# -----------------------------------------------------------------------------
-# Public re‑exports
-# -----------------------------------------------------------------------------
-
-__all__ = [
-    "get_augmentation_metadata",
-    "extract_condition_augmentations",
-    "flip_h",
-    "flip_v",
-    "flip_d",
-    "rotate_",  # unchanged
-]
-
-# "augmentations": [
-#         "flip_h",              # horizontal flip
-#         "flip_v",              # vertical flip
-#         "flip_d",              # depth flip (3D only)
-#         "rotation",            # 0–360° random rotation
-#         "scale",               # isotropic zoom in/out
-#         "elastic",             # B-spline–style elastic warp
-#         "brightness_contrast", # random α·I + β
-#         "gamma",               # power-law I^γ
-#         "gaussian_noise",      # additive Gaussian noise
-#         "gaussian_blur",       # isotropic blur
-#         "bias_field",          # low-frequency multiplicative bias field
-#     ],
-
-
-# ------------------------------------
-# core/general_dataset/logger.py
-# ------------------------------------
-import logging
-import sys
-
-logging.basicConfig(level=logging.ERROR)
-logger = logging.getLogger(__name__)
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.ERROR)
-
-fmt = logging.Formatter(
-    "%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-handler.setFormatter(fmt)
-
-# (re)attach handler
-if not logger.handlers:
-    logger.addHandler(handler)
-
-# ------------------------------------
-# core/general_dataset/collate.py
-# ------------------------------------
-import torch
-from typing import Any, Dict, List, Optional
-import random
-import numpy as np
-from core.general_dataset.logger import logger
-
-
-def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Custom collate function with None filtering.
-    """
-    # Filter out None samples
-    batch = [sample for sample in batch if sample is not None]
-    
-    # Handle empty batch case
-    if not batch:
-        logger.warning("Empty batch after filtering None values")
-        return {}  # Or return a default empty batch structure
-    
-    # Original collation logic
-    collated: Dict[str, Any] = {}
-    for key in batch[0]:
-        items = []
-        for sample in batch:
-            value = sample[key]
-            if isinstance(value, np.ndarray):
-                value = torch.from_numpy(value)
-            items.append(value)
-        if isinstance(items[0], torch.Tensor):
-            collated[key] = torch.stack(items)
-        else:
-            collated[key] = items
-    return collated
-
-def worker_init_fn(worker_id):
-    """
-    DataLoader worker initialization to ensure different random seeds for each worker.
-    """
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
-
-# ------------------------------------
-# core/general_dataset/modalities.py
-# ------------------------------------
-import numpy as np
-from scipy.ndimage import distance_transform_edt, binary_dilation
-from typing import Any, Dict, List, Optional
-from core.general_dataset.logger import logger
-
-
-
-
-def compute_distance_map(lbl: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
-    """
-    Compute a distance map from a label image.
-
-    Args:
-        lbl (np.ndarray): Input label image.
-        distance_threshold (Optional[float]): Maximum distance value.
-    
-    Returns:
-        np.ndarray: Distance map.
-    """
-    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
-    distance_map = distance_transform_edt(lbl_bin == 0)
-    if distance_threshold is not None:
-        np.minimum(distance_map, distance_threshold, out=distance_map)
-    return distance_map
-
-def compute_sdf(lbl: np.ndarray, sdf_iterations: int, sdf_thresholds: List[float]) -> np.ndarray:
-    """
-    Compute the signed distance function (SDF) for a label image.
-
-    Args:
-        lbl (np.ndarray): Input label image.
-        sdf_iterations (int): Number of iterations for dilation.
-        sdf_thresholds (List[float]): [min, max] thresholds for the SDF.
-    
-    Returns:
-        np.ndarray: The SDF computed.
-    """
-    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
-    dilated = binary_dilation(lbl_bin, iterations=sdf_iterations)
-    dist_out = distance_transform_edt(1 - dilated)
-    dist_in  = distance_transform_edt(lbl_bin)
-    sdf = dist_out - dist_in
-    if sdf_thresholds is not None:
-        sdf = np.clip(sdf, sdf_thresholds[0], sdf_thresholds[1])
-    return sdf
-
-# ------------------------------------
-# core/general_dataset/base.py
-# ------------------------------------
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
-import os
-import json
-import random
-import numpy as np
-from tqdm import tqdm
-from sklearn.model_selection import KFold
-from torch.utils.data import Dataset, DataLoader
-
-from core.general_dataset.io          import load_array_from_file
-from core.general_dataset.modalities  import compute_distance_map, compute_sdf
-from core.general_dataset.patch_validity       import check_min_thrsh_road
-from core.general_dataset.augments    import get_augmentation_metadata, extract_condition_augmentations
-from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
-from core.general_dataset.normalizations import normalize_image
-from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
-from core.general_dataset.splits import Split
-from core.general_dataset.logger import logger
-
-
-class GeneralizedDataset(Dataset):
-    """
-    PyTorch Dataset for generalized remote sensing or segmentation datasets.
-    """
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
         super().__init__()
-        self.config = config
-        self.split: str = config.get("split", "train")
-        self.patch_size: int = config.get("patch_size", 128)
-        self.small_window_size: int = config.get("small_window_size", 8)
-        self.threshold: float = config.get("threshold", 0.05)
-        self.max_images: Optional[int] = config.get("max_images")
-        self.max_attempts: int = config.get("max_attempts", 10)
-        self.validate_road_ratio: bool = config.get("validate_road_ratio", False)
-        self.seed: int = config.get("seed", 42)
-        self.fold = config.get("fold")
-        self.num_folds = config.get("num_folds")
-        self.verbose: bool = config.get("verbose", False)
-        self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
-        self.augmentation_params: Dict[str, Any] = config.get("augmentation_params", {})
-        self.distance_threshold: Optional[float] = config.get("distance_threshold")
-        self.sdf_iterations: int = config.get("sdf_iterations")
-        self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
-        self.num_workers: int = config.get("num_workers", 4)
-        self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
-        self.source_folder: str = config.get("source_folder", "")
-        self.save_computed: bool = config.get("save_computed", False)
-        self.base_modalities = config.get('base_modalities')
-        self.compute_again_modalities = config.get('compute_again_modalities', False)
-        self.data_dim    = config.get("data_dim", 2)
-        self.split_cfg = config["split_cfg"]
-        self.split_cfg['seed'] = self.seed
-        self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
-        
-        if self.patch_size is None:
-            raise ValueError("patch_size must be specified in the config.")
-        if self.data_dim not in (2, 3):
-            raise ValueError(f"data_dim must be 2 or 3, got {self.data_dim}")
-        if self.data_dim == 3 and config.get("patch_size_z", 1) < 2:
-            raise ValueError("patch_size_z must > 1 for 3D")
+        self.num_samples = num_samples
+        self.cmap = cmap
+        self._reset()
 
-        random.seed(self.seed)
-        np.random.seed(self.seed)
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _reset(self):
+        self._images, self._gts, self._preds = [], [], []
+        self._count = 0
 
-        splitter = Split(self.split_cfg, self.base_modalities)
-        self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
-        self.modalities = list(self.modality_files.keys())
-        if 'image' not in self.modality_files or 'label' not in self.modality_files:
-            raise ValueError("Split must define both 'image' and 'label' modalities in split_cfg.")
-        assert len(self.modality_files['image']) == len(self.modality_files['label']), (
-            f"len(images): {len(self.modality_files['image'])}, len(labels): {len(self.modality_files['label'])}")
+    # epoch hooks --------------------------------------------------------
+    def on_train_epoch_start(self, *_):
+        self._reset()
 
-        if self.max_images is not None:
-            for key in self.modality_files:
-                self.modality_files[key] = self.modality_files[key][:self.max_images]
-                print(key, 'Max Data Point:', len(self.modality_files[key]))
-        # Precompute additional modalities if requested
-        if self.save_computed:
-            for key in [m for m in self.modalities if m not in ['image', 'label']]:
-                logger.info(f"Generating {key} modality maps...")
-                for file_idx, _ in tqdm(list(enumerate(self.modality_files['label'])),
-                                        total=len(self.modality_files['label']),
-                                        desc=f"Processing {key} maps"):
-                    lbl = load_array_from_file(self.modality_files['label'][file_idx])
-                    modality_path = self.modality_files[key][file_idx]
-                    os.makedirs(os.path.dirname(modality_path), exist_ok=True)
-                    if key == 'distance':
-                        if not os.path.exists(modality_path) or self.compute_again_modalities:
-                            processed = compute_distance_map(lbl, None)
-                            np.save(modality_path, processed)
-                    elif key == 'sdf':
-                        if not os.path.exists(modality_path) or self.compute_again_modalities:
-                            processed = compute_sdf(lbl, self.sdf_iterations, None)
-                            np.save(modality_path, processed)
-                    else:
-                        raise ValueError(f"Unsupported modality {key}")
+    def on_validation_epoch_start(self, *_):
+        self._reset()
 
-    def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
-        imgs: Dict[str, np.ndarray] = {}
-        for key in self.modalities:
-            path = self.modality_files[key][file_idx]
-            if os.path.exists(path):
-                arr = load_array_from_file(path)
-                if arr is None:
-                    return None
-            else:
-                lbl = load_array_from_file(self.modality_files['label'][file_idx])
-                if key == 'distance':
-                    arr = compute_distance_map(lbl, None)
-                elif key == 'sdf':
-                    arr = compute_sdf(lbl, self.sdf_iterations, None)
-                else:
-                    raise ValueError(f"Unsupported modality {key}")
-            imgs[key] = arr
-        if self.data_dim == 3:
-            for k, v in imgs.items():
-                if v.ndim == 3:                # (D, H, W)  →  (1, D, H, W)
-                    imgs[k] = v[np.newaxis, ...].astype(np.float32)
-        if self.verbose:
-            print('imgs[key] shape:', imgs[key].shape)
-        return imgs
+    # batch hooks --------------------------------------------------------
+    def _collect(self, batch, outputs, pl_module):
+        if self._count >= self.num_samples:
+            return
+        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
+        take = min(self.num_samples - self._count, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._count += take
 
-    def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        # Binarize, clip, normalize per modality
-        for key, arr in list(data.items()):
-            if not key.endswith('_patch'):
-                continue
-            modality = key[:-6]
-            patch = arr.astype(np.float32)
-            if modality == 'label':
-                thresh = 127 if patch.max() > 1 else 0
-                data[key] = (patch > thresh).astype(np.uint8)
-            elif modality == 'distance' and self.distance_threshold is not None:
-                data[key] = np.clip(patch, 0, self.distance_threshold)
-            elif modality == 'sdf' and self.sdf_thresholds is not None:
-                lo, hi = self.sdf_thresholds
-                data[key] = np.clip(patch, lo, hi)
-            else:
-                data[key] = patch
-        # Normalization
-        for key, arr in list(data.items()):
-            if not key.endswith('_patch'):
-                continue
-            modality = key[:-6]
-            cfg = self.norm_cfg.get(modality)
-            if isinstance(cfg, dict):
-                method = cfg.get('method', 'minmax')
-                params = {k: v for k, v in cfg.items() if k != 'method'}
-                data[key] = normalize_image(arr, method=method, **params)
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
 
-        for key, arr in data.items():
-            if key.endswith("_patch") and isinstance(arr, np.ndarray):
-                # 2-D image  -> (1, H, W)
-                if arr.ndim == 2:
-                    arr = arr[np.newaxis, ...]
-                # 3-D volume -> (1, D, H, W)
-                elif arr.ndim == 3 and self.data_dim == 3:
-                    arr = arr[np.newaxis, ...]
-        return data
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
 
-    def __len__(self) -> int:
-        return len(self.modality_files['image'])
+    # plotting -----------------------------------------------------------
+    def _plot_and_log(self, tag: str, trainer):
+        imgs = torch.cat(self._images, 0)   # (N, C, H, W)
+        gts  = torch.cat(self._gts, 0)      # (N, 1, H, W)
+        preds = torch.cat(self._preds, 0)   # (N, 1, H, W)
+        n = imgs.size(0)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        imgs = self._load_datapoint(idx)
-        if imgs is None:
-            return self.__getitem__((idx + 1) % len(self))
+        # --- independent signed scaling for GT and prediction -------------
+        pos_max_gt,  neg_min_gt  = float(gts.max()),  float(gts.min())
+        pos_max_pr,  neg_min_pr  = float(preds.max()), float(preds.min())
 
-        img = imgs['image']
-        # Determine shape for slicing
-        if self.data_dim == 3:
-            if img.ndim == 4:
-                _, D, H, W = img.shape
-            elif img.ndim == 3:
-                D, H, W = img.shape
-            else:
-                raise ValueError(f"Expected 3D data for data_dim=3; got {img.ndim}D")
-        else:
-            if img.ndim == 2:
-                C, H, W = 1, *img.shape
-            elif img.ndim == 3:
-                C, H, W = img.shape
-            else:
-                raise ValueError(f"Expected 2D or 3-channel image for data_dim=2; got {img.ndim}D")
+        gts_scaled   = _signed_scale(gts,   pos_max_gt, neg_min_gt)
+        preds_scaled = _signed_scale(preds, pos_max_pr, neg_min_pr)
 
-        # Validation/test: return full image as one patch
-        if self.split != 'train':
-            data = {}
-            for key, array in imgs.items():
-                data[f"{key}_patch"] = array
-            data['metadata'] = {"image_idx": idx, "x": -1, "y": -1}
-            return self._postprocess_patch(data)
+        # --- plotting -----------------------------------------------------
+        fig, axes = plt.subplots(n, 3, figsize=(9, n * 3), tight_layout=True)
+        if n == 1:
+            axes = axes[None, :]  # always treat as 2‑D array [row, col]
 
-        # Training: random crop
-        attempts = 0
-        while attempts < self.max_attempts:
-            x = random.randint(0, W - self.patch_size)
-            y = random.randint(0, H - self.patch_size)
-            patch_meta: Dict[str, Any] = {"image_idx": idx, "x": x, "y": y}
-            if self.augmentations:
-                patch_meta.update(get_augmentation_metadata(self.augmentations, self.data_dim, self.augmentation_params))
-            # Extract patch
-            if self.data_dim == 2:
-                data: Dict[str, np.ndarray] = {}
-                for key, array in imgs.items():
-                    if array.ndim == 2:
-                        patch = array[y:y+self.patch_size, x:x+self.patch_size]
-                    else:
-                        patch = array[:, y:y+self.patch_size, x:x+self.patch_size]
-                    data[f"{key}_patch"] = patch
-                data['metadata'] = patch_meta
-                data = self._postprocess_patch(data)
-            else:
-                data = extract_condition_augmentations(
-                    imgs, patch_meta,
-                    patch_size_xy=self.patch_size,
-                    patch_size_z=self.config.get('patch_size_z', 1),
-                    augmentations=self.augmentations,
-                    data_dim=self.data_dim
-                )
-                data['metadata'] = patch_meta
-                data = self._postprocess_patch(data)
+        for i in range(n):
+            img = imgs[i].permute(1, 2, 0)  # CHW → HWC
+            gt  = gts_scaled[i, 0]
+            pr  = preds_scaled[i, 0]
 
-            # Validate road ratio if needed
-            if not self.validate_road_ratio or check_min_thrsh_road(data['label_patch'], self.patch_size, self.threshold):
-                return data
-            attempts += 1
+            # input
+            axes[i, 0].imshow(img, cmap="gray")
+            axes[i, 0].set_title("input")
+            axes[i, 0].axis("off")
 
-        logger.warning("No valid patch found after %d attempts on image %d; skipping.", self.max_attempts, idx)
-        return self.__getitem__((idx + 1) % len(self))
+            # ground‑truth (own scale)
+            axes[i, 1].imshow(gt, cmap=self.cmap, vmin=-1, vmax=1)
+            axes[i, 1].set_title("gt (ind. scaled)")
+            axes[i, 1].axis("off")
 
-if __name__ == "__main__":
-    split_cfg = {
-        "seed": 42,
-        "sources": [
-            {
-                "type": "folder",
-                "path": "/home/ri/Desktop/Projects/Datasets/RRRR/dataset",
-                "layout": "folders",
-                "modalities": {
-                    "image":    {"folder": "sat"},
-                    "label":    {"folder": "label"},
-                    "distance": {"folder": "distance"},
-                    "sdf":      {"folder": "sdf"},
-                },
-                "splits": {
-                    "train": "train",
-                    "valid": "valid",
-                    "test":  "test",
+            # prediction (own scale)
+            axes[i, 2].imshow(pr, cmap=self.cmap, vmin=-1, vmax=1)
+            axes[i, 2].set_title("pred (ind. scaled)")
+            axes[i, 2].axis("off")
+
+        trainer.logger.experiment.add_figure(
+            f"{tag}_samples", fig, global_step=trainer.current_epoch
+        )
+        plt.close(fig)
+
+    # epoch completion ---------------------------------------------------
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log("train", trainer)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log("validation", trainer)
+
+class SamplePlot3DCallback(SamplePlotCallback):
+    """Extends SamplePlotCallback to also handle 3D volumes by projecting
+    along Z into XY, XZ, YZ slices (via max/min/mean)."""
+
+    def __init__(
+        self,
+        num_samples: int = 5,
+        cmap: str = "coolwarm",
+        projection: str = "max",  # one of "max","min","mean"
+    ):
+        super().__init__(num_samples=num_samples, cmap=cmap)
+        assert projection in ("max", "min", "mean")
+        # map name → torch reduction
+        self._proj_fn = {
+            "max": lambda x, dim: torch.max(x, dim=dim)[0],
+            "min": lambda x, dim: torch.min(x, dim=dim)[0],
+            "mean": lambda x, dim: torch.mean(x, dim=dim),
+        }[projection]
+
+    def _project_volume(self, vol: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # vol: (C,Z,H,W) or (Z,H,W)
+        if vol.ndim == 4:
+            # collapse channels first via max
+            vol = torch.max(vol, dim=0)[0]
+        # now vol is (Z,H,W)
+        xy = self._proj_fn(vol, dim=0)           # → (H,W)
+        xz = self._proj_fn(vol, dim=1)           # → (Z,W)
+        yz = self._proj_fn(vol, dim=2).transpose(0, 1)  # → (H,Z)
+        return {"XY": xy, "XZ": xz, "YZ": yz}
+
+    def _plot_and_log(self, tag: str, trainer):
+        imgs = torch.cat(self._images, 0)
+        gts  = torch.cat(self._gts, 0)
+        preds = torch.cat(self._preds, 0)
+
+        # detect 3D volumes by rank
+        if imgs.dim() == 5:  # N×C×Z×H×W
+            n = imgs.size(0)
+            fig, axes = plt.subplots(
+                n, 9, figsize=(9 * 3, n * 3), tight_layout=True
+            )
+            if n == 1:
+                axes = axes[None, :]
+
+            for i in range(n):
+                # project each modality
+                mods = {
+                    "input": imgs[i].cpu(),
+                    "gt":    gts[i].cpu().squeeze(0),
+                    "pred":  preds[i].cpu().squeeze(0),
                 }
-            }
-        ]
-    }
+                projs = {m: self._project_volume(v) for m, v in mods.items()}
 
-    # ------------------------------------
-    # full config for GeneralizedDataset
-    # ------------------------------------
-    config = {
-        # which split to load
-        "split": "train",
+                for col, m in enumerate(("input", "gt", "pred")):
+                    for row, view in enumerate(("XY", "XZ", "YZ")):
+                        ax = axes[i, col*3 + row]
+                        arr = projs[m][view].numpy()
+                        cmap = "gray" if m == "input" else self.cmap
+                        ax.imshow(arr, cmap=cmap)
+                        ax.set_title(f"{m}-{view}")
+                        ax.axis("off")
 
-        # pass the splitter cfg here
-        "split_cfg": split_cfg,
+            trainer.logger.experiment.add_figure(
+                f"{tag}_3d_samples", fig, global_step=trainer.current_epoch
+            )
+            plt.close(fig)
 
-        # patch extraction params
-        "patch_size": 256,
-        "patch_size_z": 1,             # keep at 1 for 2D data
+        else:
+            # fallback to the original 2D behavior
+            super()._plot_and_log(tag, trainer)
 
-        # optional small‐window check
-        "small_window_size": 8,
+class PredictionLogger(Callback):
+    """
+    Validation‐only: accumulates up to `max_samples` and writes one PNG per epoch.
+    Now uses *separate* vmin/vmax for GT vs. prediction.
+    """
+    def __init__(self,
+                 log_dir: str,
+                 log_every_n_epochs: int = 1,
+                 max_samples: int = 4,
+                 cmap: str = "coolwarm"):
+        super().__init__()
+        self.log_dir = log_dir
+        self.log_every_n_epochs = log_every_n_epochs
+        self.max_samples = max_samples
+        self.cmap = cmap
+        self.logger = pl.utilities.logger.get_logs_dir_logger()
+        self._reset_buffers()
 
-        # require a minimum fraction of road pixels in each patch
-        "validate_road_ratio": True,
-        "threshold": 0.025,
+    def _reset_buffers(self):
+        self._images = []
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._logged_this_epoch = False
 
-        # if you want to limit to just N images (for debugging), set here
-        "max_images": 5,
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if (trainer.current_epoch+1) % self.log_every_n_epochs == 0:
+            self._reset_buffers()
+        else:
+            self._logged_this_epoch = True
 
-        # random seeds & workers
-        "seed": 42,
-        "num_workers": 4,
-        "verbose": True,
+    def on_validation_batch_end(self,
+                                trainer,
+                                pl_module,
+                                outputs,
+                                batch,
+                                batch_idx,
+                                dataloader_idx=0):
+        if self._logged_this_epoch \
+           or ((trainer.current_epoch+1) % self.log_every_n_epochs != 0):
+            return
 
-        # train‐time augmentations
-        "augmentations": ["flip_h", "flip_v", "rotation"],
+        x       = batch[pl_module.input_key].detach().cpu()
+        y_true  = batch[pl_module.target_key].detach().cpu()
+        y_pred  = outputs["predictions"].detach().cpu()
 
-        # distance & SDF modalities: compute if missing
-        "distance_threshold": 15.0,
-        "sdf_iterations": 3,
-        "sdf_thresholds": [-7, 7],
-        "compute_again_modalities": False,
-        "save_computed": True,
+        take = min(self.max_samples - self._collected, x.shape[0])
+        self._images.append(x[:take])
+        self._gts   .append(y_true[:take])
+        self._preds .append(y_pred[:take])
+        self._collected += take
 
-        # only used if you ever switch to ratio‐based splitting
-        "split_ratios": {"train": 0.7, "valid": 0.15, "test": 0.15},
+        if self._collected < self.max_samples:
+            return
 
-        # these are the “base” modalities that must all be present
-        "base_modalities": ["image", "label"],
+        imgs  = torch.cat(self._images, dim=0)
+        gts   = torch.cat(self._gts,    dim=0)
+        preds = torch.cat(self._preds,  dim=0)
 
-        # 2D vs 3D
-        "data_dim": 2,
+        # separate signed limits
+        vlim_gt   = float(gts.abs().max())
+        vlim_pred = float(preds.abs().max())
 
-        "normalization": {
-            "image":    {"method":  "minmax",
-                    "old_min": 0,     # your supplied min
-                    "old_max": 255.0,   # your supplied max
-                    "new_min": 0.0,
-                    "new_max": 1.0},
+        os.makedirs(self.log_dir, exist_ok=True)
+        filename = os.path.join(
+            self.log_dir,
+            f"pred_epoch_{trainer.current_epoch:06d}.png"
+        )
 
-            # "distance": {"method": "zscore"},
-            "sdf":      {},            # empty → no normalization
-            "label":    None,          # or null in JSON → skip
-        },
-        "augmentation_params": {
-            "scale":             {"min": 1.5,  "max": 5.8},
-            # "elastic":           {"alpha_min": 5.0,  "alpha_max": 10.0,
-                                # "sigma_min": 3.0,  "sigma_max": 6.0},
-            "brightness_contrast":{"alpha_min": 0.9,"alpha_max": 1.1,
-                                "beta_min": -30.0,"beta_max": 30.0},
-            "gamma":             {"min": 0.7,  "max": 1.5},
-            # "gaussian_noise":    {"min": 0.01, "max": 0.03},
-            # "gaussian_blur":     {"min": 0.5,  "max": 1.5},
-            # "bias_field":        {"min": 0.2,  "max": 0.4},
-            # "rotation":          {"min": 0.0,  "max": 360.0},
-            # flips and flip_d remain Bernoulli(0.5), no extra params needed
-        },
-    }
+        fig, axes = plt.subplots(self.max_samples, 3,
+                                 figsize=(12, 4 * self.max_samples),
+                                 tight_layout=True)
 
-    # split_cfg = {
-    #     "seed": 42,
-    #     "sources": [
-    #         {
-    #             "type": "ratio",
-    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-    #             "layout": "flat",
-    #             "modalities": {
-    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
-    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-    #             },
-    #             "ratios": {
-    #                 "train": 0.7,
-    #                 "valid": 0.15,
-    #                 "test":  0.15,
-    #             }
-    #         },
-    #         {
-    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-    #             "layout": "flat",
-    #             "modalities": {
-    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
-    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-    #             },
-
-    #             "type": "kfold",
-    #             "num_folds": 5,
-    #             "fold_idx": 0,
-    #             "test_source":{
-    #                 "type": "ratio",
-    #                 "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-    #                 "layout": "flat",
-    #                 "modalities": {
-    #                     "image":    {"pattern": r"^cube_(.*)\.npy$"},
-    #                     "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-    #                     "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-    #                 },
-    #                 "ratios": {
-    #                     "train": 0.01,
-    #                     "valid": 0.9,
-    #                     "test":  0.01,
-    #                 }
-    #             }
-    #         }
-    #     ]
-    # }
-
-    # config = {
-    #     "split": "train",                # one of "train","valid","test"
-    #     "split_cfg": split_cfg,
-
-    #     "data_dim": 3,                   # your .npy volumes are 3D
-    #     "patch_size": 90,                # XY window size
-    #     "patch_size_z": 90,              # Z-depth
-
-    #     "augmentations": ["flip_h","flip_v","flip_d","rotation"],
-    #     "validate_road_ratio": False,    # set True if you want to enforce label coverage
-    #     "threshold": 0.05,
-
-    #     "distance_threshold": None,      # clip distance map if desired
-    #     "sdf_iterations": 3,             # only if you compute SDF
-    #     "sdf_thresholds": [-5, 5],       # ditto
-
-    #     "save_computed": True,          # we already have distlbl_*.npy
-    #     "compute_again_modalities": False,
-
-    #     "max_images": None,
-    #     "max_attempts": 10,
-    #     "seed": 42,
-    #     "num_workers": 4,
-    #     "verbose": True,
-    #     "base_modalities": ['image', 'label']
-    # }
-
-    import yaml
-    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
-        # yaml.dump(config, f_out)
-    with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/AL175.yaml', 'r') as f:
-        config = yaml.safe_load(f)
-
-    # Create dataset and dataloader.
-    dataset = GeneralizedDataset(config)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=8,
-        shuffle=True,
-        collate_fn=custom_collate_fn,
-        num_workers=4,
-        # worker_init_fn=worker_init_fn
-    )
-    logger.info('len(dataloader): %d', len(dataloader))
-    for epoch in range(10):
-        for i, batch in enumerate(dataloader):
-            if batch is None:
-                continue
-            logger.info("Batch keys: %s", batch.keys())
-            logger.info("Image shape: %s", batch["image_patch"].shape)
-            logger.info("Label shape: %s", batch["label_patch"].shape)
-            if config["data_dim"] == 2:
-                visualize_batch_2d(batch, num_per_batch=2)
+        for i in range(self.max_samples):
+            # Input
+            ax = axes[i, 0]
+            if imgs.shape[1] == 1:
+                ax.imshow(imgs[i, 0], cmap='gray')
             else:
-                visualize_batch_3d(batch, projection='max', num_per_batch=2)
+                im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
+                ax.imshow(im)
+            ax.set_title('Input')
+            ax.axis('off')
 
-            # break  # Uncomment to visualize only one batch.
+            # Ground truth
+            ax = axes[i, 1]
+            ax.imshow(gts[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_gt,
+                      vmax=vlim_gt)
+            ax.set_title('Ground Truth')
+            ax.axis('off')
+
+            # Prediction
+            ax = axes[i, 2]
+            ax.imshow(preds[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_pred,
+                      vmax=vlim_pred)
+            ax.set_title('Prediction')
+            ax.axis('off')
+
+        plt.savefig(filename, dpi=150)
+        plt.close(fig)
+
+        self.logger.info(f"Saved prediction visualization: {filename}")
+        self._logged_this_epoch = True
+
+class BestMetricCheckpoint(Callback):
+    """
+    Callback to save checkpoints for the best value of each metric.
+    """
+    
+    def __init__(
+        self, 
+        dirpath: str, 
+        metric_names: List[str],
+        mode: Union[str, Dict[str, str]] = "min",
+        save_last: bool = True,
+        last_k: int = 5,  # Save last checkpoint every k epochs
+        filename_template: str = "best_{metric}"
+    ):
+        """
+        Initialize the BestMetricCheckpoint callback.
+        
+        Args:
+            dirpath: Directory to save checkpoints to
+            metric_names: List of metrics to monitor
+            mode: Either "min", "max", or a dict mapping metric names to "min"/"max"
+            save_last: Whether to save the last checkpoint
+            last_k: Save last checkpoint every k epochs (reduce I/O)
+            filename_template: Template for checkpoint filenames
+        """
+        super().__init__()
+        self.dirpath = dirpath
+        self.metric_names = metric_names
+        self.last_k = last_k
+        
+        # Setup mode for each metric (min or max)
+        self.mode = {}
+        if isinstance(mode, str):
+            for metric in metric_names:
+                self.mode[metric] = mode
+        else:
+            self.mode = mode
+            # Ensure all metrics have a mode
+            for metric in metric_names:
+                if metric not in self.mode:
+                    self.mode[metric] = "min"
+                    
+        self.save_last = save_last
+        self.filename_template = filename_template
+        self.best_values = {}
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize best values
+        for metric in metric_names:
+            if self.mode[metric] == "min":
+                self.best_values[metric] = float('inf')
+            else:
+                self.best_values[metric] = float('-inf')
+    
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        Check metrics at the end of validation and save checkpoint if needed.
+        
+        Args:
+            trainer: PyTorch Lightning trainer
+            pl_module: PyTorch Lightning module
+        """
+        # Create checkpoint directory if it doesn't exist
+        os.makedirs(self.dirpath, exist_ok=True)
+        
+        # Check each metric
+        for metric in self.metric_names:
+            metric_key = f"val_{metric}"
+            if metric_key in trainer.callback_metrics:
+                current_value = trainer.callback_metrics[metric_key].item()
+                
+                is_better = False
+                if self.mode[metric] == "min" and current_value < self.best_values[metric]:
+                    is_better = True
+                    self.best_values[metric] = current_value
+                elif self.mode[metric] == "max" and current_value > self.best_values[metric]:
+                    is_better = True
+                    self.best_values[metric] = current_value
+                
+                if is_better:
+                    filename = f"{self.filename_template.format(metric=metric)}.ckpt"
+                    filepath = os.path.join(self.dirpath, filename)
+                    self.logger.info(f"Saving best {metric} checkpoint: {filepath}")
+                    trainer.save_checkpoint(filepath)
+        
+        # Save last checkpoint if requested (with reduced frequency)
+        if self.save_last and (
+            (trainer.current_epoch+1) % self.last_k == 0 or  # Every k epochs
+            trainer.current_epoch == trainer.max_epochs - 1  # Last epoch
+        ):
+            filename = "last.ckpt"
+            filepath = os.path.join(self.dirpath, filename)
+            trainer.save_checkpoint(filepath)
+            self.logger.info(f"Saved last checkpoint at epoch {trainer.current_epoch}")
+
+
+
+
+class ConfigArchiver(Callback):
+    """
+    Callback to archive configuration files and source code at the start of training.
+    
+    This callback creates a zip file containing:
+    - All configuration files
+    - Source code files (train.py, core/, models/, losses/, metrics/)
+    """
+    
+    def __init__(
+        self,
+        output_dir: str,
+        project_root: str
+    ):
+        """
+        Initialize the ConfigArchiver callback.
+        
+        Args:
+            output_dir: Directory to save the archive to
+            project_root: Root directory of the project containing the code to archive
+        """
+        super().__init__()
+        self.output_dir = output_dir
+        self.project_root = project_root
+        self.logger = logging.getLogger(__name__)
+    
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        Archive configuration and source code at the start of training.
+        
+        Args:
+            trainer: PyTorch Lightning trainer
+            pl_module: PyTorch Lightning module
+        """
+        os.makedirs(self.output_dir, exist_ok=True)
+        timestamp = pl_module.current_epoch
+        archive_name = os.path.join(self.output_dir, f"code_snapshot_{timestamp}.zip")
+        
+        self.logger.info(f"Creating code archive: {archive_name}")
+        
+        with zipfile.ZipFile(archive_name, 'w') as zipf:
+            # Archive configurations
+            config_dir = os.path.join(self.project_root, 'configs')
+            for root, _, files in os.walk(config_dir):
+                for file in files:
+                    if file.endswith('.yaml'):
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, self.project_root)
+                        zipf.write(file_path, arcname)
+            
+            # Archive source code
+            # train.py
+            train_path = os.path.join(self.project_root, 'train.py')
+            if os.path.exists(train_path):
+                zipf.write(train_path, 'train.py')
+            
+            # Core modules
+            core_dir = os.path.join(self.project_root, 'core')
+            for root, _, files in os.walk(core_dir):
+                for file in files:
+                    if file.endswith('.py'):
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, self.project_root)
+                        zipf.write(file_path, arcname)
+            
+            # Models
+            models_dir = os.path.join(self.project_root, 'models')
+            if os.path.exists(models_dir):
+                for root, _, files in os.walk(models_dir):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.project_root)
+                            zipf.write(file_path, arcname)
+            
+            # Losses
+            losses_dir = os.path.join(self.project_root, 'losses')
+            if os.path.exists(losses_dir):
+                for root, _, files in os.walk(losses_dir):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.project_root)
+                            zipf.write(file_path, arcname)
+            
+            # Metrics
+            metrics_dir = os.path.join(self.project_root, 'metrics')
+            if os.path.exists(metrics_dir):
+                for root, _, files in os.walk(metrics_dir):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.project_root)
+                            zipf.write(file_path, arcname)
+        
+        self.logger.info(f"Code archive created: {archive_name}")
+
+
+class SkipValidation(Callback):
+    """
+    Skip the entire validation loop until a given epoch by zeroing out
+    `trainer.limit_val_batches`. Restores the original setting once the
+    epoch threshold is reached.
+    """
+    def __init__(self, skip_until_epoch: int = 0):
+        super().__init__()
+        self.skip_until_epoch = skip_until_epoch
+        self._original_limit_val_batches = None
+        self.logger = logging.getLogger(__name__)
+
+    def on_fit_start(self, trainer, pl_module):
+        # Capture the user's configured limit_val_batches
+        self._original_limit_val_batches = trainer.limit_val_batches
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.current_epoch < self.skip_until_epoch:
+            if trainer.limit_val_batches != 0:
+                self.logger.info(
+                    f"Skipping validation until epoch {self.skip_until_epoch} "
+                    f"(current: {trainer.current_epoch})"
+                )
+                trainer.limit_val_batches = 0
+        else:
+            # Restore the original setting once we've reached the target epoch
+            if trainer.limit_val_batches == 0:
+                trainer.limit_val_batches = self._original_limit_val_batches
+                self.logger.info(
+                    f"Resuming validation from epoch {trainer.current_epoch}"
+                )
+
+class PredictionSaver(pl.Callback):
+    """
+    Save model predictions and ground truths on train, validation, and test.
+    Works with Lightning 2.x using *_batch_end hooks.
+    """
+    def __init__(
+        self,
+        save_dir: str,
+        save_every_n_epochs: int = 1,
+        save_after_epoch: int = 0,
+        max_samples: Optional[int] = None,
+    ):
+        super().__init__()
+        self.save_dir = save_dir
+        self.every = save_every_n_epochs
+        self.after = save_after_epoch
+        self.max_samples = max_samples
+        self._counter = 0
+
+    def _should_save(self, epoch: int) -> bool:
+        print('epoch, self.every', epoch, self.every)
+        return epoch >= self.after and (epoch+1) % self.every == 0
+
+    def _save_tensor(
+        self,
+        array: np.ndarray,
+        split: str,
+        epoch: int,
+        batch_idx: int,
+        sample_idx: int,
+        which: str
+    ):
+        fname = f"{split}_e{epoch}_b{batch_idx}_i{sample_idx}_{which}.npy"
+        folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
+        os.makedirs(folder, exist_ok=True)
+        np.save(os.path.join(folder, fname), array)
+
+    # # ——— TRAINING HOOKS ———
+    # def on_train_epoch_start(self, trainer, pl_module):
+    #     self._counter = 0
+
+    # def on_train_batch_end(
+    #     self,
+    #     trainer: pl.Trainer,
+    #     pl_module: pl.LightningModule,
+    #     outputs: Dict[str, Any],
+    #     batch: Any,
+    #     batch_idx: int,
+    #     dataloader_idx: int = 0,
+    # ):
+    #     epoch = trainer.current_epoch
+    #     if not self._should_save(epoch):
+    #         return
+
+    #     preds = outputs.get("predictions")
+    #     gts   = outputs.get("gts")
+    #     if preds is None or gts is None:
+    #         return
+
+    #     preds = preds.detach().cpu().numpy()
+    #     gts   = gts.detach().cpu().numpy()
+    #     for i in range(preds.shape[0]):
+    #         if self.max_samples is not None and self._counter >= self.max_samples:
+    #             return
+    #         self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
+    #         self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
+    #         self._counter += 1
+
+    # ——— VALIDATION HOOKS ———
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_validation_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "val", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "val", 0, batch_idx, i, "gt")
+            self._counter += 1
+
+    # ——— TEST HOOKS ———
+    def on_test_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_test_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "test", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "test", epoch, batch_idx, i, "gt")
+            self._counter += 1
+
+class PeriodicCheckpoint(pl.Callback):
+    """
+    Save the trainer / model state every `every_n_epochs` epochs.
+
+    Args
+    ----
+    dirpath : str
+        Where the *.ckpt* files will be written.
+    every_n_epochs : int
+        Save interval.
+    prefix : str
+        Filename prefix (default: "epoch").
+    """
+
+    def __init__(self, dirpath: str, every_n_epochs: int = 5, prefix: str = "epoch"):
+        super().__init__()
+        self.dirpath = dirpath
+        self.every_n_epochs = every_n_epochs
+        self.prefix = prefix
+        os.makedirs(self.dirpath, exist_ok=True)
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        epoch = trainer.current_epoch + 1  # epochs are 0-indexed internally
+        if epoch % self.every_n_epochs == 0:
+            filename = f"{self.prefix}{epoch:06d}.ckpt"
+            ckpt_path = os.path.join(self.dirpath, filename)
+            trainer.save_checkpoint(ckpt_path)
+            # optional: log the path so you can grep it later
+            pl_module.logger.experiment.add_text("checkpoints/saved", ckpt_path, epoch)
 
 
 # ------------------------------------
-# core/general_dataset/splits.py
+# core/callbacks/periodic_ckpt.py
 # ------------------------------------
 import os
-import re
-import random
-from collections import defaultdict
-from typing import Dict, List, Any, Tuple
-import numpy as np
-from sklearn.model_selection import KFold
+import pytorch_lightning as pl
 
-def _is_junk(fname: str) -> bool:
-    """Ignore index.html or config.json files (case insensitive)."""
-    return fname.lower() in ("index.html", "config.json")
-
-
-def _listdir_safe(folder: str) -> List[str]:
-    """Safely list directory contents; return empty list if path doesn't exist."""
-    try:
-        return os.listdir(folder)
-    except Exception:
-        return []
-
-def filename_from_pattern(pattern: str, stem: str) -> str:
-    # 1) strip regex anchors
-    if pattern.startswith("^"):
-        pattern = pattern[1:]
-    if pattern.endswith("$"):
-        pattern = pattern[:-1]
-
-    # 2) split on the literal "(.*)"
-    parts = pattern.split("(.*)")
-    if len(parts) != 2:
-        raise ValueError(f"Pattern must contain exactly one '(.*)' slot: {pattern!r}")
-    prefix, suffix = parts
-
-    # 3) un-escape any escaped chars (e.g. "\." → ".", "\(" → "(", etc.)
-    unescape = lambda s: re.sub(r"\\(.)", r"\1", s)
-    prefix = unescape(prefix)
-    suffix = unescape(suffix)
-
-    # 4) re-join
-    return f"{prefix}{stem}{suffix}"
-
-def _filter_complete(records, required_modalities):
-    by_group = defaultdict(list)
-    for rec in records:
-        key = (rec["split"], rec["stem"])
-        by_group[key].append(rec)
-
-    complete = []
-    for (split, stem), recs in by_group.items():
-        mods = {r["modality"] for r in recs}
-        if mods >= set(required_modalities):
-            complete.extend(recs)
-    return complete
-
-def _filter_complete_no_split(records: List[Dict[str, str]], required_modalities: List[str]) -> List[Dict[str, str]]:
+class PeriodicCheckpoint(pl.Callback):
     """
-    Given a flat list of records without split information,
-    drop any stems missing one of the required_modalities.
+    Save the trainer / model state every `every_n_epochs` epochs.
+
+    Args
+    ----
+    dirpath : str
+        Where the *.ckpt* files will be written.
+    every_n_epochs : int
+        Save interval.
+    prefix : str
+        Filename prefix (default: "epoch").
     """
-    # Group records by stem
-    by_stem: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-    for rec in records:
-        stem = rec["stem"]
-        by_stem[stem].append(rec)
 
-    # Keep only those groups whose modalities cover the required set
-    req_set = set(required_modalities)
-    complete: List[Dict[str, str]] = []
-    for stem, recs in by_stem.items():
-        mods = {r["modality"] for r in recs}
-        if mods >= req_set:
-            complete.extend(recs)
+    def __init__(self, dirpath: str, every_n_epochs: int = 5, prefix: str = "epoch"):
+        super().__init__()
+        self.dirpath = dirpath
+        self.every_n_epochs = every_n_epochs
+        self.prefix = prefix
+        os.makedirs(self.dirpath, exist_ok=True)
 
-    return complete
-
-def _pivot_views(records):
-    st_md_sp = defaultdict(lambda: defaultdict(dict))
-    md_st_sp = defaultdict(lambda: defaultdict(dict))
-    st_sp_md = defaultdict(lambda: defaultdict(dict))
-    sp_st_md = defaultdict(lambda: defaultdict(dict))
-
-    for r in records:
-        s, m, t, p = r["split"], r["modality"], r["stem"], r["path"]
-        st_md_sp[t][m][s] = p
-        md_st_sp[m][t][s] = p
-        st_sp_md[t][s][m] = p
-        sp_st_md[s][t][m] = p
-
-    return [st_md_sp, md_st_sp, st_sp_md, sp_st_md]
-
-def _pivot_views_no_split(records):
-    st_md = defaultdict(lambda: defaultdict(dict))
-    md_st = defaultdict(lambda: defaultdict(dict))
-
-    for r in records:
-        m, t, p = r["modality"], r["stem"], r["path"]
-        st_md[t][m] = p
-        md_st[m][t] = p
-
-    return [st_md, md_st]
-
-def _collect_datapoints_from_source(src: Dict[str, Any], base_modalities, rng):
-    root       = src["path"]
-    layout     = src.get("layout", "flat")
-    modalities = src.get("modalities", {})
-    splits     = src.get("splits", {})
-
-    base_records = []
-    if layout == "folders":
-        for split, subfolder in splits.items():
-            split_dir = os.path.join(root, subfolder)
-            for mod, meta in modalities.items():
-                if mod not in base_modalities:
-                    continue
-                subfolder = meta.get("folder")
-                if not subfolder:
-                    continue
-                folder = os.path.join(split_dir, subfolder)
-                for fname in _listdir_safe(folder):
-                    if _is_junk(fname):
-                        continue
-                    stem = os.path.splitext(fname)[0]
-                    path = os.path.join(folder, fname)
-                    base_records.append({
-                        "split":    split,
-                        "modality": mod,
-                        "stem":     stem,
-                        "path":     path,
-                    })
-
-        # 2) drop any (split,stem) groups missing a base modality
-        base_records = _filter_complete(base_records, base_modalities)
-        # extract all the valid stems per split
-        stems_by_split = defaultdict(set)
-        for rec in base_records:
-            stems_by_split[rec["split"]].add(rec["stem"])
-
-        # 3) start your final list with the complete base records
-        records = list(base_records)
-
-        # 4) now add any non-base modalities, if the file exists  
-        for split, valid_stems in stems_by_split.items():
-            split_dir = os.path.join(root, split)
-            for mod, meta in modalities.items():
-                if mod in base_modalities:
-                    continue
-                subfolder = meta.get("folder")
-                if not subfolder:
-                    continue
-                folder = os.path.join(split_dir, subfolder)
-                for stem in valid_stems:
-                    fname = f"{stem}_{mod}.npy"
-                    records.append({
-                        "split":    split,
-                        "modality": mod,
-                        "stem":     stem,
-                        "path":     os.path.join(folder, fname),
-                    })
-
-        # print(_pivot_views(records)[-1])
-        
-    else:
-        base_records = []
-        for fname in _listdir_safe(root):
-            if _is_junk(fname):
-                continue
-            for mod, meta in modalities.items():
-                if mod not in base_modalities:
-                    continue
-                pat = meta.get("pattern")
-                if not pat:
-                    continue
-                m = re.fullmatch(pat, fname)
-                if not m:
-                    continue
-
-                # extract stem
-                if m.groups():
-                    stem = m.group(1)
-                else:
-                    grp_pat = pat.replace(".*", "(.*)")
-                    m2 = re.fullmatch(grp_pat, fname)
-                    if m2:
-                        stem = m2.group(1)
-                    else:
-                        stem = os.path.splitext(fname)[0]
-                
-                base_records.append({
-                        "modality": mod,
-                        "stem":     stem,
-                        "path":     os.path.join(root, fname),
-                    })
-        
-
-        # Filter out incomplete groups
-        complete_base = _filter_complete_no_split(base_records, base_modalities)
-        valid_stems = {rec["stem"] for rec in complete_base}
-
-        # Add complete base records
-        records = list(complete_base)
-        # print(_pivot_views_no_split(records)[0])
-        # raise
-
-        # Now append non-base modalities
-        for mod, meta in modalities.items():
-            if mod in base_modalities:
-                continue
-            pat = meta.get("pattern")
-            if not pat:
-                continue
-            for stem in valid_stems:
-                escaped_stem = re.escape(stem)
-                full_pat = pat.replace("(.*)", f"({escaped_stem})")
-                fname   = filename_from_pattern(pat, stem)
-                # print(mod, stem)
-                # print(fname)
-                records.append({
-                    "modality": mod,
-                    "stem":     stem,
-                    "path":     os.path.join(root, fname),
-                })
-        # print(_pivot_views_no_split(records)[0])
-        records = split_records(src, records, rng)
-    
-    return records
-
-class Split:
-    """
-    Unified splitter with support for 'folder', 'ratio', and 'kfold' sources.
-    Adds base_modalities intersection and path validation.
-    """
-    def __init__(self, cfg: Dict[str, Any], base_modalities: List[str]) -> None:
-        self.cfg = cfg
-        self.seed = cfg.get("seed", 0)
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-
-        self.base_modalities = base_modalities
-        # Make the RNG deterministic but *local* to this instance
-        self._rng = random.Random(self.seed)
-        np.random.seed(self.seed)
-
-        # Filled lazily by _build_splits()
-        self._splits_built = False
-        self._split2mod2files: Dict[str, Dict[str, List[str]]] = {}
-
-    # ------------------------------------------------------------------ #
-    # public API
-    # ------------------------------------------------------------------ #
-    def get_split(self, split: str) -> Dict[str, List[str]]:
-        """
-        Args
-        ----
-        split : str
-            One of "train", "valid", "test".
-
-        Returns
-        -------
-        Dict[str, List[str]]
-            { modality : [file paths] }  (lists are *already sorted*).
-        """
-        if split not in ("train", "valid", "test"):
-            raise ValueError("split must be 'train', 'valid' or 'test'")
-
-        if not self._splits_built:
-            self._build_splits()
-
-        # `.get` so an empty dict is returned if this split doesn't exist
-        return self._split2mod2files.get(split, {})
-
-    # ------------------------------------------------------------------ #
-    # helpers
-    # ------------------------------------------------------------------ #
-    def _build_splits(self) -> None:
-        """
-        One-shot scan of every source in the config → populate
-        self._split2mod2files.
-        """
-        all_records: List[Dict[str, str]] = []
-
-        # 1) collect and (if needed) split each source
-        for src in self.cfg.get("sources", []):
-            # recs = _collect_datapoints_from_source(src, self.base_modalities)
-            recs = self._collect_datapoints_for(src)
-            all_records.extend(recs)
-
-        # 2) bucket by split / modality
-        split2mod2files = defaultdict(lambda: defaultdict(list))
-        for rec in all_records:
-            sp, mod, path = rec["split"], rec["modality"], rec["path"]
-            split2mod2files[sp][mod].append(path)
-
-        # 3) deterministic order: sort the lists so paired modalities stay aligned
-        for sp in split2mod2files:
-            for mod in split2mod2files[sp]:
-                split2mod2files[sp][mod].sort()
-
-        # ---- print a summary of each split ----
-        for sp, mod2files in split2mod2files.items():
-            # count “stems” via the first base modality
-            if self.base_modalities:
-                base = self.base_modalities[0]
-                stem_count = len(mod2files.get(base, []))
-            else:
-                stem_count = sum(len(v) for v in mod2files.values()) // max(1, len(mod2files))
-            print(f"→ Split '{sp}': {stem_count} stems")
-            for mod, files in mod2files.items():
-                print(f"     {mod:8s}: {len(files)} files")
-            print()
-        # ---- end summary ----
-
-        self._split2mod2files = split2mod2files
-        self._splits_built    = True
-
-    def _collect_datapoints_for(self, src: Dict[str, Any]) -> List[Dict[str, str]]:
-        records = _collect_datapoints_from_source(src, self.base_modalities, self._rng)
-        if src.get('type')=='kfold':
-            test_src = src.get('test_source')
-            test_records = _collect_datapoints_from_source(test_src, self.base_modalities, self._rng)  
-            records.extend([rec for rec in test_records if rec['split']=='test'])
-        return records
-    
-def split_records(src, records, rng):
-    """
-    Assigns a 'split' field to each record in `records` based on the split strategy in `src`.
-
-    - For 'ratio': groups by stem, shuffles, and slices by the provided ratios.
-    - For 'kfold': performs K-fold cross-validation on stems, using fold_idx as the held-out fold.
-    """
-    split_type = src.get('type')
-    if split_type == 'folder':  
-        return records
-    
-    # RATIO-BASED SPLIT
-    if split_type == 'ratio':
-        # Collect unique stems
-        stems = sorted({r['stem'] for r in records})
-        # Shuffle with seed if provided
-        # seed = src.get('seed', None)
-        # if seed is not None:
-        #     random.Random(seed).shuffle(stems)
-        # else:
-        #     random.shuffle(stems)
-        rng.shuffle(stems)
-
-        ratios = src.get('ratios', {})
-        train_ratio = ratios.get('train', 0)
-        valid_ratio = ratios.get('valid', 0)
-        # test_ratio implied
-        n = len(stems)
-        n_train = int(n * train_ratio)
-        n_valid = int(n * valid_ratio)
-        # Ensure all accounted for
-        n_test = n - n_train - n_valid
-
-        train_stems = set(stems[:n_train])
-        valid_stems = set(stems[n_train:n_train + n_valid])
-        test_stems  = set(stems[n_train + n_valid:])
-
-        # Assign splits
-        for rec in records:
-            s = rec['stem']
-            if s in train_stems:
-                rec['split'] = 'train'
-            elif s in valid_stems:
-                rec['split'] = 'valid'
-            else:
-                rec['split'] = 'test'
-        return records
-
-    # K-FOLD SPLIT
-    elif split_type == 'kfold':
-        num_folds = src.get('num_folds')
-        fold_idx  = src.get('fold_idx', 0)
-        # Collect unique stems
-        stems = sorted({r['stem'] for r in records})
-        # Prepare KFold
-        kf = KFold(n_splits=num_folds,
-                   shuffle=True,
-                   random_state=src.get('seed', None))
-        # Find the train/valid split for the requested fold
-        for idx, (train_idx, valid_idx) in enumerate(kf.split(stems)):
-            if idx == fold_idx:
-                train_stems = {stems[i] for i in train_idx}
-                valid_stems = {stems[i] for i in valid_idx}
-                break
-
-        # Assign splits
-        for rec in records:
-            if rec['stem'] in train_stems:
-                rec['split'] = 'train'
-            elif rec['stem'] in valid_stems:
-                rec['split'] = 'valid'
-                
-        return records
-
-    else:
-        raise ValueError(f"Unsupported split type: {split_type}")
-
-
-def main():
-    split_cfg = {
-        "seed": 42,
-        "sources": [
-            {
-                "type": "folder",
-                "path": "/data/folder1",
-                "layout": "folders",
-                "modalities": {
-                    "image": {"folder": "imgs"},
-                    "label": {"folder": "lbls"}
-                },
-                "splits": {"train": "train_dir", "valid": "val_dir", "test": "test_dir"}
-            },
-            {
-                "type": "ratio",
-                "path": "/data/flat2",
-                "layout": "flat",
-                "modalities": {
-                    "image": {"pattern": r".*\\.jpg$"},
-                    "mask":  {"pattern": r".*\\.png$"}
-                },
-                "ratios": {"train": 0.7, "valid": 0.2, "test": 0.1}
-            },
-            {
-                "type": "kfold",
-                "num_folds": 5,
-                "fold_idx": 0,
-                "path": "/data/flat_tv",
-                "layout": "flat",
-                "modalities": {
-                    "image": {"pattern": r".*\.npy$"},
-                    "seg":   {"pattern": r".*\.npy$"}
-                },
-                "test_source":{
-                    # this can only be type ratio 
-                }
-            }
-        ]
-    }
-
-    splitter = Split(split_cfg)
-    for split_name in ("train", "valid", "test"):
-        mappings = splitter.get_split(split_name)
-        print(f"=== {split_name.upper()} ===")
-        for mod, files in mappings.items():
-            print(f"  {mod}: {len(files)} files")
-
-if __name__ == "__main__":
-    main()
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        epoch = trainer.current_epoch + 1  # epochs are 0-indexed internally
+        if epoch % self.every_n_epochs == 0:
+            filename = f"{self.prefix}{epoch:06d}.ckpt"
+            ckpt_path = os.path.join(self.dirpath, filename)
+            trainer.save_checkpoint(ckpt_path)
+            # optional: log the path so you can grep it later
+            pl_module.logger.experiment.add_text("checkpoints/saved", ckpt_path, epoch)
 
 
 # ------------------------------------
-# core/general_dataset/normalizations.py
+# core/callbacks/config_archiver.py
 # ------------------------------------
-"""
-normalizations.py
 
-Various image normalization routines for 2D/3D numpy arrays.
-Define multiple strategies and a unified `normalize` dispatcher, plus a binarization helper.
-"""
-import numpy as np
-from core.general_dataset.logger import logger
-from typing import Optional
-
-
-def min_max_normalize(
-    image: np.ndarray,
-    new_min: float = 0.0,
-    new_max: float = 1.0,
-    old_min: Optional[float] = None,
-    old_max: Optional[float] = None,
-) -> np.ndarray:
-    """
-    Scale image intensities to [new_min, new_max].
-    If old_min/old_max are provided, use them as the original bounds;
-    otherwise compute from the image itself.
-    """
-    img = image.astype(np.float32)
-    lo = old_min if old_min is not None else float(img.min())
-    hi = old_max if old_max is not None else float(img.max())
-    if hi <= lo:
-        logger.warning(
-            "Min-Max normalization: invalid range old_min=%s, old_max=%s; returning new_min.",
-            lo, hi
-        )
-        return np.full_like(img, new_min)
-    scaled = (img - lo) / (hi - lo)
-    return scaled * (new_max - new_min) + new_min
-
-
-def z_score_normalize(image: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """
-    Subtract mean and divide by standard deviation (per-image).
-    """
-    img = image.astype(np.float32)
-    mean = img.mean()
-    std = img.std()
-    if std < eps:
-        logger.warning("Z-Score normalization: low variance, returning zeros.")
-        return np.zeros_like(img)
-    return (img - mean) / std
-
-
-def robust_normalize(image: np.ndarray, lower_q: float = 0.05, upper_q: float = 0.95) -> np.ndarray:
-    """
-    Clip intensities to [lower_q, upper_q] quantiles and then apply min-max scaling.
-    """
-    img = image.astype(np.float32)
-    low, high = np.quantile(img, [lower_q, upper_q])
-    if high == low:
-        logger.warning("Robust normalization: quantiles equal, returning zeros.")
-        return np.zeros_like(img)
-    clipped = np.clip(img, low, high)
-    return (clipped - low) / (high - low)
-
-
-def percentile_normalize(image: np.ndarray, q_low: float = 1.0, q_high: float = 99.0) -> np.ndarray:
-    """
-    Similar to robust but in percent (q_low and q_high are percents).
-    Clip to percentiles then min-max scale to [0,1].
-    """
-    return robust_normalize(image, q_low/100.0, q_high/100.0)
-
-
-def clip_normalize(image: np.ndarray, min_val: float, max_val: float) -> np.ndarray:
-    """
-    Clip intensities to [min_val, max_val] then scale to [0,1].
-    """
-    img = image.astype(np.float32)
-    clipped = np.clip(img, min_val, max_val)
-    if max_val == min_val:
-        logger.warning("Clip normalization: min_val == max_val, returning zeros.")
-        return np.zeros_like(img)
-    return (clipped - min_val) / (max_val - min_val)
-
-
-def binarize(
-    image: np.ndarray,
-    threshold: float,
-    greater_is_road: bool = True
-) -> np.ndarray:
-    """
-    Binarize the image based on a threshold.
-
-    Args:
-        image:    Input array.
-        threshold: Value to threshold at.
-        greater_is_road: If True, pixels > threshold become 1; else pixels < threshold become 1.
-
-    Returns:
-        A uint8 array of 0s and 1s.
-    """
-    img = image.astype(np.float32)
-    if greater_is_road:
-        mask = img > threshold
-    else:
-        mask = img <= threshold
-    return mask.astype(np.uint8)
-
-
-def normalize(
-    image: np.ndarray,
-    method: str = "minmax",
-    **kwargs
-) -> np.ndarray:
-    """
-    Dispatch to a normalization method. Supported methods:
-      - 'minmax'    : min_max_normalize
-      - 'zscore'    : z_score_normalize
-      - 'robust'    : robust_normalize
-      - 'percentile': percentile_normalize
-      - 'clip'      : clip_normalize (requires min_val, max_val args)
-      - 'binarize'  : binarize (requires threshold, optional greater_is_road)
-    """
-    method = method.lower()
-    if method == "minmax":
-        return min_max_normalize(image, **kwargs)
-    elif method == "zscore":
-        return z_score_normalize(image, **kwargs)
-    elif method == "robust":
-        return robust_normalize(image, **kwargs)
-    elif method == "percentile":
-        return percentile_normalize(image, **kwargs)
-    elif method == "clip":
-        return clip_normalize(image, **kwargs)
-    elif method == "binarize":
-        return binarize(image, **kwargs)
-    else:
-        logger.error(f"Unknown normalization method '{method}', using minmax.")
-        return min_max_normalize(image, **kwargs)
-
-# Alias for backward compatibility
-normalize_image = normalize
-
-
-
-# normalization_config = {
-#     "minmax": {
-#         "method": "minmax",
-#         "new_min": 0.0,    # lower bound of output range
-#         "new_max": 1.0     # upper bound of output range
-#     },
-#     "zscore": {
-#         "method": "zscore",
-#         "eps": 1e-8        # small constant to avoid division by zero
-#     },
-#     "robust": {
-#         "method": "robust",
-#         "lower_q": 0.05,   # clip everything below 5th quantile
-#         "upper_q": 0.95    # clip everything above 95th quantile
-#     },
-#     "percentile": {
-#         "method": "percentile",
-#         "q_low": 1.0,      # clip below 1st percentile
-#         "q_high": 99.0     # clip above 99th percentile
-#     },
-#     "clip": {
-#         "method": "clip",
-#         "min_val": 0.0,    # lower clipping threshold
-#         "max_val": 200.0   # upper clipping threshold
-#     }
-# }
-
-# ------------------------------------
-# core/general_dataset/augments_old.py
-# ------------------------------------
-from typing import Any, Dict, List, Optional
-import numpy as np
-from core.general_dataset.logger import logger
-
-import math
-from scipy.ndimage import rotate
-
-
-def get_augmentation_metadata(augmentations: List[str], data_dim: int) -> Dict[str, Any]:
-    """
-    Generate random augmentation parameters for a patch.
-
-    Returns:
-        Dict[str, Any]: Augmentation metadata.
-    """
-    meta: Dict[str, Any] = {}
-    if 'rotation' in augmentations:
-        meta['angle'] = np.random.uniform(0, 360)
-    if 'flip_h' in augmentations:
-        meta['flip_h'] = np.random.rand() > 0.5
-    if 'flip_v' in augmentations:
-        meta['flip_v'] = np.random.rand() > 0.5
-    if 'flip_d' in augmentations and data_dim == 3:
-        meta['flip_d'] = np.random.rand() > 0.5
-    return meta
-
-
-def flip_h(full_array: np.ndarray) -> np.ndarray:
-    return np.flip(full_array, axis=-1)
-
-def flip_v(full_array: np.ndarray) -> np.ndarray:
-    return np.flip(full_array, axis=-2)
-
-def flip_d(full_array: np.ndarray) -> np.ndarray:
-    return np.flip(full_array, axis=-3)
-
-def rotate_(
-    full_array: np.ndarray,
-    patch_meta: Dict[str, Any],
-    patch_size_xy: int,
-    patch_size_z: int,
-    data_dim: int
-) -> np.ndarray:
-    """Rotate patch, preserving shape, for 2D or 3D."""
-    angle = patch_meta['angle']
-    # Compute L only in-plane
-    L = int(np.ceil(patch_size_xy * math.sqrt(2)))
-    x, y = patch_meta['x'], patch_meta['y']
-    # for 3D also get z but we only rotate each slice independently
-    cx, cy = x + patch_size_xy // 2, y + patch_size_xy // 2
-    half_L = L // 2
-    x0 = max(0, cx - half_L)
-    y0 = max(0, cy - half_L)
-    x1 = min(full_array.shape[-1], cx + half_L)
-    y1 = min(full_array.shape[-2], cy + half_L)
-    x0, x1 = max(0, cx-half_L), min(full_array.shape[-1], cx+half_L)
-    y0, y1 = max(0, cy-half_L), min(full_array.shape[-2], cy+half_L)
-
-    if data_dim == 3:
-        z = patch_meta.get('z', 0)
-        # crop a 3D block, but rotate per-slice
-        block = full_array[:, z:z+patch_size_z, y0:y1, x0:x1]
-        D, Hc, Wc = block.shape[1:]
-        if Hc < L or Wc < L:
-            logger.warning("Crop too small for 3D rotation; zero patch.")
-            return np.zeros_like(block[..., :patch_size_xy, :patch_size_xy])
-        rotated_slices = []
-        for d in range(block.shape[1]):
-            # rotate each C×H×W slice
-            slice_ = block[:, d]
-            rotated = rotate(slice_, angle, reshape=False, order=1)
-            # center-crop back to patch_size_xy
-            start = (L - patch_size_xy)//2
-            cropped = rotated[start:start+patch_size_xy, start:start+patch_size_xy]
-            rotated_slices.append(cropped)
-        return np.stack(rotated_slices, axis=1)  # C×Z×XY×XY
-    
-    else:
-        # 2D case: full_array is H×W or C×H×W
-        crop = full_array[y0:y1, x0:x1] if full_array.ndim == 2 else full_array[:, y0:y1, x0:x1]
-        Hc, Wc = crop.shape[-2], crop.shape[-1]
-        if Hc < L or Wc < L:
-            logger.warning("Crop too small for 2D rotation; zero patch.")
-            shape = (patch_size_xy, patch_size_xy) if crop.ndim == 2 else (crop.shape[0], patch_size_xy, patch_size_xy)
-            return np.zeros(shape, dtype=crop.dtype)
-        rotated = rotate(crop, angle, reshape=False, order=1)
-        start = (L - patch_size_xy)//2
-        if rotated.ndim == 2:
-            return rotated[start:start+patch_size_xy, start:start+patch_size_xy]
-        else:
-            return rotated[:, start:start+patch_size_xy, start:start+patch_size_xy]
-        
-
-def extract_condition_augmentations(
-    imgs: Dict[str, np.ndarray],
-    metadata: Dict[str, Any],
-    patch_size_xy: int,
-    patch_size_z: int,
-    augmentations: List[str],
-    data_dim: int
-) -> Dict[str, np.ndarray]:
-    """
-    Extract a patch from the full image and apply conditional augmentations.
-
-    Args:
-        imgs (Dict[str, np.ndarray]): Full images for each modality.
-        metadata (Dict[str, Any]): Metadata containing patch coordinates and augmentations.
-    
-    Returns:
-        Dict[str, np.ndarray]: Dictionary of extracted patches.
-    """
-    imgs_aug = imgs.copy()
-    z = metadata.get('z', 0)
-    data = extract_data(imgs,
-                        metadata['x'], metadata['y'], z,
-                        patch_size_xy,
-                        patch_size_z)
-    for key in imgs:
-        if key.endswith("_patch"):
-            modality = key.replace("_patch", "")
-            if 'flip_h' in augmentations:
-                imgs_aug[modality] = flip_h(imgs[modality])
-                data[key] = flip_h(data[key])
-            if 'flip_v' in augmentations:
-                imgs_aug[modality] = flip_v(imgs[modality])
-                data[key] = flip_v(data[key])
-            if 'flip_d' in augmentations and data_dim == 3:
-                imgs_aug[modality] = flip_d(imgs_aug[modality])
-                data[key]          = flip_d(data[key])
-            if 'rotation' in augmentations:
-                data[key] = rotate_(imgs_aug[modality], metadata, patch_size_xy, patch_size_z, data_dim)
-    return data
-
-
-def extract_data(imgs: Dict[str, np.ndarray],
-                 x: int, y: int, z: int,
-                 patch_size_xy: int,
-                 patch_size_z: Optional[int] = None) -> Dict[str, np.ndarray]:
-    
-    data = {}
-    for key, arr in imgs.items():
-        if arr.ndim == 4:  # C, D, H, W
-            psz = patch_size_z or patch_size_xy
-            data[f"{key}_patch"] = arr[:, z:z+psz, y:y+patch_size_xy, x:x+patch_size_xy]
-        elif arr.ndim == 3:
-            if patch_size_z is not None:
-                data[f"{key}_patch"] = arr[z:z+patch_size_z, y:y+patch_size_xy, x:x+patch_size_xy]
-            else:
-                data[f"{key}_patch"] = arr[y:y+patch_size_xy, x:x+patch_size_xy]
-        elif arr.ndim == 2:
-            data[f"{key}_patch"] = arr[y:y+patch_size_xy, x:x+patch_size_xy]
-        else:
-            raise ValueError("Unsupported array dimensions in _extract_data")
-    return data
-
-# ------------------------------------
-# core/general_dataset/patch_validity.py
-# ------------------------------------
-from typing import Any, Dict, List, Optional
-import numpy as np
-from core.general_dataset.logger import logger
-
-
-def check_min_thrsh_road(label_patch: np.ndarray, patch_size, threshold) -> bool:
-    """
-    Check if the label patch has at least a minimum percentage of road pixels.
-
-    Args:
-        label_patch (np.ndarray): The label patch.
-    
-    Returns:
-        bool: True if the patch meets the minimum threshold; False otherwise.
-    """
-    patch = label_patch
-    if patch.max() > 1:
-        patch = (patch > 127).astype(np.uint8)
-    road_percentage = np.sum(patch) / (patch_size * patch_size)
-    return road_percentage >= threshold
-
-
-def check_small_window(image_patch: np.ndarray, small_window_size) -> bool:
-    """
-    Check that no small window in the image patch is entirely black or white.
-
-    Args:
-        image_patch (np.ndarray): Input patch (H x W) or (C x H x W)
-
-    Returns:
-        bool: True if valid, False if any window is all black or white.
-    """
-    sw = small_window_size
-
-    # Ensure image has shape (C, H, W)
-    if image_patch.ndim == 2:
-        image_patch = image_patch[None, :, :]  # Add channel dimension
-
-    C, H, W = image_patch.shape
-    if H < sw or W < sw:
-        return False
-
-    # Set thresholds
-    max_val = image_patch.max()
-    if max_val > 1.0:
-        high_thresh = 255
-        low_thresh = 0
-    else:
-        high_thresh = 255 / 255.0
-        low_thresh = 0 / 255.0
-
-    # Slide window over spatial dimensions
-    for c in range(C):
-        for y in range(0, H - sw + 1):
-            for x in range(0, W - sw + 1):
-                window = image_patch[c, y:y + sw, x:x + sw]
-                window_var = np.var(window)
-                if window_var < 0.01:
-                    return False
-                # print(window)
-                if np.all(window >= high_thresh):
-                    return False  # Found an all-white window
-                if np.all(window <= low_thresh):
-                    return False  # Found an all-black window
-
-    return True  # All windows passed
-
-
-
-
-# ------------------------------------
-# core/general_dataset/io.py
-# ------------------------------------
-from pathlib import Path
-from typing import Optional
-import numpy as np
-import rasterio
+import os
 import logging
-import warnings
-from rasterio.errors import NotGeoreferencedWarning
-warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+import zipfile
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
 
-logger = logging.getLogger(__name__)
 
-def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
+class ConfigArchiver(Callback):
     """
-    Load an array from disk. Supports:
-      - .npy      → numpy.load
-      - .tif/.tiff → rasterio.open + read
-    Returns:
-      np.ndarray on success, or None if the file cannot be read.
-    """
-    path = Path(file_path)
-    ext = path.suffix.lower()
+    Callback to archive configuration files and source code at the start of training.
     
-    loaders = {
-        '.npy': lambda p: np.load(p),
-        '.tif': lambda p: rasterio.open(p).read().astype(np.float32),
-        '.tiff': lambda p: rasterio.open(p).read().astype(np.float32),
-    }
-    
-    loader = loaders.get(ext)
-    if loader is None:
-        logger.warning("Unsupported file extension '%s' for %s", ext, file_path)
-        return None
-
-    try:
-        return loader(str(path))
-    except Exception as e:
-        # logger.warning("Failed to load '%s': %s", file_path, e)
-        return None
-
-# ------------------------------------
-# core/general_dataset/__init__.py
-# ------------------------------------
-# core/general_dataset/__init__.py
-
-from .base    import GeneralizedDataset
-from .collate import custom_collate_fn, worker_init_fn
-
-# Optionally, define __all__
-__all__ = [
-    "GeneralizedDataset",
-    "custom_collate_fn",
-    "worker_init_fn",
-]
-
-
-# ------------------------------------
-# core/general_dataset/visualizations.py
-# ------------------------------------
-from typing import Any, Dict, List, Optional
-import matplotlib.pyplot as plt
-import numpy as np
-
-def visualize_batch_2d(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
+    This callback creates a zip file containing:
+    - All configuration files
+    - Source code files (train.py, core/, models/, losses/, metrics/)
     """
-    Visualizes patches in a batch: image, label, distance, and SDF (if available).
-
-    Args:
-        batch (Dict[str, Any]): Dictionary containing batched patches.
-        num_per_batch (Optional[int]): Maximum number of patches to visualize.
-    """
-    print('batch["image_patch"].shape:', batch["image_patch"].shape)
-    num_to_plot = batch["image_patch"].shape[0]
-    if num_per_batch:
-        num_to_plot = min(num_to_plot, num_per_batch)
-    for i in range(num_to_plot):
-        sample_image = batch["image_patch"][i].numpy()
-        if sample_image.shape[0] == 3:  # CHW to HWC
-            sample_image = sample_image.transpose(1, 2, 0)
-        elif sample_image.shape[0] == 1:
-            sample_image = sample_image[0]  # grayscale
-        else:
-            sample_image = sample_image.transpose(1, 2, 0)
-
-        sample_label = np.squeeze(batch["label_patch"][i].numpy())
-        sample_distance = batch["distance_patch"][i].numpy() if "distance_patch" in batch else None
-        sample_sdf = batch["sdf_patch"][i].numpy() if "sdf_patch" in batch else None
-
-        print(f'Patch {i}')
-        print('  image:', sample_image.min(), sample_image.max())
-        print('  label:', sample_label.min(), sample_label.max())
-        if sample_distance is not None:
-            print('  distance:', sample_distance.min(), sample_distance.max())
-        if sample_sdf is not None:
-            print('  sdf:', sample_sdf.min(), sample_sdf.max())
-
-        num_subplots = 3 + (1 if sample_sdf is not None else 0)
-        fig, axs = plt.subplots(1, num_subplots, figsize=(12, 4))
-        axs[0].imshow(sample_image, cmap='gray' if sample_image.ndim == 2 else None)
-        axs[0].set_title("Image")
-        axs[0].axis("off")
-        axs[1].imshow(sample_label, cmap='gray')
-        axs[1].set_title("Label")
-        axs[1].axis("off")
-        if sample_distance is not None:
-            axs[2].imshow(sample_distance[0], cmap='gray')
-            axs[2].set_title("Distance")
-            axs[2].axis("off")
-        else:
-            axs[2].text(0.5, 0.5, "No Distance", ha='center', va='center')
-            axs[2].axis("off")
-        if sample_sdf is not None:
-            axs[3].imshow(sample_sdf[0], cmap='coolwarm')
-            axs[3].set_title("SDF")
-            axs[3].axis("off")
-        plt.tight_layout()
-        plt.show()
-
-
-def visualize_batch_3d(
-    batch: Dict[str, Any],
-    projection: str = "max",
-    num_per_batch: Optional[int] = None
-) -> None:
-    """
-    Visualizes 3D patches in a batch by projecting along the Z axis.
     
-    Args:
-        batch: dict with keys image_patch, label_patch, etc., each a Tensor [B,C,Z,H,W] or [B,Z,H,W]
-        projection: one of "max", "min", "mean"
-        num_per_batch: how many samples to plot
-    """
-    assert projection in ("max","min","mean"), "projection must be max, min, or mean"
-    
-    # which modalities?
-    print('batch', batch.keys())
-    mods = [k.replace("_patch","") for k in batch if k.endswith("_patch")]
-    print('batch["image_patch"].shape:', batch["image_patch"].shape)
-    num_to_plot = batch["image_patch"].shape[0]
-    if num_per_batch:
-        num_to_plot = min(num_to_plot, num_per_batch)
-    
-    for i in range(num_to_plot):
-        # gather each modality’s volume
-        vols = {}
-        for mod in mods:
-            arr = batch[f"{mod}_patch"][i].numpy()
-            # arr is either (Z,H,W) or (C,Z,H,W)
-            if arr.ndim == 4:
-                # collapse channels by max
-                arr = arr.max(axis=0)
-            vols[mod] = arr  # now Z×H×W
+    def __init__(
+        self,
+        output_dir: str,
+        project_root: str
+    ):
+        """
+        Initialize the ConfigArchiver callback.
         
-        # set up subplot grid: rows=modalities, cols=1
-        nrows = len(mods)
-        ncols = 3
-        fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows))
-        project = {
-            "max": np.max,
-            "min": np.min,
-            "mean": np.mean
+        Args:
+            output_dir: Directory to save the archive to
+            project_root: Root directory of the project containing the code to archive
+        """
+        super().__init__()
+        self.output_dir = output_dir
+        self.project_root = project_root
+        self.logger = logging.getLogger(__name__)
+    
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        Archive configuration and source code at the start of training.
+        
+        Args:
+            trainer: PyTorch Lightning trainer
+            pl_module: PyTorch Lightning module
+        """
+        os.makedirs(self.output_dir, exist_ok=True)
+        timestamp = pl_module.current_epoch
+        archive_name = os.path.join(self.output_dir, f"code_snapshot_{timestamp}.zip")
+        
+        self.logger.info(f"Creating code archive: {archive_name}")
+        
+        with zipfile.ZipFile(archive_name, 'w') as zipf:
+            # Archive configurations
+            config_dir = os.path.join(self.project_root, 'configs')
+            for root, _, files in os.walk(config_dir):
+                for file in files:
+                    if file.endswith('.yaml'):
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, self.project_root)
+                        zipf.write(file_path, arcname)
+            
+            # Archive source code
+            # train.py
+            train_path = os.path.join(self.project_root, 'train.py')
+            if os.path.exists(train_path):
+                zipf.write(train_path, 'train.py')
+            
+            # Core modules
+            core_dir = os.path.join(self.project_root, 'core')
+            for root, _, files in os.walk(core_dir):
+                for file in files:
+                    if file.endswith('.py'):
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, self.project_root)
+                        zipf.write(file_path, arcname)
+            
+            # Models
+            models_dir = os.path.join(self.project_root, 'models')
+            if os.path.exists(models_dir):
+                for root, _, files in os.walk(models_dir):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.project_root)
+                            zipf.write(file_path, arcname)
+            
+            # Losses
+            losses_dir = os.path.join(self.project_root, 'losses')
+            if os.path.exists(losses_dir):
+                for root, _, files in os.walk(losses_dir):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.project_root)
+                            zipf.write(file_path, arcname)
+            
+            # Metrics
+            metrics_dir = os.path.join(self.project_root, 'metrics')
+            if os.path.exists(metrics_dir):
+                for root, _, files in os.walk(metrics_dir):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.project_root)
+                            zipf.write(file_path, arcname)
+        
+        self.logger.info(f"Code archive created: {archive_name}")
+
+
+
+# ------------------------------------
+# core/callbacks/pred_logger.py
+# ------------------------------------
+
+import os
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+import matplotlib.pyplot as plt
+
+class PredictionLogger(Callback):
+    """
+    Validation‐only: accumulates up to `max_samples` and writes one PNG per epoch.
+    Now uses *separate* vmin/vmax for GT vs. prediction.
+    """
+    def __init__(self,
+                 log_dir: str,
+                 log_every_n_epochs: int = 1,
+                 max_samples: int = 4,
+                 cmap: str = "coolwarm"):
+        super().__init__()
+        self.log_dir = log_dir
+        self.log_every_n_epochs = log_every_n_epochs
+        self.max_samples = max_samples
+        self.cmap = cmap
+        self.logger = pl.utilities.logger.get_logs_dir_logger()
+        self._reset_buffers()
+
+    def _reset_buffers(self):
+        self._images = []
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._logged_this_epoch = False
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if (trainer.current_epoch+1) % self.log_every_n_epochs == 0:
+            self._reset_buffers()
+        else:
+            self._logged_this_epoch = True
+
+    def on_validation_batch_end(self,
+                                trainer,
+                                pl_module,
+                                outputs,
+                                batch,
+                                batch_idx,
+                                dataloader_idx=0):
+        if self._logged_this_epoch \
+           or ((trainer.current_epoch+1) % self.log_every_n_epochs != 0):
+            return
+
+        x       = batch[pl_module.input_key].detach().cpu()
+        y_true  = batch[pl_module.target_key].detach().cpu()
+        y_pred  = outputs["predictions"].detach().cpu()
+
+        take = min(self.max_samples - self._collected, x.shape[0])
+        self._images.append(x[:take])
+        self._gts   .append(y_true[:take])
+        self._preds .append(y_pred[:take])
+        self._collected += take
+
+        if self._collected < self.max_samples:
+            return
+
+        imgs  = torch.cat(self._images, dim=0)
+        gts   = torch.cat(self._gts,    dim=0)
+        preds = torch.cat(self._preds,  dim=0)
+
+        # separate signed limits
+        vlim_gt   = float(gts.abs().max())
+        vlim_pred = float(preds.abs().max())
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        filename = os.path.join(
+            self.log_dir,
+            f"pred_epoch_{trainer.current_epoch:06d}.png"
+        )
+
+        fig, axes = plt.subplots(self.max_samples, 3,
+                                 figsize=(12, 4 * self.max_samples),
+                                 tight_layout=True)
+
+        for i in range(self.max_samples):
+            # Input
+            ax = axes[i, 0]
+            if imgs.shape[1] == 1:
+                ax.imshow(imgs[i, 0], cmap='gray')
+            else:
+                im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
+                ax.imshow(im)
+            ax.set_title('Input')
+            ax.axis('off')
+
+            # Ground truth
+            ax = axes[i, 1]
+            ax.imshow(gts[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_gt,
+                      vmax=vlim_gt)
+            ax.set_title('Ground Truth')
+            ax.axis('off')
+
+            # Prediction
+            ax = axes[i, 2]
+            ax.imshow(preds[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_pred,
+                      vmax=vlim_pred)
+            ax.set_title('Prediction')
+            ax.axis('off')
+
+        plt.savefig(filename, dpi=150)
+        plt.close(fig)
+
+        self.logger.info(f"Saved prediction visualization: {filename}")
+        self._logged_this_epoch = True
+
+
+# ------------------------------------
+# core/callbacks/sample_plot.py
+# ------------------------------------
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+
+
+def _gather_from_outputs(batch, outputs, pl_module):
+    """
+    Extract input, ground‑truth and prediction tensors from ``batch`` and
+    ``outputs`` without re‑running the model.
+    """
+    x = batch[pl_module.input_key].float()
+    y = batch[pl_module.target_key].float()
+    if y.dim() == 3:
+        y = y.unsqueeze(1)  # (B, 1, H, W)
+    preds = outputs.get("predictions").float()
+    return x.cpu(), y.cpu(), preds.detach().cpu()
+
+
+def _signed_scale(arr: torch.Tensor, pos_max: float, neg_min: float) -> torch.Tensor:
+    """Scale *signed* ``arr`` so that
+
+    * 0 → 0
+    * (arr > 0) are mapped linearly onto ``(0,  +1]`` where the *largest* value
+      becomes +1.
+    * (arr < 0) are mapped linearly onto ``[−1, 0)`` where the *most‑negative*
+      value becomes −1.
+
+    Positive and negative parts are treated independently so that sign symmetry
+    is preserved.
+    """
+    if pos_max <= 0 and neg_min >= 0:  # all‑zero tensor
+        return torch.zeros_like(arr)
+
+    scaled = arr.clone()
+    if pos_max > 0:
+        pos_mask = scaled > 0
+        scaled[pos_mask] = scaled[pos_mask] / pos_max
+    if neg_min < 0:  # remember: neg_min is ≤ 0
+        neg_mask = scaled < 0
+        scaled[neg_mask] = scaled[neg_mask] / abs(neg_min)
+    return scaled
+
+
+class SamplePlotCallback(pl.Callback):
+    """Log side‑by‑side *input | ground‑truth | prediction* panels during
+    training/validation with **independent colour scaling** for ground‑truth and
+    prediction maps.
+
+    Parameters
+    ----------
+    num_samples:
+        Maximum number of examples to visualise each epoch.
+    cmap:
+        Colormap passed to ``matplotlib.pyplot.imshow`` for signed maps
+        (default: ``"coolwarm"``).
+    """
+
+    def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
+        super().__init__()
+        self.num_samples = num_samples
+        self.cmap = cmap
+        self._reset()
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _reset(self):
+        self._images, self._gts, self._preds = [], [], []
+        self._count = 0
+
+    # epoch hooks --------------------------------------------------------
+    def on_train_epoch_start(self, *_):
+        self._reset()
+
+    def on_validation_epoch_start(self, *_):
+        self._reset()
+
+    # batch hooks --------------------------------------------------------
+    def _collect(self, batch, outputs, pl_module):
+        if self._count >= self.num_samples:
+            return
+        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
+        take = min(self.num_samples - self._count, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._count += take
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    # plotting -----------------------------------------------------------
+    def _plot_and_log(self, tag: str, trainer):
+        imgs = torch.cat(self._images, 0)   # (N, C, H, W)
+        gts  = torch.cat(self._gts, 0)      # (N, 1, H, W)
+        preds = torch.cat(self._preds, 0)   # (N, 1, H, W)
+        n = imgs.size(0)
+
+        # --- independent signed scaling for GT and prediction -------------
+        pos_max_gt,  neg_min_gt  = float(gts.max()),  float(gts.min())
+        pos_max_pr,  neg_min_pr  = float(preds.max()), float(preds.min())
+
+        gts_scaled   = _signed_scale(gts,   pos_max_gt, neg_min_gt)
+        preds_scaled = _signed_scale(preds, pos_max_pr, neg_min_pr)
+
+        # --- plotting -----------------------------------------------------
+        fig, axes = plt.subplots(n, 3, figsize=(9, n * 3), tight_layout=True)
+        if n == 1:
+            axes = axes[None, :]  # always treat as 2‑D array [row, col]
+
+        for i in range(n):
+            img = imgs[i].permute(1, 2, 0)  # CHW → HWC
+            gt  = gts_scaled[i, 0]
+            pr  = preds_scaled[i, 0]
+
+            # input
+            axes[i, 0].imshow(img, cmap="gray")
+            axes[i, 0].set_title("input")
+            axes[i, 0].axis("off")
+
+            # ground‑truth (own scale)
+            axes[i, 1].imshow(gt, cmap=self.cmap, vmin=-1, vmax=1)
+            axes[i, 1].set_title("gt (ind. scaled)")
+            axes[i, 1].axis("off")
+
+            # prediction (own scale)
+            axes[i, 2].imshow(pr, cmap=self.cmap, vmin=-1, vmax=1)
+            axes[i, 2].set_title("pred (ind. scaled)")
+            axes[i, 2].axis("off")
+
+        trainer.logger.experiment.add_figure(
+            f"{tag}_samples", fig, global_step=trainer.current_epoch
+        )
+        plt.close(fig)
+
+    # epoch completion ---------------------------------------------------
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log("train", trainer)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log("validation", trainer)
+
+class SamplePlot3DCallback(SamplePlotCallback):
+    """Extends SamplePlotCallback to also handle 3D volumes by projecting
+    along Z into XY, XZ, YZ slices (via max/min/mean)."""
+
+    def __init__(
+        self,
+        num_samples: int = 5,
+        cmap: str = "coolwarm",
+        projection: str = "max",  # one of "max","min","mean"
+    ):
+        super().__init__(num_samples=num_samples, cmap=cmap)
+        assert projection in ("max", "min", "mean")
+        # map name → torch reduction
+        self._proj_fn = {
+            "max": lambda x, dim: torch.max(x, dim=dim)[0],
+            "min": lambda x, dim: torch.min(x, dim=dim)[0],
+            "mean": lambda x, dim: torch.mean(x, dim=dim),
         }[projection]
-        print(f'Patch {i} ({projection}-projection)')
-        for row, mod in enumerate(mods):
-            vol = vols[mod]
-            # Compute projections along axes:
-            #   XY: collapse Z axis -> (H, W)
-            #   XZ: collapse Y axis -> (Z, W)
-            #   YZ: collapse X axis -> (Z, H) then transpose for display (H, Z)
-            proj_xy = project(vol, axis=0)
-            proj_xz = project(vol, axis=1)
-            proj_yz = project(vol, axis=2).T
 
-            projs = {"XY": proj_xy, "XZ": proj_xz, "YZ": proj_yz}
+    def _project_volume(self, vol: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # vol: (C,Z,H,W) or (Z,H,W)
+        if vol.ndim == 4:
+            # collapse channels first via max
+            vol = torch.max(vol, dim=0)[0]
+        # now vol is (Z,H,W)
+        xy = self._proj_fn(vol, dim=0)           # → (H,W)
+        xz = self._proj_fn(vol, dim=1)           # → (Z,W)
+        yz = self._proj_fn(vol, dim=2).transpose(0, 1)  # → (H,Z)
+        return {"XY": xy, "XZ": xz, "YZ": yz}
 
-            for col, (name, proj) in enumerate(projs.items()):
-                ax = axs[row, col] if nrows > 1 else axs[col]
-                ax.imshow(proj, cmap='gray')
-                ax.set_title(f"{mod} - {name} view")
-                ax.axis("off")
+    def _plot_and_log(self, tag: str, trainer):
+        imgs = torch.cat(self._images, 0)
+        gts  = torch.cat(self._gts, 0)
+        preds = torch.cat(self._preds, 0)
 
-                # Print projection stats
-                print(f'  {mod} {name}: min={proj.min():.3f}, max={proj.max():.3f}, mean={proj.mean():.3f}')
+        # detect 3D volumes by rank
+        if imgs.dim() == 5:  # N×C×Z×H×W
+            n = imgs.size(0)
+            fig, axes = plt.subplots(
+                n, 9, figsize=(9 * 3, n * 3), tight_layout=True
+            )
+            if n == 1:
+                axes = axes[None, :]
 
-        plt.tight_layout()
-        plt.show()
+            for i in range(n):
+                # project each modality
+                mods = {
+                    "input": imgs[i].cpu(),
+                    "gt":    gts[i].cpu().squeeze(0),
+                    "pred":  preds[i].cpu().squeeze(0),
+                }
+                projs = {m: self._project_volume(v) for m, v in mods.items()}
+
+                for col, m in enumerate(("input", "gt", "pred")):
+                    for row, view in enumerate(("XY", "XZ", "YZ")):
+                        ax = axes[i, col*3 + row]
+                        arr = projs[m][view].numpy()
+                        cmap = "gray" if m == "input" else self.cmap
+                        ax.imshow(arr, cmap=cmap)
+                        ax.set_title(f"{m}-{view}")
+                        ax.axis("off")
+
+            trainer.logger.experiment.add_figure(
+                f"{tag}_3d_samples", fig, global_step=trainer.current_epoch
+            )
+            plt.close(fig)
+
+        else:
+            # fallback to the original 2D behavior
+            super()._plot_and_log(tag, trainer)
+
+
+# ------------------------------------
+# core/callbacks/best_metric_ckpt.py
+# ------------------------------------
+
+import os
+import logging
+from glob import glob
+from typing import Any, Dict, List, Optional, Union
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+
+class BestMetricCheckpoint(Callback):
+    """
+    Callback to save checkpoints for the best value of each metric.
+    """
+    
+    def __init__(
+        self, 
+        dirpath: str, 
+        metric_names: List[str],
+        mode: Union[str, Dict[str, str]] = "min",
+        save_last: bool = True,
+        last_k: int = 5,  # Save last checkpoint every k epochs
+        filename_template: str = "best_{metric}"
+    ):
+        """
+        Initialize the BestMetricCheckpoint callback.
+        
+        Args:
+            dirpath: Directory to save checkpoints to
+            metric_names: List of metrics to monitor
+            mode: Either "min", "max", or a dict mapping metric names to "min"/"max"
+            save_last: Whether to save the last checkpoint
+            last_k: Save last checkpoint every k epochs (reduce I/O)
+            filename_template: Template for checkpoint filenames
+        """
+        super().__init__()
+        self.dirpath = dirpath
+        self.metric_names = metric_names
+        self.last_k = last_k
+        
+        # Setup mode for each metric (min or max)
+        self.mode = {}
+        if isinstance(mode, str):
+            for metric in metric_names:
+                self.mode[metric] = mode
+        else:
+            self.mode = mode
+            # Ensure all metrics have a mode
+            for metric in metric_names:
+                if metric not in self.mode:
+                    self.mode[metric] = "min"
+                    
+        self.save_last = save_last
+        self.filename_template = filename_template
+        self.best_values = {}
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize best values
+        for metric in metric_names:
+            if self.mode[metric] == "min":
+                self.best_values[metric] = float('inf')
+            else:
+                self.best_values[metric] = float('-inf')
+    
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        Check metrics at the end of validation and save checkpoint if needed.
+        
+        Args:
+            trainer: PyTorch Lightning trainer
+            pl_module: PyTorch Lightning module
+        """
+        # Create checkpoint directory if it doesn't exist
+        os.makedirs(self.dirpath, exist_ok=True)
+        
+        # Check each metric
+        for metric in self.metric_names:
+            metric_key = f"val_{metric}"
+            if metric_key in trainer.callback_metrics:
+                current_value = trainer.callback_metrics[metric_key].item()
+                
+                is_better = False
+                if self.mode[metric] == "min" and current_value < self.best_values[metric]:
+                    is_better = True
+                    self.best_values[metric] = current_value
+                elif self.mode[metric] == "max" and current_value > self.best_values[metric]:
+                    is_better = True
+                    self.best_values[metric] = current_value
+                
+                if is_better:
+                    filename = f"{self.filename_template.format(metric=metric)}.ckpt"
+                    filepath = os.path.join(self.dirpath, filename)
+                    self.logger.info(f"Saving best {metric} checkpoint: {filepath}")
+                    trainer.save_checkpoint(filepath)
+        
+        # Save last checkpoint if requested (with reduced frequency)
+        if self.save_last and (
+            (trainer.current_epoch+1) % self.last_k == 0 or  # Every k epochs
+            trainer.current_epoch == trainer.max_epochs - 1  # Last epoch
+        ):
+            filename = "last.ckpt"
+            filepath = os.path.join(self.dirpath, filename)
+            trainer.save_checkpoint(filepath)
+            self.logger.info(f"Saved last checkpoint at epoch {trainer.current_epoch}")
+
+
+
+
+
+# ------------------------------------
+# core/callbacks/pred_saver.py
+# ------------------------------------
+import os
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+
+class PredictionSaver(pl.Callback):
+    """
+    Save model predictions and ground truths on train, validation, and test.
+    Works with Lightning 2.x using *_batch_end hooks.
+    """
+    def __init__(
+        self,
+        save_dir: str,
+        save_every_n_epochs: int = 1,
+        save_after_epoch: int = 0,
+        max_samples: Optional[int] = None,
+    ):
+        super().__init__()
+        self.save_dir = save_dir
+        self.every = save_every_n_epochs
+        self.after = save_after_epoch
+        self.max_samples = max_samples
+        self._counter = 0
+
+    def _should_save(self, epoch: int) -> bool:
+        print('epoch, self.every', epoch, self.every)
+        return epoch >= self.after and (epoch+1) % self.every == 0
+
+    def _save_tensor(
+        self,
+        array: np.ndarray,
+        split: str,
+        epoch: int,
+        batch_idx: int,
+        sample_idx: int,
+        which: str
+    ):
+        fname = f"{split}_e{epoch}_b{batch_idx}_i{sample_idx}_{which}.npy"
+        folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
+        os.makedirs(folder, exist_ok=True)
+        np.save(os.path.join(folder, fname), array)
+
+    # # ——— TRAINING HOOKS ———
+    # def on_train_epoch_start(self, trainer, pl_module):
+    #     self._counter = 0
+
+    # def on_train_batch_end(
+    #     self,
+    #     trainer: pl.Trainer,
+    #     pl_module: pl.LightningModule,
+    #     outputs: Dict[str, Any],
+    #     batch: Any,
+    #     batch_idx: int,
+    #     dataloader_idx: int = 0,
+    # ):
+    #     epoch = trainer.current_epoch
+    #     if not self._should_save(epoch):
+    #         return
+
+    #     preds = outputs.get("predictions")
+    #     gts   = outputs.get("gts")
+    #     if preds is None or gts is None:
+    #         return
+
+    #     preds = preds.detach().cpu().numpy()
+    #     gts   = gts.detach().cpu().numpy()
+    #     for i in range(preds.shape[0]):
+    #         if self.max_samples is not None and self._counter >= self.max_samples:
+    #             return
+    #         self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
+    #         self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
+    #         self._counter += 1
+
+    # ——— VALIDATION HOOKS ———
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_validation_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "val", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "val", 0, batch_idx, i, "gt")
+            self._counter += 1
+
+    # ——— TEST HOOKS ———
+    def on_test_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_test_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "test", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "test", epoch, batch_idx, i, "gt")
+            self._counter += 1
+
+
+# ------------------------------------
+# core/callbacks/__init__.py
+# ------------------------------------
+# core/callbacks/__init__.py
+
+from core.callbacks.best_metric_ckpt    import BestMetricCheckpoint
+from core.callbacks.periodic_ckpt       import PeriodicCheckpoint
+from core.callbacks.pred_saver          import PredictionSaver
+from core.callbacks.sample_plot         import SamplePlotCallback, SamplePlot3DCallback
+from core.callbacks.skip_validation     import SkipValidation
+from core.callbacks.config_archiver     import ConfigArchiver
+from core.callbacks.pred_logger   import PredictionLogger   # <<–– add this line
+
+
+# ------------------------------------
+# core/callbacks/skip_validation.py
+# ------------------------------------
+
+import logging
+from pytorch_lightning.callbacks import Callback
+
+class SkipValidation(Callback):
+    """
+    Skip the entire validation loop until a given epoch by zeroing out
+    `trainer.limit_val_batches`. Restores the original setting once the
+    epoch threshold is reached.
+    """
+    def __init__(self, skip_until_epoch: int = 0):
+        super().__init__()
+        self.skip_until_epoch = skip_until_epoch
+        self._original_limit_val_batches = None
+        self.logger = logging.getLogger(__name__)
+
+    def on_fit_start(self, trainer, pl_module):
+        # Capture the user's configured limit_val_batches
+        self._original_limit_val_batches = trainer.limit_val_batches
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.current_epoch < self.skip_until_epoch:
+            if trainer.limit_val_batches != 0:
+                self.logger.info(
+                    f"Skipping validation until epoch {self.skip_until_epoch} "
+                    f"(current: {trainer.current_epoch})"
+                )
+                trainer.limit_val_batches = 0
+        else:
+            # Restore the original setting once we've reached the target epoch
+            if trainer.limit_val_batches == 0:
+                trainer.limit_val_batches = self._original_limit_val_batches
+                self.logger.info(
+                    f"Resuming validation from epoch {trainer.current_epoch}"
+                )
+
 
 # ------------------------------------
 # metrics/dice.py
@@ -5924,7 +5388,7 @@ BIAS = True
 nn_Conv      = lambda three_dimensional: nn.Conv3d if three_dimensional else nn.Conv2d
 nn_ConvTrans = lambda three_dimensional: nn.ConvTranspose3d if three_dimensional else nn.ConvTranspose2d
 nn_BatchNorm = lambda three_dimensional: nn.BatchNorm3d if three_dimensional else nn.BatchNorm2d
-nn_GroupNorm = lambda three_dimensional: nn.BatchNorm3d if three_dimensional else nn.BatchNorm2d
+# nn_GroupNorm = lambda three_dimensional: nn.BatchNorm3d if three_dimensional else nn.BatchNorm2d
 nn_Dropout   = lambda three_dimensional: nn.Dropout3d if three_dimensional else nn.Dropout2d
 nn_MaxPool   = lambda three_dimensional: nn.MaxPool3d if three_dimensional else nn.MaxPool2d
 nn_AvgPool   = lambda three_dimensional: nn.AvgPool3d if three_dimensional else nn.AvgPool2d
@@ -5952,7 +5416,7 @@ def possible_input_size(n_levels, step=2, range=(2,1024)):
 class DownBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels, is_first=False, n_convs=2,
-                 dropout=0.3, batch_norm=True, pooling="max", three_dimensional=False):
+                 dropout=0.3, norm_type='batch', num_groups=8, pooling="max", three_dimensional=False):
         super().__init__()
 
         _3d = three_dimensional
@@ -5969,15 +5433,31 @@ class DownBlock(nn.Module):
                 raise ValueError("Unrecognized option pooling=\"{}\"".format(pooling))
 
         layers.append(nn_Conv(_3d)(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-        if batch_norm:
-            # layers.append(nn_BatchNorm(_3d)(out_channels))
-            layers.append(nn.GroupNorm(8, out_channels))
+        # if batch_norm:
+        #     # layers.append(nn_BatchNorm(_3d)(out_channels))
+        #     layers.append(nn.GroupNorm(8, out_channels))
+        if norm_type=='batch':
+            layers.append(nn_BatchNorm(_3d)(out_channels))
+        elif norm_type=='group':
+            layers.append(nn.GroupNorm(num_groups, out_channels))
+        # elif norm_type=='instance':
+        #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+        # else:  # norm_type is None → no normalization
+        #     pass
         layers.append(nn.ReLU(inplace=True))
         for i in range(n_convs-1):
             layers.append(nn_Conv(_3d)(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-            if batch_norm:
-#                 layers.append(nn_BatchNorm(_3d)(out_channels))
-                layers.append(nn.GroupNorm(8, out_channels))
+#             if batch_norm:
+# #                 layers.append(nn_BatchNorm(_3d)(out_channels))
+#                 layers.append(nn.GroupNorm(8, out_channels))
+            if norm_type=='batch':
+                layers.append(nn_BatchNorm(_3d)(out_channels))
+            elif norm_type=='group':
+                layers.append(nn.GroupNorm(num_groups, out_channels))
+            # elif norm_type=='instance':
+            #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+            # else:  # norm_type is None → no normalization
+            #     pass
             layers.append(nn.ReLU(inplace=True))
         layers.append(nn_Dropout(_3d)(p=dropout))
 
@@ -5989,7 +5469,7 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
 
     def __init__(self, in_channels, n_convs=2, dropout=0.3,
-                 batch_norm=True, upsampling='deconv', three_dimensional=False):
+                 norm_type='batch', num_groups=8, upsampling='deconv', three_dimensional=False, align_corners=False):
         super().__init__()
 
         _3d = three_dimensional
@@ -6003,24 +5483,46 @@ class UpBlock(nn.Module):
                                 nn_BatchNorm(_3d)(out_channels),
                                 nn.ReLU(inplace=True))
             '''
-        elif upsampling in ['nearest', 'bilinear']:
+        elif upsampling in ['nearest', 'bilinear', 'trilinear']:
+            mode = upsampling
+            if _3d and upsampling == 'bilinear':
+                mode = 'trilinear'
+            # align_corners only applies to non-nearest
+            uc = {} if mode=='nearest' else {'align_corners': align_corners}
             self.upsampling = nn.Sequential(
-                                nn.Upsample(size=None, scale_factor=2, mode=upsampling),
+                                nn.Upsample(size=None, scale_factor=2, mode=mode, **uc),
                                 nn_Conv(_3d)(in_channels, out_channels, kernel_size=1, padding=0, bias=BIAS))
         else:
             raise ValueError("Unrecognized upsampling option {}".fomrat(upsampling))
+        
 
         layers = []
         layers.append(nn_Conv(_3d)(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-        if batch_norm:
-#             layers.append(nn_BatchNorm(_3d)(out_channels))
-            layers.append(nn.GroupNorm(8, out_channels))
+#         if batch_norm:
+# #             layers.append(nn_BatchNorm(_3d)(out_channels))
+#             layers.append(nn.GroupNorm(8, out_channels))
+        if norm_type=='batch':
+            layers.append(nn_BatchNorm(_3d)(out_channels))
+        elif norm_type=='group':
+            layers.append(nn.GroupNorm(num_groups, out_channels))
+        # elif norm_type=='instance':
+        #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+        # else:  # norm_type is None → no normalization
+        #     pass
         layers.append(nn.ReLU(inplace=True))
         for i in range(n_convs-1):
             layers.append(nn_Conv(_3d)(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-            if batch_norm:
-#                 layers.append(nn_BatchNorm(_3d)(out_channels))
-                layers.append(nn.GroupNorm(8, out_channels))
+#             if batch_norm:
+# #                 layers.append(nn_BatchNorm(_3d)(out_channels))
+#                 layers.append(nn.GroupNorm(8, out_channels))
+            if norm_type=='batch':
+                layers.append(nn_BatchNorm(_3d)(out_channels))
+            elif norm_type=='group':
+                layers.append(nn.GroupNorm(num_groups, out_channels))
+            # elif norm_type=='instance':
+            #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+            # else:  # norm_type is None → no normalization
+            #     pass
             layers.append(nn.ReLU(inplace=True))
         layers.append(nn_Dropout(_3d)(p=dropout))
 
@@ -6036,7 +5538,7 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
+                 n_levels=3, dropout=0.0, norm_type='batch', num_groups=8, upsampling='bilinear',
                  pooling="max", three_dimensional=False, apply_final_relu=True):
         super().__init__()
 
@@ -6049,7 +5551,8 @@ class UNet(nn.Module):
         self.n_convs = n_convs
         self.n_levels = n_levels
         self.dropout = dropout
-        self.batch_norm = batch_norm
+        self.norm_type = norm_type 
+        self.num_groups = num_groups
         self.upsampling = upsampling
         self.pooling = pooling
         self.three_dimensional = three_dimensional
@@ -6059,9 +5562,9 @@ class UNet(nn.Module):
         channels = [2**x*m_channels for x in range(0, self.n_levels+1)]
 
         down_block = lambda inch, outch, is_first: DownBlock(inch, outch, is_first, n_convs,
-                                                             dropout, batch_norm, pooling,
+                                                             dropout, norm_type, num_groups, pooling,
                                                              three_dimensional)
-        up_block = lambda inch: UpBlock(inch, n_convs, dropout, batch_norm,
+        up_block = lambda inch: UpBlock(inch, n_convs, dropout, norm_type, num_groups,
                                         upsampling, three_dimensional)
 
         # === Down path ===

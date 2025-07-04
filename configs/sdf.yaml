@@ -7,6 +7,7 @@ model_config: "baseline.yaml"
 loss_config: "mixed_topo.yaml"
 metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
+callbacks_config: "callbacks_2d.yaml"
 
 # Output directory
 output_dir: "outputs/base_sdf_mass_lif_640dp"

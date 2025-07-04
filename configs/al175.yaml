@@ -7,9 +7,10 @@ model_config: "baseline_3d.yaml"
 loss_config: "lif_mse_cape.yaml"
 metrics_config: "dice_iou_ccq.yaml"
 inference_config: "chunk_3d.yaml"
+callbacks_config: "callbacks_3d.yaml"
 
 # Output directory
-output_dir: "outputs/base_sdf_mass_lif_640dp"
+output_dir: "outputs/base_al175_lif_cape"
 
 # Trainer configuration
 trainer:
@@ -30,7 +31,7 @@ trainer:
 
   extra_args:
     accelerator: "auto" 
-    precision: 32  
+    precision: 16-mixed  
     deterministic: false
     # gradient_clip_val: 1.0
     # accumulate_grad_batches: 1

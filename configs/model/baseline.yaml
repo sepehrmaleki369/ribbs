@@ -11,10 +11,10 @@ params:
   n_convs: 2
   n_levels: 3
   dropout: 0.1
-  batch_norm: True
+  norm_type: 'batch'
   upsampling: "bilinear"
   pooling: "max"
   in_channels: 3
   out_channels: 1
   apply_final_relu: False
-  
+  # num_groups: 8            # use GroupNorm (8 groups) after each conv

@@ -6,7 +6,7 @@ primary_loss:
   class: "LIFWeightedMSELoss"
   params:
     sdf_min: 0
-    sdf_max: 15.0
+    sdf_max: 20.0
     n_bins: 256
     eps: 0.02
     freeze_after_first: False

@@ -63,10 +63,10 @@ augmentations:
   - "flip_h"
   - "flip_v"
   - "rotation"
-  - "scale"
-  - "elastic"
-  - "brightness_contrast"
-  - "gamma"
+  # - "scale"
+  # - "elastic"
+  # - "brightness_contrast"
+  # - "gamma"
   # - "gaussian_noise"
   # - "gaussian_blur"
   # - "bias_field"
@@ -75,31 +75,31 @@ augmentation_params:
   rotation:
     min: 0.0
     max: 360.0
-  scale:
-    min: 3.8
-    max: 5
-  elastic:
-    alpha_min: 5.0
-    alpha_max: 10.0
-    sigma_min: 3.0
-    sigma_max: 6.0
-  brightness_contrast:
-    alpha_min: 0.9
-    alpha_max: 1.1
-    beta_min: -30.0
-    beta_max: 30.0
-  gamma:
-    min: 0.7
-    max: 1.5
-  gaussian_noise:
-    min: 0.01
-    max: 0.03
-  gaussian_blur:
-    min: 0.5
-    max: 1.5
-  bias_field:
-    min: 0.2
-    max: 0.4
+  # scale:
+  #   min: 3.8
+  #   max: 5
+  # elastic:
+  #   alpha_min: 5.0
+  #   alpha_max: 10.0
+  #   sigma_min: 3.0
+  #   sigma_max: 6.0
+  # brightness_contrast:
+  #   alpha_min: 0.9
+  #   alpha_max: 1.1
+  #   beta_min: -30.0
+  #   beta_max: 30.0
+  # gamma:
+  #   min: 0.7
+  #   max: 1.5
+  # gaussian_noise:
+  #   min: 0.01
+  #   max: 0.03
+  # gaussian_blur:
+  #   min: 0.5
+  #   max: 1.5
+  # bias_field:
+  #   min: 0.2
+  #   max: 0.4
 
 # -----------------------------------------------------------------------------
 # Normalization Settings

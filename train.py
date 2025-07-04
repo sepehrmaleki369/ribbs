@@ -15,11 +15,13 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import LearningRateMonitor
 
-from core.model_loader import load_model
-from core.loss_loader import load_loss
+from core.loaders.callback_loader import load_callbacks
+from core.loaders.model_loader import load_model
+from core.loaders.loss_loader import load_loss
+from core.loaders.metric_loader import load_metrics
+from core.loaders.dataloader import SegmentationDataModule
 from core.mix_loss import MixedLoss
-from core.metric_loader import load_metrics
-from core.dataloader import SegmentationDataModule
+
 from core.callbacks import (
     BestMetricCheckpoint,
     PredictionLogger,
@@ -64,6 +66,7 @@ def main():
     loss_cfg      = load_config(os.path.join("configs", "loss",      main_cfg["loss_config"]))
     metrics_cfg   = load_config(os.path.join("configs", "metrics",   main_cfg["metrics_config"]))
     inference_cfg = load_config(os.path.join("configs", "inference", main_cfg["inference_config"]))
+    callbacks_cfg = load_config(os.path.join("configs", "callbacks", main_cfg["callbacks_config"]))
 
     # --- prepare output & logger ---
     output_dir = main_cfg.get("output_dir", "outputs")
@@ -73,7 +76,6 @@ def main():
 
     # --- trainer params from YAML ---
     trainer_cfg                = main_cfg.get("trainer", {})
-    skip_valid_until_epoch     = trainer_cfg["skip_validation_until_epoch"]
 
     train_metrics_every_n      = trainer_cfg["train_metrics_every_n_epochs"]
     val_metrics_every_n        = trainer_cfg["val_metrics_every_n_epochs"]
@@ -120,54 +122,17 @@ def main():
     )
 
     # --- callbacks ---
-    callbacks: List[pl.Callback] = []
-    ckpt_dir = os.path.join(output_dir, "checkpoints")
-    mkdir(ckpt_dir)
-
-    callbacks.append(BestMetricCheckpoint(
-        dirpath=ckpt_dir,
-        metric_names=list(metric_list.keys()),
-        mode="max",
-        save_last=True,
-        last_k=1,
-    ))
-
-    backup_ckpt_dir = os.path.join(output_dir, "backup_checkpoints")
-    mkdir(backup_ckpt_dir)
-
-    callbacks.append(PeriodicCheckpoint(               # <-- add this block
-        dirpath=backup_ckpt_dir,
-        every_n_epochs=trainer_cfg.get("save_checkpoints_every_n_epochs", 5)
-    ))
-
-    # callbacks.append(SamplePlotCallback(
-    #     num_samples=trainer_cfg["num_samples_plot"],
-    #     cmap=trainer_cfg["cmap_plot"]
-    # ))
-
-    callbacks.append(LearningRateMonitor(logging_interval="epoch"))
-
-    if not args.resume:
-        code_dir = os.path.join(output_dir, "code")
-        mkdir(code_dir)
-        callbacks.append(ConfigArchiver(
-            output_dir=code_dir,
-            project_root=os.path.dirname(os.path.abspath(__file__))
-        ))
-
-    if skip_valid_until_epoch > 0:
-        callbacks.append(SkipValidation(skip_until_epoch=skip_valid_until_epoch))
-
-    pred_save_dir = os.path.join(output_dir, "saved_predictions")
-    mkdir(pred_save_dir)
-    callbacks.append(PredictionSaver(
-        save_dir=pred_save_dir,
-        save_every_n_epochs=trainer_cfg["save_gt_pred_val_test_every_n_epochs"],
-        save_after_epoch=trainer_cfg["save_gt_pred_val_test_after_epoch"],
-        max_samples=trainer_cfg.get('save_gt_pred_max_samples', None),
-    ))
-    logging.getLogger("core.callbacks.PredictionSaver").setLevel(logging.DEBUG)
-
+    callbacks = load_callbacks(
+        callbacks_cfg["callbacks"],
+        output_dir=output_dir,
+        resume=args.resume,
+        skip_valid_until_epoch=trainer_cfg["skip_validation_until_epoch"],
+        save_gt_pred_val_test_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
+        save_gt_pred_val_test_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
+        save_gt_pred_max_samples=trainer_cfg.get("save_gt_pred_max_samples", None),
+        project_root=os.path.dirname(os.path.abspath(__file__)),
+    )
+    
     # --- trainer & logger setup ---
     tb_logger     = TensorBoardLogger(save_dir=output_dir, name="logs")
     trainer_kwargs = dict(trainer_cfg.get("extra_args", {}))
@@ -209,7 +174,7 @@ def main():
             trainer.fit(lit, datamodule=dm)
 
         mgr = CheckpointManager(
-            checkpoint_dir=ckpt_dir,
+            checkpoint_dir=os.path.join(output_dir, "checkpoints"),
             metrics=list(metric_list.keys()),
             default_mode="max"
         )
