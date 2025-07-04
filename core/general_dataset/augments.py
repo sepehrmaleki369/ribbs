@@ -286,24 +286,78 @@ def bias_field_patch(patch: np.ndarray, amplitude: float, data_dim: int) -> np.n
 # Patch extraction + conditional augmentation
 # -----------------------------------------------------------------------------
 
+def extract_data(
+    imgs: Dict[str, np.ndarray],
+    x: int,
+    y: int,
+    z: int,
+    patch_size_xy: int,
+    patch_size_z: Optional[int],
+    data_dim: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Slice a spatial patch from every modality in *imgs*.
 
-def extract_data(imgs: Dict[str, np.ndarray], x: int, y: int, z: int, patch_size_xy: int, patch_size_z: Optional[int] = None) -> Dict[str, np.ndarray]:
-    """Existing helper – unchanged (copied verbatim to keep augments.py self‑contained)."""
+    Parameters
+    ----------
+    imgs : Dict[str, np.ndarray]
+        Each value is one of the following shapes
+          ─ data_dim == 2 →  (H, W)  or  (C, H, W)
+          ─ data_dim == 3 →  (D, H, W)  or  (C, D, H, W)
+    x, y : int
+        Upper-left corner of the XY window.
+    z : int
+        First slice index along the depth axis (ignored for 2-D).
+    patch_size_xy : int
+        Height and width of the square crop.
+    patch_size_z : Optional[int]
+        If given in 3-D mode, take this many slices; otherwise fall back to
+        *patch_size_xy*.
+    data_dim : int
+        2 or 3 – tells the function how to interpret array ranks.
+
+    Returns
+    -------
+    Dict[str, np.ndarray]
+        For every key in *imgs* a new entry ``f"{key}_patch"`` containing the
+        cropped patch (shape preserved except for the spatial dims).
+    """
     data: Dict[str, np.ndarray] = {}
+    psz_z = patch_size_z or patch_size_xy
+
     for key, arr in imgs.items():
-        if arr.ndim == 4:  # C, D, H, W
-            psz = patch_size_z or patch_size_xy
-            data[f"{key}_patch"] = arr[:, z : z + psz, y : y + patch_size_xy, x : x + patch_size_xy]
-        elif arr.ndim == 3:
-            if patch_size_z is not None:
-                data[f"{key}_patch"] = arr[z : z + patch_size_z, y : y + patch_size_xy, x : x + patch_size_xy]
+
+        # ───────────────────────────── 3-D CASE ───────────────────────────── #
+        if data_dim == 3:
+            if arr.ndim == 4:                             # (C, D, H, W)
+                patch = arr[:, z : z + psz_z,
+                               y : y + patch_size_xy,
+                               x : x + patch_size_xy]
+            elif arr.ndim == 3:                           # (D, H, W)
+                patch = arr[z : z + psz_z,
+                             y : y + patch_size_xy,
+                             x : x + patch_size_xy]
             else:
-                data[f"{key}_patch"] = arr[y : y + patch_size_xy, x : x + patch_size_xy]
-        elif arr.ndim == 2:
-            data[f"{key}_patch"] = arr[y : y + patch_size_xy, x : x + patch_size_xy]
+                raise ValueError(f"{key}: expected 3-D or 4-D array, got shape {arr.shape}")
+
+        # ───────────────────────────── 2-D CASE ───────────────────────────── #
+        elif data_dim == 2:
+            if arr.ndim == 3:                             # (C, H, W)
+                patch = arr[:, y : y + patch_size_xy,
+                               x : x + patch_size_xy]
+            elif arr.ndim == 2:                           # (H, W)
+                patch = arr[y : y + patch_size_xy,
+                             x : x + patch_size_xy]
+            else:
+                raise ValueError(f"{key}: expected 2-D or 3-D array, got shape {arr.shape}")
+
         else:
-            raise ValueError("Unsupported array dims")
+            raise ValueError(f"data_dim must be 2 or 3, got {data_dim}")
+
+        data[f"{key}_patch"] = patch
+
     return data
+
 
 
 # -----------------------------------------------------------------------------
@@ -333,7 +387,8 @@ def extract_condition_augmentations(
     data = extract_data(imgs,
                         metadata['x'], metadata['y'], z,
                         patch_size_xy,
-                        patch_size_z)
+                        patch_size_z,
+                        data_dim)
     for key in imgs:
         if key.endswith("_patch"):
             modality = key.replace("_patch", "")

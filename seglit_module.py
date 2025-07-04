@@ -70,6 +70,8 @@ class SegLitModule(pl.LightningModule):
                 m.reset()
 
     def training_step(self, batch, batch_idx):
+        im = batch["image_patch"]
+        print('img shape:', im.shape)
         x = batch[self.input_key].float()
         y = batch[self.target_key].float()
         y_hat = self(x)

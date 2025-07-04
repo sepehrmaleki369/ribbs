@@ -186,6 +186,11 @@ def main():
 
     trainer = pl.Trainer(**trainer_kwargs)
 
+    batch = next(iter(dm.train_dataloader()))
+    print("image_patch shape:", batch["image_patch"].shape)   # (B, C, H, W)
+    print("UNet expects    :", lit.model.in_channels)
+
+
     # --- run ---
     if args.test:
         logger.info("Running test...")

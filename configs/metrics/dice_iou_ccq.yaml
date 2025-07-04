@@ -1,0 +1,41 @@
+# ----------------------------------------
+# Segmentation-metrics configuration
+# ----------------------------------------
+
+metrics:
+
+  # Dice
+  - alias: dice
+    path: metrics.dice
+    class: ThresholdedDiceMetric
+    params:
+      threshold: 0          # 0 splits neg/pos
+      greater_is_road: false # neg < 0  -> road = 1
+      eps: 1e-6
+      multiclass: false
+      zero_division: 1.0
+
+  # IoU
+  - alias: iou
+    path: metrics.iou
+    class: ThresholdedIoUMetric
+    params:
+      threshold: 0
+      greater_is_road: false
+      eps: 1e-6
+      multiclass: false     
+      zero_division: 1.0
+
+  # Connected-components quality
+  - alias: ccq
+    path: metrics.ccq
+    class: ConnectedComponentsQuality
+    params:
+      min_size: 15
+      tolerance: 5           # centroid distance in px
+      threshold: 0
+      greater_is_road: false
+
+# How often to compute each metric
+train_frequencies:   {dice: 1,  iou: 1,  ccq: 20}
+val_frequencies:     {dice: 1,  iou: 1,  ccq: 10}

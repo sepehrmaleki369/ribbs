@@ -8,7 +8,7 @@ BIAS = True
 nn_Conv      = lambda three_dimensional: nn.Conv3d if three_dimensional else nn.Conv2d
 nn_ConvTrans = lambda three_dimensional: nn.ConvTranspose3d if three_dimensional else nn.ConvTranspose2d
 nn_BatchNorm = lambda three_dimensional: nn.BatchNorm3d if three_dimensional else nn.BatchNorm2d
-nn_GroupNorm = lambda three_dimensional: nn.BatchNorm3d if three_dimensional else nn.BatchNorm2d
+# nn_GroupNorm = lambda three_dimensional: nn.BatchNorm3d if three_dimensional else nn.BatchNorm2d
 nn_Dropout   = lambda three_dimensional: nn.Dropout3d if three_dimensional else nn.Dropout2d
 nn_MaxPool   = lambda three_dimensional: nn.MaxPool3d if three_dimensional else nn.MaxPool2d
 nn_AvgPool   = lambda three_dimensional: nn.AvgPool3d if three_dimensional else nn.AvgPool2d
@@ -36,7 +36,7 @@ def possible_input_size(n_levels, step=2, range=(2,1024)):
 class DownBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels, is_first=False, n_convs=2,
-                 dropout=0.3, batch_norm=True, pooling="max", three_dimensional=False):
+                 dropout=0.3, norm_type='batch', num_groups=8, pooling="max", three_dimensional=False):
         super().__init__()
 
         _3d = three_dimensional
@@ -53,15 +53,31 @@ class DownBlock(nn.Module):
                 raise ValueError("Unrecognized option pooling=\"{}\"".format(pooling))
 
         layers.append(nn_Conv(_3d)(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-        if batch_norm:
-            # layers.append(nn_BatchNorm(_3d)(out_channels))
-            layers.append(nn.GroupNorm(8, out_channels))
+        # if batch_norm:
+        #     # layers.append(nn_BatchNorm(_3d)(out_channels))
+        #     layers.append(nn.GroupNorm(8, out_channels))
+        if norm_type=='batch':
+            layers.append(nn_BatchNorm(_3d)(out_channels))
+        elif norm_type=='group':
+            layers.append(nn.GroupNorm(num_groups, out_channels))
+        # elif norm_type=='instance':
+        #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+        # else:  # norm_type is None → no normalization
+        #     pass
         layers.append(nn.ReLU(inplace=True))
         for i in range(n_convs-1):
             layers.append(nn_Conv(_3d)(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-            if batch_norm:
-#                 layers.append(nn_BatchNorm(_3d)(out_channels))
-                layers.append(nn.GroupNorm(8, out_channels))
+#             if batch_norm:
+# #                 layers.append(nn_BatchNorm(_3d)(out_channels))
+#                 layers.append(nn.GroupNorm(8, out_channels))
+            if norm_type=='batch':
+                layers.append(nn_BatchNorm(_3d)(out_channels))
+            elif norm_type=='group':
+                layers.append(nn.GroupNorm(num_groups, out_channels))
+            # elif norm_type=='instance':
+            #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+            # else:  # norm_type is None → no normalization
+            #     pass
             layers.append(nn.ReLU(inplace=True))
         layers.append(nn_Dropout(_3d)(p=dropout))
 
@@ -73,7 +89,7 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
 
     def __init__(self, in_channels, n_convs=2, dropout=0.3,
-                 batch_norm=True, upsampling='deconv', three_dimensional=False):
+                 norm_type='batch', num_groups=8, upsampling='deconv', three_dimensional=False, align_corners=False):
         super().__init__()
 
         _3d = three_dimensional
@@ -87,24 +103,46 @@ class UpBlock(nn.Module):
                                 nn_BatchNorm(_3d)(out_channels),
                                 nn.ReLU(inplace=True))
             '''
-        elif upsampling in ['nearest', 'bilinear']:
+        elif upsampling in ['nearest', 'bilinear', 'trilinear']:
+            mode = upsampling
+            if _3d and upsampling == 'bilinear':
+                mode = 'trilinear'
+            # align_corners only applies to non-nearest
+            uc = {} if mode=='nearest' else {'align_corners': align_corners}
             self.upsampling = nn.Sequential(
-                                nn.Upsample(size=None, scale_factor=2, mode=upsampling),
+                                nn.Upsample(size=None, scale_factor=2, mode=mode, **uc),
                                 nn_Conv(_3d)(in_channels, out_channels, kernel_size=1, padding=0, bias=BIAS))
         else:
             raise ValueError("Unrecognized upsampling option {}".fomrat(upsampling))
+        
 
         layers = []
         layers.append(nn_Conv(_3d)(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-        if batch_norm:
-#             layers.append(nn_BatchNorm(_3d)(out_channels))
-            layers.append(nn.GroupNorm(8, out_channels))
+#         if batch_norm:
+# #             layers.append(nn_BatchNorm(_3d)(out_channels))
+#             layers.append(nn.GroupNorm(8, out_channels))
+        if norm_type=='batch':
+            layers.append(nn_BatchNorm(_3d)(out_channels))
+        elif norm_type=='group':
+            layers.append(nn.GroupNorm(num_groups, out_channels))
+        # elif norm_type=='instance':
+        #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+        # else:  # norm_type is None → no normalization
+        #     pass
         layers.append(nn.ReLU(inplace=True))
         for i in range(n_convs-1):
             layers.append(nn_Conv(_3d)(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=BIAS))
-            if batch_norm:
-#                 layers.append(nn_BatchNorm(_3d)(out_channels))
-                layers.append(nn.GroupNorm(8, out_channels))
+#             if batch_norm:
+# #                 layers.append(nn_BatchNorm(_3d)(out_channels))
+#                 layers.append(nn.GroupNorm(8, out_channels))
+            if norm_type=='batch':
+                layers.append(nn_BatchNorm(_3d)(out_channels))
+            elif norm_type=='group':
+                layers.append(nn.GroupNorm(num_groups, out_channels))
+            # elif norm_type=='instance':
+            #     layers.append(nn.InstanceNorm3d(out_channels) if _3d else nn.InstanceNorm2d(out_channels))
+            # else:  # norm_type is None → no normalization
+            #     pass
             layers.append(nn.ReLU(inplace=True))
         layers.append(nn_Dropout(_3d)(p=dropout))
 
@@ -120,7 +158,7 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, in_channels=1, m_channels=64, out_channels=2, n_convs=1,
-                 n_levels=3, dropout=0.0, batch_norm=False, upsampling='bilinear',
+                 n_levels=3, dropout=0.0, norm_type='batch', num_groups=8, upsampling='bilinear',
                  pooling="max", three_dimensional=False, apply_final_relu=True):
         super().__init__()
 
@@ -133,7 +171,8 @@ class UNet(nn.Module):
         self.n_convs = n_convs
         self.n_levels = n_levels
         self.dropout = dropout
-        self.batch_norm = batch_norm
+        self.norm_type = norm_type 
+        self.num_groups = num_groups
         self.upsampling = upsampling
         self.pooling = pooling
         self.three_dimensional = three_dimensional
@@ -143,9 +182,9 @@ class UNet(nn.Module):
         channels = [2**x*m_channels for x in range(0, self.n_levels+1)]
 
         down_block = lambda inch, outch, is_first: DownBlock(inch, outch, is_first, n_convs,
-                                                             dropout, batch_norm, pooling,
+                                                             dropout, norm_type, num_groups, pooling,
                                                              three_dimensional)
-        up_block = lambda inch: UpBlock(inch, n_convs, dropout, batch_norm,
+        up_block = lambda inch: UpBlock(inch, n_convs, dropout, norm_type, num_groups,
                                         upsampling, three_dimensional)
 
         # === Down path ===

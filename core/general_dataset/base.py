@@ -74,7 +74,7 @@ class GeneralizedDataset(Dataset):
         if self.max_images is not None:
             for key in self.modality_files:
                 self.modality_files[key] = self.modality_files[key][:self.max_images]
-
+                # print(key, 'Max Data Point:', len(self.modality_files[key]))
         # Precompute additional modalities if requested
         if self.save_computed:
             for key in [m for m in self.modalities if m not in ['image', 'label']]:
@@ -113,6 +113,12 @@ class GeneralizedDataset(Dataset):
                 else:
                     raise ValueError(f"Unsupported modality {key}")
             imgs[key] = arr
+        # if self.data_dim == 3:
+        #     for k, v in imgs.items():
+        #         if v.ndim == 3:                # (D, H, W)  →  (1, D, H, W)
+        #             imgs[k] = v[np.newaxis, ...].astype(np.float32)
+        if self.verbose:
+            print('imgs[key] shape:', imgs[key].shape)
         return imgs
 
     def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -142,6 +148,16 @@ class GeneralizedDataset(Dataset):
                 method = cfg.get('method', 'minmax')
                 params = {k: v for k, v in cfg.items() if k != 'method'}
                 data[key] = normalize_image(arr, method=method, **params)
+
+        for key, arr in list(data.items()):
+            if not key.endswith("_patch") or not isinstance(arr, np.ndarray):
+                continue
+            # 2-D image  -> (1, H, W)
+            if arr.ndim == 2:
+                data[key] = arr[np.newaxis, ...]
+            # 3-D volume -> (1, D, H, W)
+            elif arr.ndim == 3 and self.data_dim == 3:
+                data[key] = arr[np.newaxis, ...]
         return data
 
     def __len__(self) -> int:
@@ -389,10 +405,10 @@ if __name__ == "__main__":
     # }
 
     import yaml
-    with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
-        yaml.dump(config, f_out)
-    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/massroads.yaml', 'r') as f:
-        # config = yaml.safe_load(f)
+    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
+        # yaml.dump(config, f_out)
+    with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/AL175.yaml', 'r') as f:
+        config = yaml.safe_load(f)
 
     # Create dataset and dataloader.
     dataset = GeneralizedDataset(config)
