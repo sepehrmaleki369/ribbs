@@ -1,77 +1,129 @@
 import torch
 import torch.nn as nn
+from typing import Tuple
 
 class ThresholdedDiceMetric(nn.Module):
-    """
-    Threshold each channel into a binary mask, then compute standard Dice.
+    r"""
+    Compute thresholded Dice coefficient for binary **or** multi-class
+    predictions in **any** spatial dimensionality.
 
-    Args:
-        threshold (float or str): cut‐off for binarization.
-        eps (float or str): small constant to avoid zero‐division.
-        multiclass (bool or str): if True, macro‐average over channels.
-        zero_division (float or str): returned value when both pred & GT empty.
+    Acceptable input shapes
+    -----------------------
+    * 2-D with channel:  (B, C, H, W)
+    * 2-D no channel:   (B, H, W)                → channel added
+    * 3-D with channel: (B, C, D, H, W)
+    * 3-D no channel:   (B, D, H, W)             → channel added
+
+    Args
+    ----
+    threshold (float): cut-off for binarization.
+    eps (float): small constant to avoid division by zero.
+    multiclass (bool): if True, macro-average over channels.
+    zero_division (float): value to return when both pred & GT are empty.
+    greater_is_road (bool): if True, values > threshold are “positive”.
     """
     def __init__(
         self,
-        threshold=0.5,
-        eps=1e-6,
-        multiclass=False,
-        zero_division=1.0,
-        greater_is_road=True
+        threshold: float = 0.5,
+        eps: float = 1e-6,
+        multiclass: bool = False,
+        zero_division: float = 1.0,
+        greater_is_road: bool = True,
     ):
         super().__init__()
-        # Force numerical types
-        self.threshold     = float(threshold)
-        self.eps           = float(eps)
-        self.multiclass    = bool(multiclass)
-        self.zero_division = float(zero_division)
+        self.threshold      = float(threshold)
+        self.eps            = float(eps)
+        self.multiclass     = bool(multiclass)
+        self.zero_division  = float(zero_division)
         self.greater_is_road = bool(greater_is_road)
 
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
         if self.greater_is_road:
-            return (x >  self.threshold).float()
+            return (x > self.threshold).float()
         else:
-            return (x <=  self.threshold).float()
+            return (x <= self.threshold).float()
+
+    def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
+        # (B, H, W) → (B,1,H,W); (B, D, H, W) → (B,1,D,H,W)
+        if t.dim() == 3:
+            return t.unsqueeze(1)
+        if t.dim() == 4:
+            # could be (B, C, H, W) or (B, D, H, W)
+            # if binary mode & C==1, assume it's already channel
+            if not self.multiclass and t.shape[1] == 1:
+                return t
+            return t.unsqueeze(1)
+        # dims == 5: (B, C, D, H, W) already good
+        return t
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # ensure (N, C, H, W)
-        if y_pred.dim() == 3:
-            y_pred = y_pred.unsqueeze(1)
-        if y_true.dim() == 3:
-            y_true = y_true.unsqueeze(1)
+        # must have at least (B, H, W)
+        if y_pred.dim() < 3 or y_true.dim() < 3:
+            raise ValueError("Expected inputs with at least 3 dims: (B, …, spatial)")
+        # add channel if missing
+        y_pred = self._ensure_channel(y_pred)
+        y_true = self._ensure_channel(y_true)
 
-        N, C, *_ = y_pred.shape
+        if y_pred.shape != y_true.shape:
+            raise ValueError(f"Shape mismatch: pred {y_pred.shape} vs true {y_true.shape}")
+
+        N, C = y_pred.shape[:2]
         if not self.multiclass and C != 1:
-            raise ValueError(f"[ThresholdedDiceMetric] Binary mode expects 1 channel, got {C}")
+            raise ValueError(f"Binary mode expects C=1 channel, got C={C}")
 
-        # binarize
-        y_pred_bin = self._binarize(y_pred)
-        y_true_bin = self._binarize(y_true)
-        # flatten
-        y_pred_flat = y_pred_bin.view(N, C, -1)
-        y_true_flat = y_true_bin.view(N, C, -1)
+        # threshold
+        p = self._binarize(y_pred)
+        g = self._binarize(y_true)
 
-        # intersection and sums
-        inter = (y_pred_flat * y_true_flat).sum(-1)           # (N, C)
-        sums  = y_pred_flat.sum(-1) + y_true_flat.sum(-1)     # (N, C)
+        # sum over all spatial dims
+        spatial = tuple(range(2, p.dim()))
+        inter = (p * g).sum(dim=spatial)           # (B, C)
+        sums  = p.sum(dim=spatial) + g.sum(dim=spatial)  # (B, C)
 
-        # build eps and zero_division as tensors
-        device = y_pred.device
-        eps_tensor = torch.tensor(self.eps, device=device, dtype=inter.dtype)
-        zd_tensor = torch.tensor(self.zero_division, device=device, dtype=inter.dtype)
+        # stable dice
+        eps_t = torch.tensor(self.eps, device=inter.device, dtype=inter.dtype)
+        zd_t  = torch.tensor(self.zero_division, device=inter.device, dtype=inter.dtype)
+        dice  = (2*inter + eps_t) / (sums + eps_t)       # (B, C)
 
-        # dice per sample/class with ε for stability
-        dice = (2 * inter + eps_tensor) / (sums + eps_tensor)     # (N, C)
+        # handle empty
+        empty = (sums == 0)
+        if empty.any():
+            dice = torch.where(empty, zd_t, dice)
 
-        # override exact-zero cases
-        zero_mask = (sums == 0)
-        if zero_mask.any():
-            dice = torch.where(zero_mask, zd_tensor, dice)
+        # reductions
+        per_class = dice.mean(dim=0)            # → (C,)
+        if self.multiclass and C > 1:
+            return per_class.mean()             # macro-avg over classes
+        return per_class.squeeze(0)             # scalar for binary
 
-        # mean over batch → (C,)
-        dice_per_class = dice.mean(0)
+if __name__ == "__main__":
+    # Example usage
+    metric = ThresholdedDiceMetric(threshold=0.5, multiclass=True)
+    y_pred = torch.rand(4, 3, 64, 64)  # Example prediction (B, C, H, W)
+    y_true = torch.randint(0, 2, (4, 3, 64, 64))  # Example ground truth (B, C, H, W)
+    
+    dice_score = metric(y_pred, y_true)
+    print("Dice Score:", dice_score)
 
-        if not self.multiclass or C == 1:
-            return dice_per_class.squeeze(0)
+    metric = ThresholdedDiceMetric(multiclass=False)
 
-        return dice_per_class.mean()
+    # 2D no-channel
+    y2 = torch.rand(2, 32, 32)
+    assert torch.isclose(metric(y2, y2), torch.tensor(1.0))
+
+    # 2D with channel
+    y2c = y2.unsqueeze(1)
+    assert torch.isclose(metric(y2c, y2c), torch.tensor(1.0))
+
+    # 3D no-channel
+    y3 = torch.rand(2, 8, 32, 32)
+    assert torch.isclose(metric(y3, y3), torch.tensor(1.0))
+
+    # 3D with channel
+    y3c = y3.unsqueeze(1)
+    assert torch.isclose(metric(y3c, y3c), torch.tensor(1.0))
+
+    # multiclass
+    metric_mc = ThresholdedDiceMetric(multiclass=True)
+    y_mc = torch.rand(2, 3, 16, 16)
+    assert torch.isclose(metric_mc(y_mc, y_mc), torch.tensor(1.0))

@@ -1,78 +1,147 @@
 import torch
 import torch.nn as nn
+from typing import Tuple
 
 class ThresholdedIoUMetric(nn.Module):
-    """
-    Threshold each channel into binary masks, then compute Intersection-over-Union.
+    r"""
+    Compute thresholded Intersection-over-Union for binary **or** multi-class
+    predictions in **any** spatial dimensionality.
 
-    Args:
-        threshold (float): cut-off for binarization.
-        eps (float): small constant to stabilize non-zero cases.
-        multiclass (bool): if True, macro-average over channels.
-        zero_division (float): value to return when both pred and true are empty (union=0).
+    Acceptable input shapes
+    -----------------------
+    * 2-D with channel:  (B, C, H, W)
+    * 2-D no channel:   (B, H, W)                → channel added
+    * 3-D with channel: (B, C, D, H, W)
+    * 3-D no channel:   (B, D, H, W)             → channel added
+
+    Args
+    ----
+    threshold (float): Binarization cutoff.
+    eps (float): Small constant to avoid division by zero.
+    multiclass (bool): If *True*, macro-average across channels.
+    zero_division (float): IoU to return when both pred & true are empty.
+    greater_is_road (bool): If *True*, voxels **above** threshold are “road”
+                            (foreground); otherwise “road” = `≤ threshold`.
     """
     def __init__(
         self,
-        threshold = 0.5,
-        eps = 1e-6,
-        multiclass = False,
-        zero_division = 1.0,
-        greater_is_road=True
+        threshold: float = 0.5,
+        eps: float = 1e-6,
+        multiclass: bool = False,
+        zero_division: float = 1.0,
+        greater_is_road: bool = True,
     ):
         super().__init__()
-        self.threshold     = float(threshold)
-        self.eps           = float(eps)
-        self.multiclass    = bool(multiclass)
-        self.zero_division = float(zero_division)
+        self.threshold       = float(threshold)
+        self.eps             = float(eps)
+        self.multiclass      = bool(multiclass)
+        self.zero_division   = float(zero_division)
         self.greater_is_road = bool(greater_is_road)
 
+    # --------------------------------------------------------------------- #
+    # helpers
+    # --------------------------------------------------------------------- #
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.greater_is_road:
-            return (x >  self.threshold).float()
-        else:
-            return (x <=  self.threshold).float()
-        
+        return (x > self.threshold).float() if self.greater_is_road else (x <= self.threshold).float()
+    
+    
+    # (B, H, W) → becomes (B, 1, H, W)
+    # (B, D, H, W) → becomes (B, 1, D, H, W)
+    # (B, C, H, W) with C==1 in binary mode → stays (B,1,H,W)
+    # (B, C, H, W) with C>1 in multiclass mode → stays (B,C,H,W)
+    # (B, C, D, H, W) → stays (B,C,D,H,W)
+    def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Insert a channel dimension for:
+          - 2D no-channel: (B, H, W)   → (B, 1, H, W)
+          - 3D no-channel: (B, D, H, W) → (B, 1, D, H, W)
+        Leave (B, C, H, W) and (B, C, D, H, W) untouched.
+        """
+        if t.dim() == 3:
+            # (B, H, W)
+            return t.unsqueeze(1)
+        if t.dim() == 4:
+            # Could be (B, C, H, W) or (B, D, H, W).
+            # If binary-mode and C==1, treat as channel; else assume depth.
+            if not self.multiclass and t.shape[1] == 1:
+                return t
+            return t.unsqueeze(1)
+        # dims == 5: (B, C, D, H, W) → already good
+        return t
+
+    # --------------------------------------------------------------------- #
+    # forward
+    # --------------------------------------------------------------------- #
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # Ensure shape (N, C, H, W)
-        if y_pred.dim() == 3:
-            y_pred = y_pred.unsqueeze(1)
-        if y_true.dim() == 3:
-            y_true = y_true.unsqueeze(1)
+        if y_pred.ndim < 3:
+            raise ValueError("Expected at least 3 dims: (B, …, spatial)")
 
-        N, C, *_ = y_pred.shape
+        # insert channel if needed
+        y_pred = self._ensure_channel(y_pred)
+        y_true = self._ensure_channel(y_true)
+
+        if y_pred.shape != y_true.shape:
+            raise ValueError(f"Shape mismatch: y_pred {y_pred.shape} vs y_true {y_true.shape}")
+
+        N, C = y_pred.shape[:2]
         if not self.multiclass and C != 1:
-            raise ValueError(f"[ThresholdedIoUMetric] Binary mode expects 1 channel, got {C}")
+            raise ValueError(f"Binary mode expects 1 channel, got {C}")
 
-        # Binarize
+        # binarize
         y_pred_bin = self._binarize(y_pred)
         y_true_bin = self._binarize(y_true)
-        
-        # Flatten
-        y_pred_flat = y_pred_bin.view(N, C, -1)
-        y_true_flat = y_true_bin.view(N, C, -1)
 
-        # Intersection and union
-        inter = (y_pred_flat * y_true_flat).sum(-1)                    # (N, C)
-        sum_pred = y_pred_flat.sum(-1)
-        sum_true = y_true_flat.sum(-1)
-        union = sum_pred + sum_true - inter                           # (N, C)
+        # gather all spatial dimensions (2, 3, …)
+        spatial_dims: Tuple[int, ...] = tuple(range(2, y_pred_bin.ndim))
 
-        # IoU per sample/class with ε for stability
-        iou = (inter + self.eps) / (union + self.eps)                  # (N, C)
+        # intersection & union
+        inter = (y_pred_bin * y_true_bin).sum(dim=spatial_dims)          # (B, C)
+        sum_pred = y_pred_bin.sum(dim=spatial_dims)
+        sum_true = y_true_bin.sum(dim=spatial_dims)
+        union = sum_pred + sum_true - inter                              # (B, C)
 
-        # Handle zero-union explicitly: when union == 0, set to zero_division
-        zero_mask = (union == 0)
+        # IoU with ε for numerical stability
+        iou = (inter + self.eps) / (union + self.eps)                    # (B, C)
+
+        # handle empty masks → user-defined value
+        zero_mask = union == 0
         if zero_mask.any():
-            iou = torch.where(zero_mask,
-                              torch.tensor(self.zero_division, device=iou.device),
-                              iou)
+            fill = torch.full_like(iou, self.zero_division)
+            iou = torch.where(zero_mask, fill, iou)
 
-        # Mean over batch → (C,)
-        iou_per_class = iou.mean(0)
+        # reduce batch then, optionally, channels
+        iou_per_class = iou.mean(dim=0)                                  # (C,)
+        return iou_per_class if (self.multiclass and C > 1) else iou_per_class.squeeze(0)
 
-        if not self.multiclass or C == 1:
-            # Binary: return scalar
-            return iou_per_class.squeeze(0)
 
-        # Multiclass: macro-average
-        return iou_per_class.mean()
+
+if __name__ == "__main__":
+    # Example usage
+    metric = ThresholdedIoUMetric(threshold=0.5, multiclass=True)
+    y_pred = torch.rand(4, 3, 32, 32)  # Example prediction tensor
+    y_true = torch.randint(0, 2, (4, 3, 32, 32))  # Example ground truth tensor
+    iou = metric(y_pred, y_true)
+    print("IoU per class:", iou)
+
+    metric = ThresholdedIoUMetric(multiclass=False)
+
+    # 2D no-channel → perfect match → IoU == 1
+    y2 = torch.rand(2, 32, 32)
+    assert metric(y2, y2) == 1.0
+
+    # 2D with channel (explicit C=1)
+    y2c = y2.unsqueeze(1)  # shape (2,1,32,32)
+    assert metric(y2c, y2c) == 1.0
+
+    # 3D no-channel → perfect match → IoU == 1
+    y3 = torch.rand(2, 8, 32, 32)
+    assert metric(y3, y3) == 1.0
+
+    # 3D with channel (explicit C=1)
+    y3c = y3.unsqueeze(1)  # shape (2,1,8,32,32)
+    assert metric(y3c, y3c) == 1.0
+
+    # multiclass mode with C>1
+    metric_mc = ThresholdedIoUMetric(multiclass=True)
+    y2m = torch.rand(2, 3, 32, 32)
+    assert metric_mc(y2m, y2m) == 1.0

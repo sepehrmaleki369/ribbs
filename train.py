@@ -22,15 +22,6 @@ from core.loaders.metric_loader import load_metrics
 from core.loaders.dataloader import SegmentationDataModule
 from core.mix_loss import MixedLoss
 
-from core.callbacks import (
-    BestMetricCheckpoint,
-    PredictionLogger,
-    ConfigArchiver,
-    SkipValidation,
-    SamplePlotCallback,
-    PredictionSaver,
-    PeriodicCheckpoint
-)
 from core.logger import setup_logger
 from core.checkpoint import CheckpointManager
 from core.utils import yaml_read, mkdir
@@ -41,8 +32,9 @@ from seglit_module import SegLitModule
 for lib in ('rasterio', 'matplotlib', 'PIL', 'tensorboard', 'urllib3'):
     logging.getLogger(lib).setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO)
-logging.getLogger('core').setLevel(logging.DEBUG)
-logging.getLogger('__main__').setLevel(logging.DEBUG)
+logging.getLogger('core').setLevel(logging.INFO)
+logging.getLogger('__main__').setLevel(logging.INFO)
+logging.getLogger('seglit_module').setLevel(logging.INFO)
 
 
 def load_config(config_path: str) -> Dict[str, Any]:

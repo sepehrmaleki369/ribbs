@@ -1,4 +1,3 @@
-
 import os
 import logging
 import zipfile
@@ -41,11 +40,22 @@ class ConfigArchiver(Callback):
             pl_module: PyTorch Lightning module
         """
         os.makedirs(self.output_dir, exist_ok=True)
-        timestamp = pl_module.current_epoch
-        archive_name = os.path.join(self.output_dir, f"code_snapshot_{timestamp}.zip")
-        
+        # Use epoch or timestamp
+        identifier = pl_module.current_epoch
+        base_name = f"code_snapshot_{identifier}"
+        archive_name = os.path.join(self.output_dir, f"{base_name}.zip")
+
+        # If file exists, append version suffix
+        version = 1
+        while os.path.exists(archive_name):
+            archive_name = os.path.join(
+                self.output_dir,
+                f"{base_name}_v{version}.zip"
+            )
+            version += 1
+
         self.logger.info(f"Creating code archive: {archive_name}")
-        
+
         with zipfile.ZipFile(archive_name, 'w') as zipf:
             # Archive configurations
             config_dir = os.path.join(self.project_root, 'configs')
@@ -102,4 +112,3 @@ class ConfigArchiver(Callback):
                             zipf.write(file_path, arcname)
         
         self.logger.info(f"Code archive created: {archive_name}")
-

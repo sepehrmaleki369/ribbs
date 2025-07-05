@@ -5,9 +5,9 @@ import skimage.graph
 import random
 import cv2
 from skimage.morphology import skeletonize
-from utils.graph_from_skeleton_3D import graph_from_skeleton as graph_from_skeleton_3D
-from utils.graph_from_skeleton_2D import graph_from_skeleton as graph_from_skeleton_2D
-from utils.crop_graph import crop_graph_2D, crop_graph_3D
+from losses.cape.utils.graph_from_skeleton_3D import graph_from_skeleton as graph_from_skeleton_3D
+from losses.cape.utils.graph_from_skeleton_2D import graph_from_skeleton as graph_from_skeleton_2D
+from losses.cape.utils.crop_graph import crop_graph_2D, crop_graph_3D
 from skimage.draw import line_nd
 from scipy.ndimage import binary_dilation, generate_binary_structure
 import networkx as nx

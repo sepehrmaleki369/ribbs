@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Any, Dict
 import numpy as np
+import logging
 
 from core.mix_loss import MixedLoss
 from core.validator import Validator
@@ -41,6 +42,29 @@ class SegLitModule(pl.LightningModule):
         self.val_freq = val_metrics_every_n_epochs
         self.train_metric_frequencies = train_metric_frequencies or {}
         self.val_metric_frequencies = val_metric_frequencies or {}
+
+        self.py_logger = logging.getLogger(__name__)
+    
+    def log(self, name, value, *args, **kwargs):
+        """
+        Override LightningModule.log so that every time you call self.log(...)
+        it also does a Python-log to console/file.
+        """
+        # 1) call Lightning's logger
+        super().log(name, value, *args, **kwargs)
+
+        # 2) extract a scalar out of value (torch.Tensor or numeric)
+        try:
+            val = value.item()
+        except Exception:
+            val = value
+
+        # 3) log via Python logging
+        #    you can format this how you like; here we print epoch/step context
+        ep = getattr(self, 'current_epoch', None)
+        st = getattr(self.trainer, 'global_step', None)
+        ctx = f"[ep={ep} step={st}]" if ep is not None and st is not None else ""
+        self.py_logger.info(f"{ctx} {name} = {val:.4f}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -97,6 +121,9 @@ class SegLitModule(pl.LightningModule):
         for name, metric in self.metrics.items():
             freq = self.train_metric_frequencies.get(name, self.train_freq)
             if (self.current_epoch+1) % freq == 0:
+                # print('y_int.shape', y_hat.shape)
+                # print('y_int.shape', y_hat.shape)
+                # print(name, metric(y_hat, y_int))
                 self.log(f"train_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         
@@ -160,6 +187,9 @@ class SegLitModule(pl.LightningModule):
         for name, metric in self.metrics.items():
             freq = self.val_metric_frequencies.get(name, self.val_freq)
             if (self.current_epoch+1) % freq == 0:
+                # print('y_int.shape', y_hat.shape)
+                # print('y_int.shape', y_hat.shape)
+                # print(name, metric(y_hat, y_int))
                 self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         
