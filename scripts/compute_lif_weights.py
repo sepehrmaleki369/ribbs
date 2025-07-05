@@ -116,7 +116,7 @@ if __name__ == "__main__":
 
 '''
 python scripts/compute_lif_weights.py \
-  /cvlabdata2/cvlab/home/oner/Sinergia2/AL175-inds/train_index.json \
+  ../Sinergia2/AL175-inds/train_index.json \
   distance \
   --sdf_min 0.0 \
   --sdf_max 15.0 \

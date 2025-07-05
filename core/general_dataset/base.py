@@ -407,7 +407,7 @@ if __name__ == "__main__":
     import yaml
     # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
         # yaml.dump(config, f_out)
-    with open('/cvlabdata2/cvlab/home/oner/Codebase/configs/dataset/AL175_15.yaml', 'r') as f:
+    with open('./configs/dataset/AL175_15.yaml', 'r') as f:
     # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/massroads.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
