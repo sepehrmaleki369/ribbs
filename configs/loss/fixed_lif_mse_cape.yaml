@@ -8,7 +8,6 @@ primary_loss:
     sdf_min: 0
     sdf_max: 15.0
     n_bins: 15
-    eps: 0.02
     reduction: "mean"
     lut_path: "weights/al175_15_lif_weights.pt"
 
