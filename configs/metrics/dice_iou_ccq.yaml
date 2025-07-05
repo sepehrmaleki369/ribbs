@@ -9,7 +9,7 @@ metrics:
     path: metrics.dice
     class: ThresholdedDiceMetric
     params:
-      threshold: 0          # 0 splits neg/pos
+      threshold: 2          # 0 splits neg/pos
       greater_is_road: false # neg < 0  -> road = 1
       eps: 1e-6
       multiclass: false
@@ -20,7 +20,7 @@ metrics:
     path: metrics.iou
     class: ThresholdedIoUMetric
     params:
-      threshold: 0
+      threshold: 2
       greater_is_road: false
       eps: 1e-6
       multiclass: false     
@@ -33,7 +33,7 @@ metrics:
     params:
       min_size: 5
       tolerance: 2           # centroid distance in px
-      threshold: 0
+      threshold: 2
       greater_is_road: false
       data_dim: 3 # 3D data
       # data_dim: 2 # 2D data

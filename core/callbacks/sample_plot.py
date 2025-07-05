@@ -147,73 +147,120 @@ class SamplePlotCallback(pl.Callback):
         if self._count > 0:
             self._plot_and_log("validation", trainer)
 
-class SamplePlot3DCallback(SamplePlotCallback):
-    """Extends SamplePlotCallback to also handle 3D volumes by projecting
-    along Z into XY, XZ, YZ slices (via max/min/mean)."""
+class SamplePlot3DCallback(pl.Callback):
+    """
+    Callback to log sample slices from 3D volumes (Z×H×W) during training/validation.
 
-    def __init__(
-        self,
-        num_samples: int = 5,
-        cmap: str = "coolwarm",
-        projection: str = "max",  # one of "max","min","mean"
-    ):
-        super().__init__(num_samples=num_samples, cmap=cmap)
-        assert projection in ("max", "min", "mean")
-        # map name → torch reduction
-        self._proj_fn = {
-            "max": lambda x, dim: torch.max(x, dim=dim)[0],
-            "min": lambda x, dim: torch.min(x, dim=dim)[0],
-            "mean": lambda x, dim: torch.mean(x, dim=dim),
-        }[projection]
+    Args:
+        num_samples (int): number of samples to log each epoch.
+        projection_view (str): one of 'XY', 'XZ', 'YZ' to project on.
+        cfg (Optional[Dict[str, Dict[str, Any]]]):
+            per-modality settings, e.g.: 
+            {
+              'input': {'cmap': 'gray', 'projection': 'max'},
+              'gt':    {'cmap': 'viridis', 'projection': 'min'},
+              'pred':  {'cmap': 'plasma', 'projection': 'min'},
+            }
+    """
+    def __init__(self, config):
+        super().__init__()
 
-    def _project_volume(self, vol: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # vol: (C,Z,H,W) or (Z,H,W)
-        if vol.ndim == 4:
-            # collapse channels first via max
-            vol = torch.max(vol, dim=0)[0]
-        # now vol is (Z,H,W)
-        xy = self._proj_fn(vol, dim=0)           # → (H,W)
-        xz = self._proj_fn(vol, dim=1)           # → (Z,W)
-        yz = self._proj_fn(vol, dim=2).transpose(0, 1)  # → (H,Z)
-        return {"XY": xy, "XZ": xz, "YZ": yz}
+        self.num_samples = config['num_samples']
+        self.projection_view = config.get('projection_view', 'YZ')
+        self.cfg = config.get('cfg')
+        # default settings per modality
+        self.default_modals = {
+            'input': {'cmap': 'gray', 'projection': 'max'},
+            'gt':    {'cmap': 'gray', 'projection': 'min'},
+            'pred':  {'cmap': 'gray', 'projection': 'min'},
+        }
+        # map view to axis: XY->Z(0), XZ->Y(1), YZ->X(2)
+        self.axis_map = {'XY': 0, 'XZ': 1, 'YZ': 2}
 
-    def _plot_and_log(self, tag: str, trainer):
-        imgs = torch.cat(self._images, 0)
-        gts  = torch.cat(self._gts, 0)
-        preds = torch.cat(self._preds, 0)
+        # **FIX**: initialize buffers immediately so _images always exists
+        self._reset()
 
-        # detect 3D volumes by rank
-        if imgs.dim() == 5:  # N×C×Z×H×W
-            n = imgs.size(0)
-            fig, axes = plt.subplots(
-                n, 9, figsize=(9 * 3, n * 3), tight_layout=True
-            )
-            if n == 1:
-                axes = axes[None, :]
+    def _reset(self):
+        self._images: List[torch.Tensor] = []
+        self._gts:    List[torch.Tensor] = []
+        self._preds:  List[torch.Tensor] = []
+        self._count:  int = 0
 
-            for i in range(n):
-                # project each modality
-                mods = {
-                    "input": imgs[i].cpu(),
-                    "gt":    gts[i].cpu().squeeze(0),
-                    "pred":  preds[i].cpu().squeeze(0),
-                }
-                projs = {m: self._project_volume(v) for m, v in mods.items()}
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._reset()
 
-                for col, m in enumerate(("input", "gt", "pred")):
-                    for row, view in enumerate(("XY", "XZ", "YZ")):
-                        ax = axes[i, col*3 + row]
-                        arr = projs[m][view].numpy()
-                        cmap = "gray" if m == "input" else self.cmap
-                        ax.imshow(arr, cmap=cmap)
-                        ax.set_title(f"{m}-{view}")
-                        ax.axis("off")
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._reset()
 
-            trainer.logger.experiment.add_figure(
-                f"{tag}_3d_samples", fig, global_step=trainer.current_epoch
-            )
-            plt.close(fig)
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
 
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log('train', trainer, pl_module)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log('val', trainer, pl_module)
+
+    def _collect(self, batch, outputs, pl_module):
+        if self._count >= self.num_samples:
+            return
+        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
+        take = min(self.num_samples - self._count, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._count += take
+
+    def _project(self, volume: torch.Tensor, modal: str) -> torch.Tensor:
+        """
+        Project a 3D tensor onto 2D by reducing along the chosen axis,
+        using the right projection type for this modality.
+        """
+        axis = self.axis_map[self.projection_view]
+        modal_cfg = self.cfg.get(modal, {})
+        proj_type = modal_cfg.get('projection', self.default_modals[modal]['projection'])
+        if proj_type == 'min':
+            return volume.min(dim=axis)[0]
         else:
-            # fallback to the original 2D behavior
-            super()._plot_and_log(tag, trainer)
+            return volume.max(dim=axis)[0]
+
+    def _plot_and_log(self, tag: str, trainer, pl_module):
+        imgs  = torch.cat(self._images,  0)  # N × C × Z × H × W
+        gts   = torch.cat(self._gts,     0)
+        preds = torch.cat(self._preds,   0)
+
+        if imgs.dim() != 5:
+            # fallback to 2D callback if implemented upstream
+            super_hook = getattr(super(), f"on_{tag}_epoch_end", None)
+            if callable(super_hook):
+                super_hook(trainer, pl_module)
+            return
+
+        n = imgs.size(0)
+        fig, axes = plt.subplots(n, 3, figsize=(12, n * 4), tight_layout=True)
+        if n == 1:
+            axes = axes[None, :]  # shape (1,3) even for single sample
+
+        for i in range(n):
+            data = {
+                'input': imgs[i].squeeze(0),
+                'gt':    gts[i].squeeze(0),
+                'pred':  preds[i].squeeze(0),
+            }
+            for col, m in enumerate(['input', 'gt', 'pred']):
+                arr = self._project(data[m], m)
+                cmap = self.cfg.get(m, {}).get('cmap', self.default_modals[m]['cmap'])
+                ax = axes[i, col]
+                ax.imshow(arr.numpy(), cmap=cmap)
+                ax.set_title(f"{tag}:{m}-{self.projection_view}")
+                ax.axis('off')
+
+        trainer.logger.experiment.add_figure(
+            f"{tag}_3d_samples", fig, global_step=trainer.current_epoch
+        )
+        plt.close(fig)

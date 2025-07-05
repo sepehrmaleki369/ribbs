@@ -87,9 +87,7 @@ def load_callbacks(
         elif name == "SamplePlot3DCallback":
             callbacks.append(
                 SamplePlot3DCallback(
-                    num_samples=params.get("num_samples", 5),
-                    cmap=params.get("cmap", "coolwarm"),
-                    projection=params.get("projection", "max"),
+                    params
                 )
             )
 

@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
 
 class PredictionSaver(pl.Callback):
     """
@@ -23,11 +22,14 @@ class PredictionSaver(pl.Callback):
         self.after = save_after_epoch
         self.max_samples = max_samples
         self._counter = 0
-        self._saved_val_gts = False
+        # Per‐epoch switch
+        self._save_gts_this_epoch = False
+        # Ever‐saved guard to ensure GTs only once
+        self._gts_already_saved = False
 
     def _should_save(self, epoch: int) -> bool:
-        print('epoch, self.every', epoch, self.every)
-        return epoch >= self.after and (epoch+1) % self.every == 0
+        # print('epoch, self.every', epoch, self.every)
+        return epoch >= self.after and (epoch + 1) % self.every == 0
 
     def _save_tensor(
         self,
@@ -44,39 +46,42 @@ class PredictionSaver(pl.Callback):
         np.save(os.path.join(folder, fname), array)
 
     # # ——— TRAINING HOOKS ———
-    # def on_train_epoch_start(self, trainer, pl_module):
-    #     self._counter = 0
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._counter = 0
 
-    # def on_train_batch_end(
-    #     self,
-    #     trainer: pl.Trainer,
-    #     pl_module: pl.LightningModule,
-    #     outputs: Dict[str, Any],
-    #     batch: Any,
-    #     batch_idx: int,
-    #     dataloader_idx: int = 0,
-    # ):
-    #     epoch = trainer.current_epoch
-    #     if not self._should_save(epoch):
-    #         return
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
 
-    #     preds = outputs.get("predictions")
-    #     gts   = outputs.get("gts")
-    #     if preds is None or gts is None:
-    #         return
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
 
-    #     preds = preds.detach().cpu().numpy()
-    #     gts   = gts.detach().cpu().numpy()
-    #     for i in range(preds.shape[0]):
-    #         if self.max_samples is not None and self._counter >= self.max_samples:
-    #             return
-    #         self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
-    #         self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
-    #         self._counter += 1
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
+            self._counter += 1
 
     # ——— VALIDATION HOOKS ———
     def on_validation_epoch_start(self, trainer, pl_module):
         self._counter = 0
+        # only enable GT saving if this is the first matching epoch
+        epoch = trainer.current_epoch
+        self._save_gts_this_epoch = self._should_save(epoch) and not self._gts_already_saved
 
     def on_validation_batch_end(
         self,
@@ -113,13 +118,16 @@ class PredictionSaver(pl.Callback):
             self._save_tensor(preds_np[i], "val", epoch, batch_idx, i, "pred")
             self._counter += 1
 
-        # only save gts once ever
-        if gts is not None and not self._saved_val_gts:
+        # save gts for every batch—but only in that one epoch
+        if self._save_gts_this_epoch:
             gts_np = gts.detach().cpu().numpy()
-            # you might only need to save one batch (or all of them here)
             for i in range(gts_np.shape[0]):
                 self._save_tensor(gts_np[i], "val", epoch, batch_idx, i, "gt")
-            self._saved_val_gts = True
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # mark that we've done our one-time GT dump
+        if self._save_gts_this_epoch:
+            self._gts_already_saved = True
 
     # ——— TEST HOOKS ———
     def on_test_epoch_start(self, trainer, pl_module):

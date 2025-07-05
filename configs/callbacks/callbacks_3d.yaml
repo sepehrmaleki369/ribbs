@@ -25,8 +25,18 @@ callbacks:
   # 3D sample plots in TensorBoard
   - name: SamplePlot3DCallback
     params:
-      num_samples: 3
-      cmap: coolwarm
+      num_samples: 5            # how many volumes to log per epoch
+      projection_view: YZ       # choose from: 'XY', 'XZ', 'YZ'
+      cfg:
+        input:
+          cmap: gray
+          projection: max
+        gt:
+          cmap: gray
+          projection: min
+        pred:
+          cmap: gray
+          projection: min
 
   # Save raw prediction .npy files
   - name: PredictionSaver
