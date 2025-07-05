@@ -9,7 +9,7 @@ callbacks:
         - dive
         - iou
         - ccq
-        - apls
+        # - apls
       mode: max               # or "min" (or a dict per metric)
       save_last: true
       last_k: 1
@@ -19,7 +19,7 @@ callbacks:
   - name: PeriodicCheckpoint
     params:
       dirpath: backup_checkpoints
-      every_n_epochs: 5
+      every_n_epochs: 1
       prefix: epoch
 
   # 3D sample plots in TensorBoard

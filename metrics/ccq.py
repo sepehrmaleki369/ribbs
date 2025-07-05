@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from skimage import measure
-from typing import List, Tuple, Set
+from typing import Any, List, Tuple, Set
+
 
 class ConnectedComponentsQuality(nn.Module):
     """
@@ -13,7 +14,7 @@ class ConnectedComponentsQuality(nn.Module):
     """
     def __init__(
         self,
-        data_dim: int,
+        data_dim: int = 2,
         min_size: int = 5,
         tolerance: float = 2.0,
         alpha: float = 0.5,
@@ -43,14 +44,13 @@ class ConnectedComponentsQuality(nn.Module):
         self.eps             = float(eps)
 
     def _bin(self, arr: np.ndarray) -> np.ndarray:
-        return (arr > self.threshold) \
-               if self.greater_is_road else (arr <= self.threshold)
+        return (arr > self.threshold) if self.greater_is_road else (arr <= self.threshold)
 
     def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
-        # if (B, H, W) or (B, D, H, W), insert channel at axis=1
+        # If t is (B, H, W) or (B, D, H, W), insert channel at axis=1
         if t.dim() == self.data_dim + 1:
             return t.unsqueeze(1)
-        # else assume channel present: (B,1,H,W) or (B,1,D,H,W)
+        # Else assume channel present: (B,1,H,W) or (B,1,D,H,W)
         return t
 
     def _label_connectivity(self) -> int:
@@ -65,11 +65,11 @@ class ConnectedComponentsQuality(nn.Module):
         Returns:
             scalar CCQ score (higher is better).
         """
-        # must have at least (B,H,W)
+        # check for at least (B,H,W) or (B,D,H,W)
         if y_pred.dim() < self.data_dim + 1 or y_true.dim() < self.data_dim + 1:
             raise ValueError(f"Inputs must be at least {(self.data_dim+1)}-D")
-        
-        # unify channel: after this both are (B,1,...) 
+
+        # unify channel dimension
         y_pred = self._ensure_channel(y_pred)
         y_true = self._ensure_channel(y_true)
         if y_pred.shape != y_true.shape:
@@ -86,30 +86,28 @@ class ConnectedComponentsQuality(nn.Module):
             pred_np = self._bin(y_pred[b,0].detach().cpu().numpy()).astype(np.uint8)
             true_np = self._bin(y_true[b,0].detach().cpu().numpy()).astype(np.uint8)
 
-            # both empty?
+            # If ground truth is empty
             if true_np.sum() == 0:
-                scores.append(1.0 if pred_np.sum()==0 else 0.0)
+                scores.append(1.0 if pred_np.sum() == 0 else 0.0)
                 continue
 
-            # label components
-            true_lbl = measure.label(true_np,  connectivity=conn)
-            pred_lbl = measure.label(pred_np,  connectivity=conn)
+            # label connected components
+            true_lbl = measure.label(true_np, connectivity=conn)
+            pred_lbl = measure.label(pred_np, connectivity=conn)
 
-            true_props = [p for p in measure.regionprops(true_lbl)
-                          if p.area >= self.min_size]
-            pred_props = [p for p in measure.regionprops(pred_lbl)
-                          if p.area >= self.min_size]
+            true_props = [p for p in measure.regionprops(true_lbl) if p.area >= self.min_size]
+            pred_props = [p for p in measure.regionprops(pred_lbl) if p.area >= self.min_size]
 
-            # no significant GT
+            # no significant GT components
             if not true_props:
                 scores.append(1.0 if not pred_props else 0.0)
                 continue
-            # no significant pred
+            # no significant predicted components
             if not pred_props:
                 scores.append(0.0)
                 continue
 
-            # match by centroid
+            # match components by centroid
             matches = self._match_components(true_props, pred_props)
 
             tp = len(matches)
@@ -117,7 +115,7 @@ class ConnectedComponentsQuality(nn.Module):
             fn = len(true_props) - tp
             detection = tp / (tp + fp + fn + self.eps)
 
-            # shape: avg IoU over matches
+            # shape: mean IoU over matched pairs
             shape_scores = []
             for t_idx, p_idx in matches:
                 t_mask = (true_lbl == true_props[t_idx].label)
@@ -127,17 +125,19 @@ class ConnectedComponentsQuality(nn.Module):
                 shape_scores.append(inter / (union + self.eps))
             shape = float(np.mean(shape_scores)) if shape_scores else 0.0
 
-            scores.append(self.alpha * detection + (1-self.alpha) * shape)
+            scores.append(self.alpha * detection + (1 - self.alpha) * shape)
 
-        return torch.tensor(float(np.mean(scores)), device=y_pred.device)
+        avg = float(np.mean(scores))
+        return torch.tensor(avg, device=y_pred.device)
 
     def _match_components(
         self,
-        true_props: List[measure._regionprops.RegionProperties],
-        pred_props: List[measure._regionprops.RegionProperties],
-    ) -> List[Tuple[int,int]]:
-        matches: List[Tuple[int,int]] = []
+        true_props: List[Any],
+        pred_props: List[Any],
+    ) -> List[Tuple[int, int]]:
+        matches: List[Tuple[int, int]] = []
         used_pred: Set[int] = set()
+
         for t_idx, t_prop in enumerate(true_props):
             tx, ty = t_prop.centroid[:2]
             best_dist, best_idx = float('inf'), None
@@ -145,10 +145,11 @@ class ConnectedComponentsQuality(nn.Module):
                 if p_idx in used_pred:
                     continue
                 px, py = p_prop.centroid[:2]
-                d = np.hypot(tx-px, ty-py)
+                d = np.hypot(tx - px, ty - py)
                 if d <= self.tolerance and d < best_dist:
                     best_dist, best_idx = d, p_idx
             if best_idx is not None:
                 matches.append((t_idx, best_idx))
                 used_pred.add(best_idx)
+
         return matches

@@ -4,8 +4,8 @@ split_cfg:
   seed: 42
   sources:
     - type: "ratio"
-      path: "/home/ri/Desktop/Projects/Datasets/AL175"
-      # path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
+      # path: "/home/ri/Desktop/Projects/Datasets/AL175"
+      path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
       layout: "flat"
       modalities:
         image:
@@ -48,7 +48,7 @@ distance_threshold: 20.0          # clip distance maps (null = no clip)
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 16
+train_batch_size: 32
 val_batch_size: 1
 test_batch_size: 1
 num_workers: 4
@@ -74,21 +74,21 @@ augmentation_params:
     min: 0.0
     max: 360.0
   scale:
-    min: 3.8
-    max: 5
+    min: 0.75
+    max: 1.25
   elastic:
-    alpha_min: 5.0
-    alpha_max: 10.0
-    sigma_min: 3.0
-    sigma_max: 6.0
+    alpha_min: 1.0
+    alpha_max: 2.0
+    sigma_min: 4.0
+    sigma_max: 8.0
   brightness_contrast:
     alpha_min: 0.9
     alpha_max: 1.1
-    beta_min: -30.0
-    beta_max: 30.0
+    beta_min: -10.0
+    beta_max: 20.0
   gamma:
-    min: 0.7
-    max: 1.5
+    min: 0.8
+    max: 1.2
   # gaussian_noise:
   #   min: 0.01
   #   max: 0.03

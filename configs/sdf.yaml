@@ -24,10 +24,6 @@ trainer:
   save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
   save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
   # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
-  save_checkpoints_every_n_epochs: 1
-
-  num_samples_plot: 5
-  cmap_plot: "coolwarm"
 
   extra_args:
     accelerator: "auto" 
@@ -36,8 +32,6 @@ trainer:
     # gradient_clip_val: 1.0
     # accumulate_grad_batches: 1
     # max_time: "24:00:00"
-
-
 
 # Optimizer configuration
 optimizer:

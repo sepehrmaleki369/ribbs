@@ -31,11 +31,13 @@ metrics:
     path: metrics.ccq
     class: ConnectedComponentsQuality
     params:
-      min_size: 15
-      tolerance: 5           # centroid distance in px
+      min_size: 5
+      tolerance: 2           # centroid distance in px
       threshold: 0
       greater_is_road: false
+      data_dim: 3 # 3D data
+      # data_dim: 2 # 2D data
 
 # How often to compute each metric
-train_frequencies:   {dice: 1,  iou: 1,  ccq: 20}
-val_frequencies:     {dice: 1,  iou: 1,  ccq: 10}
+train_frequencies:   {dice: 1,  iou: 1,  ccq: 5}
+val_frequencies:     {dice: 1,  iou: 1,  ccq: 5}

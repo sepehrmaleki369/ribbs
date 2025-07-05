@@ -19,7 +19,7 @@ callbacks:
   - name: PeriodicCheckpoint
     params:
       dirpath: backup_checkpoints
-      every_n_epochs: 5
+      every_n_epochs: 1
       prefix: epoch
 
   # 2D sample plots in TensorBoard
