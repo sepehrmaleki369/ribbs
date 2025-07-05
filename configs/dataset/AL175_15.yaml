@@ -2,25 +2,23 @@
 seed: 42  # Random seed
 split_cfg:
   seed: 42
-  index_save_pth: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/"
+  index_save_pth: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175-inds"
   sources:
-    - type: "folder"
-      path: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-      # path: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
-      layout: "folders"
+    - type: "ratio"
+      # path: "/home/ri/Desktop/Projects/Datasets/AL175"
+      path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
+      layout: "flat"
       modalities:
         image:
-          folder: "sat"
+          pattern: "^cube_(.*)\\.npy$"
         label:
-          folder: "label"
-        # distance:
-          # folder: "distance"
-        sdf:
-          folder: "sdf"
-      splits:
-        train: "train"
-        valid: "valid"
-        test:  "test"
+          pattern: "^lbl_(.*)\\.npy$"
+        distance:
+          pattern: "^distlbl_(.*)\\.npy$"
+      ratios:
+        train: 0.75
+        valid: 0.2
+        test:  0.05
 
 base_modalities: ["label", "image"]
 
@@ -28,13 +26,13 @@ base_modalities: ["label", "image"]
 # -----------------------------------------------------------------------------
 # Dimensionality & Patch Extraction
 # -----------------------------------------------------------------------------
-data_dim: 2                # 2 = 2D patches, 3 = 3D volumes
-patch_size: 512            # XY patch size
-# patch_size_z: 16           # Z-depth (only for 3D)
+data_dim: 3                # 2 = 2D patches, 3 = 3D volumes
+patch_size: 96            # XY patch size
+patch_size_z: 96           # Z-depth (only for 3D)
 small_window_size: 8       # window for texture/variance check
 validate_road_ratio: false # enforce minimum label coverage
 threshold: 0.05            # minimum road fraction if above = true
-max_images: 2           # limit number of loaded images (null = no limit)
+# max_images: 10           # limit number of loaded images (null = no limit)
 # max_images: null           # limit number of loaded images (null = no limit)
 # max_attempts: 10           # retries to find a valid patch
 
@@ -44,14 +42,14 @@ max_images: 2           # limit number of loaded images (null = no limit)
 save_computed: true               # save new distance/SDF files
 compute_again_modalities: false   # overwrite existing if true
 
-# distance_threshold: 20.0          # clip distance maps (null = no clip)
-sdf_iterations: 3                 # dilation iterations before SDF
-sdf_thresholds: [-7, 7]           # clip range for SDF values
+distance_threshold: 15.0          # clip distance maps (null = no clip)
+# sdf_iterations: 3                 # dilation iterations before SDF
+# sdf_thresholds: [-7, 7]           # clip range for SDF values
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 64
+train_batch_size: 32
 val_batch_size: 1
 test_batch_size: 1
 num_workers: 4
@@ -64,10 +62,10 @@ augmentations:
   - "flip_h"
   - "flip_v"
   - "rotation"
-  # - "scale"
-  # - "elastic"
-  # - "brightness_contrast"
-  # - "gamma"
+  - "scale"
+  - "elastic"
+  - "brightness_contrast"
+  - "gamma"
   # - "gaussian_noise"
   # - "gaussian_blur"
   # - "bias_field"
@@ -76,22 +74,22 @@ augmentation_params:
   rotation:
     min: 0.0
     max: 360.0
-  # scale:
-  #   min: 3.8
-  #   max: 5
-  # elastic:
-  #   alpha_min: 5.0
-  #   alpha_max: 10.0
-  #   sigma_min: 3.0
-  #   sigma_max: 6.0
-  # brightness_contrast:
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  #   beta_min: -30.0
-  #   beta_max: 30.0
-  # gamma:
-  #   min: 0.7
-  #   max: 1.5
+  scale:
+    min: 0.75
+    max: 1.25
+  elastic:
+    alpha_min: 1.0
+    alpha_max: 2.0
+    sigma_min: 4.0
+    sigma_max: 8.0
+  brightness_contrast:
+    alpha_min: 0.9
+    alpha_max: 1.1
+    beta_min: -10.0
+    beta_max: 20.0
+  gamma:
+    min: 0.8
+    max: 1.2
   # gaussian_noise:
   #   min: 0.01
   #   max: 0.03
@@ -109,11 +107,11 @@ augmentation_params:
 normalization:
   # 1) Min–Max scaling: linearly map [old_min, old_max] → [new_min, new_max]
   image:
-    method: "minmax"     # options: minmax, zscore, robust, percentile, clip
-    old_min: 0.0         # lower bound of your data range (or null to infer from image)
-    old_max: 255.0       # upper bound of your data range (or null to infer from image)
-    new_min: 0.0         # target lower bound
-    new_max: 1.0         # target upper bound
+    method: "zscore"     # options: minmax, zscore, robust, percentile, clip
+    eps: !!float 1e-8         # lower bound of your data range (or null to infer from image)
+    # old_max: 255.0       # upper bound of your data range (or null to infer from image)
+    # new_min: 0.0         # target lower bound
+    # new_max: 1.0         # target upper bound
 
   # # 2) Z-Score normalization: subtract mean, divide by stddev
   # distance: 

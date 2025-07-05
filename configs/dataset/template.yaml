@@ -5,6 +5,7 @@
 split: "train"             # Which split to load: "train", "valid", or "test"
 
 split_cfg:
+  index_save_pth: "/path/to/save_inds.json"
   sources:
     # 1) Folder-based split
     - type: "folder"

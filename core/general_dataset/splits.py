@@ -224,6 +224,83 @@ def _collect_datapoints_from_source(src: Dict[str, Any], base_modalities, rng):
     
     return records
 
+def split_records(src, records, rng):
+    """
+    Assigns a 'split' field to each record in `records` based on the split strategy in `src`.
+
+    - For 'ratio': groups by stem, shuffles, and slices by the provided ratios.
+    - For 'kfold': performs K-fold cross-validation on stems, using fold_idx as the held-out fold.
+    """
+    split_type = src.get('type')
+    if split_type == 'folder':  
+        return records
+    
+    # RATIO-BASED SPLIT
+    if split_type == 'ratio':
+        # Collect unique stems
+        stems = sorted({r['stem'] for r in records})
+        # Shuffle with seed if provided
+        # seed = src.get('seed', None)
+        # if seed is not None:
+        #     random.Random(seed).shuffle(stems)
+        # else:
+        #     random.shuffle(stems)
+        rng.shuffle(stems)
+
+        ratios = src.get('ratios', {})
+        train_ratio = ratios.get('train', 0)
+        valid_ratio = ratios.get('valid', 0)
+        # test_ratio implied
+        n = len(stems)
+        n_train = int(n * train_ratio)
+        n_valid = int(n * valid_ratio)
+        # Ensure all accounted for
+        n_test = n - n_train - n_valid
+
+        train_stems = set(stems[:n_train])
+        valid_stems = set(stems[n_train:n_train + n_valid])
+        test_stems  = set(stems[n_train + n_valid:])
+
+        # Assign splits
+        for rec in records:
+            s = rec['stem']
+            if s in train_stems:
+                rec['split'] = 'train'
+            elif s in valid_stems:
+                rec['split'] = 'valid'
+            else:
+                rec['split'] = 'test'
+        return records
+
+    # K-FOLD SPLIT
+    elif split_type == 'kfold':
+        num_folds = src.get('num_folds')
+        fold_idx  = src.get('fold_idx', 0)
+        # Collect unique stems
+        stems = sorted({r['stem'] for r in records})
+        # Prepare KFold
+        kf = KFold(n_splits=num_folds,
+                   shuffle=True,
+                   random_state=src.get('seed', None))
+        # Find the train/valid split for the requested fold
+        for idx, (train_idx, valid_idx) in enumerate(kf.split(stems)):
+            if idx == fold_idx:
+                train_stems = {stems[i] for i in train_idx}
+                valid_stems = {stems[i] for i in valid_idx}
+                break
+
+        # Assign splits
+        for rec in records:
+            if rec['stem'] in train_stems:
+                rec['split'] = 'train'
+            elif rec['stem'] in valid_stems:
+                rec['split'] = 'valid'
+                
+        return records
+
+    else:
+        raise ValueError(f"Unsupported split type: {split_type}")
+
 class Split:
     """
     Unified splitter with support for 'folder', 'ratio', and 'kfold' sources.
@@ -232,6 +309,11 @@ class Split:
     def __init__(self, cfg: Dict[str, Any], base_modalities: List[str]) -> None:
         self.cfg = cfg
         self.seed = cfg.get("seed", 0)
+        self.index_save_pth = cfg.get("index_save_pth", None)
+
+        if self.index_save_pth:
+            os.makedirs(self.index_save_pth, exist_ok=True)
+            
         random.seed(self.seed)
         np.random.seed(self.seed)
 
@@ -312,6 +394,21 @@ class Split:
         self._split2mod2files = split2mod2files
         self._splits_built    = True
 
+        if self.index_save_pth:
+            self._save_indices()
+
+    def _save_indices(self) -> None:
+        """
+        Save the file list for each modality in each split as JSON.
+        """
+        import json
+        for split, mod2files in self._split2mod2files.items():
+            index = {mod: files for mod, files in mod2files.items()}
+            fname = os.path.join(self.index_save_pth, f"{split}_index.json")
+            with open(fname, 'w') as f:
+                json.dump(index, f, indent=2)
+            print(f"Saved index for split '{split}' to {fname}")
+
     def _collect_datapoints_for(self, src: Dict[str, Any]) -> List[Dict[str, str]]:
         records = _collect_datapoints_from_source(src, self.base_modalities, self._rng)
         if src.get('type')=='kfold':
@@ -320,82 +417,6 @@ class Split:
             records.extend([rec for rec in test_records if rec['split']=='test'])
         return records
     
-def split_records(src, records, rng):
-    """
-    Assigns a 'split' field to each record in `records` based on the split strategy in `src`.
-
-    - For 'ratio': groups by stem, shuffles, and slices by the provided ratios.
-    - For 'kfold': performs K-fold cross-validation on stems, using fold_idx as the held-out fold.
-    """
-    split_type = src.get('type')
-    if split_type == 'folder':  
-        return records
-    
-    # RATIO-BASED SPLIT
-    if split_type == 'ratio':
-        # Collect unique stems
-        stems = sorted({r['stem'] for r in records})
-        # Shuffle with seed if provided
-        # seed = src.get('seed', None)
-        # if seed is not None:
-        #     random.Random(seed).shuffle(stems)
-        # else:
-        #     random.shuffle(stems)
-        rng.shuffle(stems)
-
-        ratios = src.get('ratios', {})
-        train_ratio = ratios.get('train', 0)
-        valid_ratio = ratios.get('valid', 0)
-        # test_ratio implied
-        n = len(stems)
-        n_train = int(n * train_ratio)
-        n_valid = int(n * valid_ratio)
-        # Ensure all accounted for
-        n_test = n - n_train - n_valid
-
-        train_stems = set(stems[:n_train])
-        valid_stems = set(stems[n_train:n_train + n_valid])
-        test_stems  = set(stems[n_train + n_valid:])
-
-        # Assign splits
-        for rec in records:
-            s = rec['stem']
-            if s in train_stems:
-                rec['split'] = 'train'
-            elif s in valid_stems:
-                rec['split'] = 'valid'
-            else:
-                rec['split'] = 'test'
-        return records
-
-    # K-FOLD SPLIT
-    elif split_type == 'kfold':
-        num_folds = src.get('num_folds')
-        fold_idx  = src.get('fold_idx', 0)
-        # Collect unique stems
-        stems = sorted({r['stem'] for r in records})
-        # Prepare KFold
-        kf = KFold(n_splits=num_folds,
-                   shuffle=True,
-                   random_state=src.get('seed', None))
-        # Find the train/valid split for the requested fold
-        for idx, (train_idx, valid_idx) in enumerate(kf.split(stems)):
-            if idx == fold_idx:
-                train_stems = {stems[i] for i in train_idx}
-                valid_stems = {stems[i] for i in valid_idx}
-                break
-
-        # Assign splits
-        for rec in records:
-            if rec['stem'] in train_stems:
-                rec['split'] = 'train'
-            elif rec['stem'] in valid_stems:
-                rec['split'] = 'valid'
-                
-        return records
-
-    else:
-        raise ValueError(f"Unsupported split type: {split_type}")
 
 
 def main():

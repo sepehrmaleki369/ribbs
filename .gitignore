@@ -4,6 +4,7 @@ AllFayzad/
 *.ckpt
 tmp*
 epoch*
+weights*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
