@@ -84,7 +84,7 @@ class BestMetricCheckpoint(Callback):
             # print('trainer.callback_metrics:', trainer.callback_metrics)
             if metric_key in trainer.callback_metrics:
                 current_value = trainer.callback_metrics[metric_key].item()
-                print(f"Current value for {metric}: {current_value}")
+                self.logger.info(f"Current value for {metric}: {current_value}")
                 is_better = False
                 if self.mode[metric] == "min" and current_value < self.best_values[metric]:
                     is_better = True

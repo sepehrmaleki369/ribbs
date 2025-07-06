@@ -388,7 +388,6 @@ class Split:
             print(f"→ Split '{sp}': {stem_count} stems")
             for mod, files in mod2files.items():
                 print(f"     {mod:8s}: {len(files)} files")
-            print()
         # ---- end summary ----
 
         self._split2mod2files = split2mod2files
