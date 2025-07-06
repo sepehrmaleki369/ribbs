@@ -36,6 +36,11 @@ def compute_angle_degree(c, p0, p1):
     p1c = np.sqrt((c[0]-p1[0])**2+(c[1]-p1[1])**2+(c[2]-p1[2])**2)
     p0p1 = np.sqrt((p1[0]-p0[0])**2+(p1[1]-p0[1])**2+(p1[2]-p0[2])**2)
     return np.arccos((p1c*p1c+p0c*p0c-p0p1*p0p1)/(2*p1c*p0c))*180/np.pi
+    # cos_val = (p1c*p1c + p0c*p0c - p0p1*p0p1) / (2 * p1c * p0c)
+    ## clamp to [-1, 1] to guard against floating-point drift
+    # cos_val = np.clip(cos_val, -1.0, 1.0)
+    # angle_rad = np.arccos(cos_val)
+    # return angle_rad * 180.0 / np.pi
 
 def distance_point_line(c,p0,p1):
     return np.linalg.norm(np.cross(p0-c, c-p1))/np.linalg.norm(p1-p0)
