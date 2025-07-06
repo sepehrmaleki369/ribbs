@@ -41,8 +41,6 @@ class MixedLoss(nn.Module):
             and self.training                       # train() vs eval()
             and self.current_epoch >= self.start_epoch
         )
-        print(self.training)
-        
         if use_secondary:
             s = self.secondary_loss(y_pred, y_true)
         else:
