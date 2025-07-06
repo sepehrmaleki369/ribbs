@@ -2,11 +2,12 @@
 seed: 42  # Random seed
 split_cfg:
   seed: 42
-  index_save_pth: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset/"
+  # index_save_pth: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/inds"
+  index_save_pth: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/mass-inds"
   sources:
     - type: "folder"
-      path: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
-      # path: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
+      # path: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+      path: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
       layout: "folders"
       modalities:
         image:
@@ -34,7 +35,7 @@ patch_size: 512            # XY patch size
 small_window_size: 8       # window for texture/variance check
 validate_road_ratio: false # enforce minimum label coverage
 threshold: 0.05            # minimum road fraction if above = true
-max_images: 2           # limit number of loaded images (null = no limit)
+# max_images: 2           # limit number of loaded images (null = no limit)
 # max_images: null           # limit number of loaded images (null = no limit)
 # max_attempts: 10           # retries to find a valid patch
 

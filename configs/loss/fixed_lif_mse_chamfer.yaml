@@ -1,0 +1,42 @@
+# Mixed Topological Loss Configuration
+
+# Primary loss (used from the beginning)
+primary_loss:
+  path: "losses.fixed_lif_weighted_mse"
+  class: "FixedLUTWeightedMSELoss"
+  params:
+    sdf_min: -7
+    sdf_max: 7.0
+    n_bins: 15
+    reduction: "mean"
+    lut_path: "weights/mass_7_lif_weights.pt"
+
+  # path: "losses.weighted_mse"
+  # class: "WeightedMSELoss"
+  # params:
+  #   road_weight: 4
+  #   bg_weight: 1
+  #   threshold: 0
+  #   greater_is_road: False
+  #   reduction: mean
+
+  # class: "MSELoss"  # Built-in PyTorch loss
+  # params: {}
+
+# # Secondary loss (activated after start_epoch)
+secondary_loss:
+  path: "losses.vectorized_chamfer"  # Path to the module containing the loss
+  class: "ChamferBoundarySDFLossVec"  # Name of the loss class
+  params:
+    update_scale: 1.0     # scale applied to the gradient projection
+    dist_threshold: 3.0   # max distance (in pixels) to consider a match
+    w_inject: 1.0         # weight for the “inject” term
+    w_pixel: 1.0          # weight for the “pixel” term
+
+# # Mixing parameters
+alpha: 0.5  # Weight for the secondary loss (0 to 1)
+start_epoch: 3020  # Epoch to start using the secondary loss
+
+
+
+ 

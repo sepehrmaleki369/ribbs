@@ -4,7 +4,7 @@
 # Sub-config references
 dataset_config: "massroads.yaml"
 model_config: "baseline.yaml"
-loss_config: "mixed_topo.yaml"
+loss_config: "fixed_lif_mse_chamfer.yaml"
 metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 callbacks_config: "callbacks_2d.yaml"
@@ -20,8 +20,8 @@ trainer:
   skip_validation_until_epoch: 0  # Skip validation until this epoch
   log_every_n_steps: 1            # log metrics every step
   train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
-  val_metrics_every_n_epochs: 1  # compute/log val   metrics every epoch
-  save_gt_pred_val_test_every_n_epochs: 10  # Save GT+pred every 10 epochs
+  val_metrics_every_n_epochs: 10  # compute/log val   metrics every epoch
+  save_gt_pred_val_test_every_n_epochs: 500  # Save GT+pred every 10 epochs
   save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
   # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
 
