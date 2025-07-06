@@ -124,8 +124,20 @@ class SegLitModule(pl.LightningModule):
                 # print('y_int.shape', y_hat.shape)
                 # print('y_int.shape', y_hat.shape)
                 # print(name, metric(y_hat, y_int))
-                self.log(f"train_metrics/{name}", metric(y_hat, y_int),
-                         prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                if name == "ccq":
+                    ccq_value = metric(y_hat, y_int)
+                    correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
+                    completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
+                    quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
+                    self.log(f"train_metrics/{name}/correctness", correctness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"train_metrics/{name}/completeness", completeness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"train_metrics/{name}/quality", quality,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                else:
+                    self.log(f"train_metrics/{name}", metric(y_hat, y_int),
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         
         # ——— Log GT / Pred stats for TensorBoard ———
         # flatten tensors
@@ -190,7 +202,19 @@ class SegLitModule(pl.LightningModule):
                 # print('y_int.shape', y_hat.shape)
                 # print('y_int.shape', y_hat.shape)
                 # print(name, metric(y_hat, y_int))
-                self.log(f"val_metrics/{name}", metric(y_hat, y_int),
+                if name == "ccq":
+                    ccq_value = metric(y_hat, y_int)
+                    correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
+                    completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
+                    quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
+                    self.log(f"val_metrics/{name}/correctness", correctness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"val_metrics/{name}/completeness", completeness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"val_metrics/{name}/quality", quality,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                else:
+                    self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         
         # ——— Log GT / Pred stats for TensorBoard ———
@@ -237,7 +261,19 @@ class SegLitModule(pl.LightningModule):
 
         y_int = y
         for name, metric in self.metrics.items():
-            self.log(f"test_metrics/{name}", metric(y_hat, y_int),
+            if name == "ccq":
+                ccq_value = metric(y_hat, y_int)
+                correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
+                completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
+                quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
+                self.log(f"test_metrics/{name}/correctness", correctness,
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                self.log(f"test_metrics/{name}/completeness", completeness,
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                self.log(f"test_metrics/{name}/quality", quality,
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+            else:
+                self.log(f"test_metrics/{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
         return {"predictions": y_hat, "test_loss": loss_dict["mixed"], "gts": y}
@@ -278,3 +314,4 @@ class SegLitModule(pl.LightningModule):
         scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    

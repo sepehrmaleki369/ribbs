@@ -46,35 +46,35 @@ class PredictionSaver(pl.Callback):
         np.save(os.path.join(folder, fname), array)
 
     # # ——— TRAINING HOOKS ———
-    def on_train_epoch_start(self, trainer, pl_module):
-        self._counter = 0
+    # def on_train_epoch_start(self, trainer, pl_module):
+    #     self._counter = 0
 
-    def on_train_batch_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs: Dict[str, Any],
-        batch: Any,
-        batch_idx: int,
-        dataloader_idx: int = 0,
-    ):
-        epoch = trainer.current_epoch
-        if not self._should_save(epoch):
-            return
+    # def on_train_batch_end(
+    #     self,
+    #     trainer: pl.Trainer,
+    #     pl_module: pl.LightningModule,
+    #     outputs: Dict[str, Any],
+    #     batch: Any,
+    #     batch_idx: int,
+    #     dataloader_idx: int = 0,
+    # ):
+    #     epoch = trainer.current_epoch
+    #     if not self._should_save(epoch):
+    #         return
 
-        preds = outputs.get("predictions")
-        gts   = outputs.get("gts")
-        if preds is None or gts is None:
-            return
+    #     preds = outputs.get("predictions")
+    #     gts   = outputs.get("gts")
+    #     if preds is None or gts is None:
+    #         return
 
-        preds = preds.detach().cpu().numpy()
-        gts   = gts.detach().cpu().numpy()
-        for i in range(preds.shape[0]):
-            if self.max_samples is not None and self._counter >= self.max_samples:
-                return
-            self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
-            self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
-            self._counter += 1
+    #     preds = preds.detach().cpu().numpy()
+    #     gts   = gts.detach().cpu().numpy()
+    #     for i in range(preds.shape[0]):
+    #         if self.max_samples is not None and self._counter >= self.max_samples:
+    #             return
+    #         self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
+    #         self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
+    #         self._counter += 1
 
     # ——— VALIDATION HOOKS ———
     def on_validation_epoch_start(self, trainer, pl_module):
@@ -119,10 +119,10 @@ class PredictionSaver(pl.Callback):
             self._counter += 1
 
         # save gts for every batch—but only in that one epoch
-        if self._save_gts_this_epoch:
-            gts_np = gts.detach().cpu().numpy()
-            for i in range(gts_np.shape[0]):
-                self._save_tensor(gts_np[i], "val", epoch, batch_idx, i, "gt")
+        # if self._save_gts_this_epoch:
+        #     gts_np = gts.detach().cpu().numpy()
+        #     for i in range(gts_np.shape[0]):
+        #         self._save_tensor(gts_np[i], "val", epoch, batch_idx, i, "gt")
 
     def on_validation_epoch_end(self, trainer, pl_module):
         # mark that we've done our one-time GT dump

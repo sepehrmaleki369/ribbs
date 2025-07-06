@@ -15,11 +15,11 @@ callbacks:
       last_k: 1
       filename_template: best_{metric}
 
-  # Periodic full checkpoints (e.g. every 5 epochs)
+  # # Periodic full checkpoints (e.g. every 5 epochs)
   - name: PeriodicCheckpoint
     params:
       dirpath: backup_checkpoints
-      every_n_epochs: 1
+      every_n_epochs: 500
       prefix: epoch
 
   # 3D sample plots in TensorBoard

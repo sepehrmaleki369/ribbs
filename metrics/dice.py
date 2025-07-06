@@ -29,6 +29,7 @@ class ThresholdedDiceMetric(nn.Module):
         multiclass: bool = False,
         zero_division: float = 1.0,
         greater_is_road: bool = True,
+        data_dim: int = 2  # 2D or 3D data
     ):
         super().__init__()
         self.threshold      = float(threshold)
@@ -36,6 +37,7 @@ class ThresholdedDiceMetric(nn.Module):
         self.multiclass     = bool(multiclass)
         self.zero_division  = float(zero_division)
         self.greater_is_road = bool(greater_is_road)
+        self.data_dim = int(data_dim)
 
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
         if self.greater_is_road:
@@ -44,16 +46,16 @@ class ThresholdedDiceMetric(nn.Module):
             return (x <= self.threshold).float()
 
     def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
-        # (B, H, W) → (B,1,H,W); (B, D, H, W) → (B,1,D,H,W)
-        if t.dim() == 3:
+        """
+        Ensure a channel dimension for 2D or 3D data.
+        For 2D: (B,H,W) -> (B,1,H,W)
+        For 3D: (B,D,H,W) -> (B,1,D,H,W)
+        Leaves (B,1,H,W) or (B,1,D,H,W) unchanged.
+        """
+        expected_dim = 2 + self.data_dim  # batch + channel + spatial
+        if t.dim() == expected_dim - 1:
+            # Missing channel dimension
             return t.unsqueeze(1)
-        if t.dim() == 4:
-            # could be (B, C, H, W) or (B, D, H, W)
-            # if binary mode & C==1, assume it's already channel
-            if not self.multiclass and t.shape[1] == 1:
-                return t
-            return t.unsqueeze(1)
-        # dims == 5: (B, C, D, H, W) already good
         return t
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:

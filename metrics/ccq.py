@@ -1,155 +1,122 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from skimage import measure
-from typing import Any, List, Tuple, Set
+from scipy import ndimage
+from skimage.morphology import skeletonize
 
+__all__ = ["ThresholdedCCQMetric"]
 
-class ConnectedComponentsQuality(nn.Module):
+class ThresholdedCCQMetric(nn.Module):
     """
-    Connected Components Quality (CCQ) metric for segmentation.
+    Compute Relaxed Correctness, Completeness, and Quality (CCQ) for binary predictions.
 
-    Evaluates detection+shape accuracy of connected components in binary
-    (or thresholded) predictions vs. ground truth, on 2-D or 3-D volumes.
+    Args:
+        threshold (float): cutoff for binarization (default: 0.5).
+        slack (int): maximum pixel distance for a true positive (default: 3).
+        eps (float): small constant to avoid division by zero (default: 1e-12).
+        greater_is_road (bool): if True, values > threshold are foreground.
     """
     def __init__(
         self,
-        data_dim: int = 2,
-        min_size: int = 5,
-        tolerance: float = 2.0,
-        alpha: float = 0.5,
         threshold: float = 0.5,
+        slack: int = 3,
+        eps: float = 1e-12,
         greater_is_road: bool = True,
-        eps: float = 1e-8,
+        data_dim: int = 2  # 2D or 3D data
     ):
-        """
-        Args:
-            data_dim: 2 for (H,W) images, 3 for (D,H,W) volumes.
-            min_size: minimum component area/volume to keep.
-            tolerance: max centroid distance (pixels/voxels) to match.
-            alpha: weight [0–1] blending detection vs. shape scores.
-            threshold: binarization cutoff.
-            greater_is_road: direction of thresholding.
-            eps: stability constant.
-        """
         super().__init__()
-        if data_dim not in (2, 3):
-            raise ValueError("data_dim must be 2 or 3")
-        self.data_dim        = data_dim
-        self.min_size        = int(min_size)
-        self.tolerance       = float(tolerance)
-        self.alpha           = float(alpha)
-        self.threshold       = float(threshold)
+        self.threshold = float(threshold)
+        self.slack = int(slack)
+        self.eps = float(eps)
         self.greater_is_road = bool(greater_is_road)
-        self.eps             = float(eps)
+        self.data_dim = int(data_dim)
 
-    def _bin(self, arr: np.ndarray) -> np.ndarray:
-        return (arr > self.threshold) if self.greater_is_road else (arr <= self.threshold)
+    def _binarize(self, x: torch.Tensor) -> np.ndarray:
+        """
+        Binarize tensor according to threshold.
+        """
+        if self.greater_is_road:
+            return np.array(x.detach().cpu().numpy() > self.threshold)
+        else:
+            return np.array(x.detach().cpu().numpy() <= self.threshold)
+
+    def _skeletonize(self, x_bin: np.ndarray) -> np.ndarray:
+        """
+        Apply binary skeletonization to the input tensor.
+        This is a placeholder; actual implementation may vary.
+        """
+        x_bin = skeletonize(x_bin.astype(bool))
+        if self.data_dim == 2:  # skeletonize the binary mask
+            return x_bin
+        elif self.data_dim == 3:
+            return x_bin // 255
+        return x_bin
 
     def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
-        # If t is (B, H, W) or (B, D, H, W), insert channel at axis=1
-        if t.dim() == self.data_dim + 1:
+        """
+        Ensure a channel dimension for 2D or 3D data.
+        For 2D: (B,H,W) -> (B,1,H,W)
+        For 3D: (B,D,H,W) -> (B,1,D,H,W)
+        Leaves (B,1,H,W) or (B,1,D,H,W) unchanged.
+        """
+        expected_dim = 2 + self.data_dim  # batch + channel + spatial
+        if t.dim() == expected_dim - 1:
+            # Missing channel dimension
             return t.unsqueeze(1)
-        # Else assume channel present: (B,1,H,W) or (B,1,D,H,W)
         return t
 
-    def _label_connectivity(self) -> int:
-        # skimage: connectivity=2 for 2-D 8-nbr, =1 for full 3-D adjacency
-        return 2 if self.data_dim == 2 else 1
-
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor
+    ) -> np.ndarray:
         """
-        Args:
-            y_pred: (B, …) logits/prob maps or distance maps.
-            y_true: (B, …) ground truth mask or continuous map.
-        Returns:
-            scalar CCQ score (higher is better).
+        Returns a tensor of shape (3,) with [correctness, completeness, quality]
+        averaged over the batch.
         """
-        # check for at least (B,H,W) or (B,D,H,W)
-        if y_pred.dim() < self.data_dim + 1 or y_true.dim() < self.data_dim + 1:
-            raise ValueError(f"Inputs must be at least {(self.data_dim+1)}-D")
-
-        # unify channel dimension
+        # Binarize inputs
         y_pred = self._ensure_channel(y_pred)
         y_true = self._ensure_channel(y_true)
+
         if y_pred.shape != y_true.shape:
-            raise ValueError(f"Shape mismatch: {y_pred.shape} vs {y_true.shape}")
+            raise ValueError(f"Shape mismatch: pred {y_pred.shape} vs true {y_true.shape}")
 
-        B, C = y_pred.shape[:2]
-        if C != 1:
-            raise ValueError(f"CCQ only supports binary masks; got C={C}")
+        # Only binary mode: expect C=1
+        if y_pred.shape[1] != 1:
+            raise ValueError(f"CCQMetric supports binary masks only (C=1), got C={y_pred.shape[1]}")
 
-        conn = self._label_connectivity()
-        scores: List[float] = []
+        # Move to CPU numpy for distance transform
+        p_np = (self._binarize(y_pred)[:, 0]).astype(bool)  # (B, ...) spatial
+        g_np = (self._binarize(y_true)[:, 0]).astype(bool)
 
-        for b in range(B):
-            pred_np = self._bin(y_pred[b,0].detach().cpu().numpy()).astype(np.uint8)
-            true_np = self._bin(y_true[b,0].detach().cpu().numpy()).astype(np.uint8)
+        batch_metrics = []
+        for p_bin, g_bin in zip(p_np, g_np):
+            g_bin = self._skeletonize(g_bin)  # skeletonize ground truth if needed
+            p_bin = self._skeletonize(p_bin)  # skeletonize prediction if needed
 
-            # If ground truth is empty
-            if true_np.sum() == 0:
-                scores.append(1.0 if pred_np.sum() == 0 else 0.0)
-                continue
+            # print(f"p_bin shape: {p_bin.shape}, g_bin shape: {g_bin.shape}")
+            # print(f"p_bin max: {p_bin.max()}, g_bin max: {g_bin.max()}")
+            # distance maps
+            dist_gt = ndimage.distance_transform_edt(~g_bin)
+            dist_pred = ndimage.distance_transform_edt(~p_bin)
+            
+            # define areas
+            tp_area = dist_gt <= self.slack
+            fp_area = dist_gt > self.slack
+            fn_area = dist_pred > self.slack
 
-            # label connected components
-            true_lbl = measure.label(true_np, connectivity=conn)
-            pred_lbl = measure.label(pred_np, connectivity=conn)
+            # counts
+            TP = np.logical_and(tp_area, p_bin).sum()
+            FP = np.logical_and(fp_area, p_bin).sum()
+            FN = np.logical_and(fn_area, g_bin).sum()
 
-            true_props = [p for p in measure.regionprops(true_lbl) if p.area >= self.min_size]
-            pred_props = [p for p in measure.regionprops(pred_lbl) if p.area >= self.min_size]
+            # compute metrics
+            correctness = TP / (TP + FP + self.eps)
+            completeness = TP / (TP + FN + self.eps)
+            quality = TP / (TP + FP + FN + self.eps)
 
-            # no significant GT components
-            if not true_props:
-                scores.append(1.0 if not pred_props else 0.0)
-                continue
-            # no significant predicted components
-            if not pred_props:
-                scores.append(0.0)
-                continue
+            batch_metrics.append([correctness, completeness, quality])
 
-            # match components by centroid
-            matches = self._match_components(true_props, pred_props)
-
-            tp = len(matches)
-            fp = len(pred_props) - tp
-            fn = len(true_props) - tp
-            detection = tp / (tp + fp + fn + self.eps)
-
-            # shape: mean IoU over matched pairs
-            shape_scores = []
-            for t_idx, p_idx in matches:
-                t_mask = (true_lbl == true_props[t_idx].label)
-                p_mask = (pred_lbl == pred_props[p_idx].label)
-                inter = np.logical_and(t_mask, p_mask).sum()
-                union = np.logical_or(t_mask, p_mask).sum()
-                shape_scores.append(inter / (union + self.eps))
-            shape = float(np.mean(shape_scores)) if shape_scores else 0.0
-
-            scores.append(self.alpha * detection + (1 - self.alpha) * shape)
-
-        avg = float(np.mean(scores))
-        return torch.tensor(avg, device=y_pred.device)
-
-    def _match_components(
-        self,
-        true_props: List[Any],
-        pred_props: List[Any],
-    ) -> List[Tuple[int, int]]:
-        matches: List[Tuple[int, int]] = []
-        used_pred: Set[int] = set()
-
-        for t_idx, t_prop in enumerate(true_props):
-            tx, ty = t_prop.centroid[:2]
-            best_dist, best_idx = float('inf'), None
-            for p_idx, p_prop in enumerate(pred_props):
-                if p_idx in used_pred:
-                    continue
-                px, py = p_prop.centroid[:2]
-                d = np.hypot(tx - px, ty - py)
-                if d <= self.tolerance and d < best_dist:
-                    best_dist, best_idx = d, p_idx
-            if best_idx is not None:
-                matches.append((t_idx, best_idx))
-                used_pred.add(best_idx)
-
-        return matches
+        # average over batch
+        avg = np.mean(batch_metrics, axis=0)
+        return avg
