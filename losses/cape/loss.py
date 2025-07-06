@@ -5,9 +5,9 @@ import skimage.graph
 import random
 import cv2
 from skimage.morphology import skeletonize
-from losses.cape.utils.graph_from_skeleton_3D import graph_from_skeleton as graph_from_skeleton_3D
-from losses.cape.utils.graph_from_skeleton_2D import graph_from_skeleton as graph_from_skeleton_2D
-from losses.cape.utils.crop_graph import crop_graph_2D, crop_graph_3D
+from .utils.graph_from_skeleton_3D import graph_from_skeleton as graph_from_skeleton_3D
+from .utils.graph_from_skeleton_2D import graph_from_skeleton as graph_from_skeleton_2D
+from .utils.crop_graph import crop_graph_2D, crop_graph_3D
 from skimage.draw import line_nd
 from scipy.ndimage import binary_dilation, generate_binary_structure
 import networkx as nx
@@ -37,6 +37,22 @@ class CAPE(nn.Module):
         self.is_binary = is_binary
         self.distance_threshold = distance_threshold
         self.single_edge = single_edge
+        self.data_dim = 3 if three_dimensional else 2
+    
+    def _ensure_no_channel(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Remove a channel dimension for 2D or 3D data if it's a singleton.
+
+        For 2D:
+        (B,1,H,W) -> (B,H,W)
+        For 3D:
+        (B,1,D,H,W) -> (B,D,H,W)
+        Leaves (B,H,W) or (B,D,H,W) unchanged.
+        """
+        expected_dim = 1 + self.data_dim  # batch + spatial
+        if t.dim() != expected_dim and t.size(1) == 1:
+            return t.squeeze(1)
+        return t
         
 
     def _random_connected_pair(self, G):
@@ -127,7 +143,7 @@ class CAPE(nn.Module):
         x_min, x_max = max(0, x0 - int(radius)), min(width, x0 + int(radius) + 1)
 
         sub_volume = array[z_min:z_max, y_min:y_max, x_min:x_max]
-
+        
         
         min_idx = np.unravel_index(np.argmin(sub_volume), sub_volume.shape)
         
@@ -239,6 +255,9 @@ class CAPE(nn.Module):
         Returns:
             torch.Tensor: Scalar tensor representing the mean CAPE loss over the batch.
         """
+        predictions = self._ensure_no_channel(predictions)
+        ground_truths = self._ensure_no_channel(ground_truths)
+
         batch_size = predictions.size(0)
         total_loss = 0.0
 
@@ -409,7 +428,6 @@ class CAPE(nn.Module):
                                     i * self.window_size:(i + 1) * self.window_size,
                                     j * self.window_size:(j + 1) * self.window_size
                                 ]
-                                
                                 skeleton = skeletonize(window_gt)
                                 graph = graph_from_skeleton_3D(skeleton, angle_range=(175,185), verbose=False)
                             
@@ -468,3 +486,4 @@ class CAPE(nn.Module):
                 total_loss += crop_loss_sum
                 
             return total_loss / batch_size if batch_size > 0 else 0
+

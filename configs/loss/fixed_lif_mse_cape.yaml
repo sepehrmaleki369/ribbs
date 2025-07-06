@@ -28,15 +28,11 @@ secondary_loss:
   path: "losses.cape.loss"  # Path to the module containing the loss
   class: "CAPE"  # Name of the loss class
   params:
-    window_size: 90
+    window_size: 48
     three_dimensional: true
     distance_threshold: 15.0
     dilation_radius: 10.0 
 
 # # Mixing parameters
-alpha: 0.0001  # Weight for the secondary loss (0 to 1)
-start_epoch: 30000  # Epoch to start using the secondary loss
-
-
-
- 
+alpha: 0.01  # Weight for the secondary loss (0 to 1)
+start_epoch: 5000  # Epoch to start using the secondary loss

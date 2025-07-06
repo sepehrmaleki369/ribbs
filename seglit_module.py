@@ -26,6 +26,7 @@ class SegLitModule(pl.LightningModule):
         val_metrics_every_n_epochs: int = 1,
         train_metric_frequencies: Dict[str, int] = None,
         val_metric_frequencies: Dict[str, int] = None,
+        divisible_by: int = 16
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
@@ -42,6 +43,8 @@ class SegLitModule(pl.LightningModule):
         self.val_freq = val_metrics_every_n_epochs
         self.train_metric_frequencies = train_metric_frequencies or {}
         self.val_metric_frequencies = val_metric_frequencies or {}
+
+        self.divisible_by = divisible_by
 
         self.py_logger = logging.getLogger(__name__)
     
@@ -80,7 +83,7 @@ class SegLitModule(pl.LightningModule):
         # otherwise (val/test/predict), run full-image chunked inference
         # (validator will pad to divisible-by-16 under the hood)
         with torch.no_grad():
-            y_hat = self.validator.run_chunked_inference(self.model, x)
+            y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
         return y_hat
     
     def on_train_epoch_start(self):
@@ -175,7 +178,7 @@ class SegLitModule(pl.LightningModule):
 
         # chunked inference (with built-in padding)
         with torch.no_grad():
-            y_hat = self.validator.run_chunked_inference(self.model, x)
+            y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
         loss_dict = self.loss_fn(y_hat, y)
@@ -246,7 +249,7 @@ class SegLitModule(pl.LightningModule):
             x, y = x.unsqueeze(0), y.unsqueeze(0)
 
         with torch.no_grad():
-            y_hat = self.validator.run_chunked_inference(self.model, x)
+            y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
         loss_dict = self.loss_fn(y_hat, y)
@@ -314,4 +317,3 @@ class SegLitModule(pl.LightningModule):
         scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
-    

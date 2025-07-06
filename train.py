@@ -111,6 +111,7 @@ def main():
         val_metrics_every_n_epochs=val_metrics_every_n,
         train_metric_frequencies=metrics_cfg.get("train_frequencies", {}),
         val_metric_frequencies=metrics_cfg.get("val_frequencies", {}),
+        divisible_by=inference_cfg.get('chunk_divisible_by', 16)
     )
 
     # --- callbacks ---

@@ -103,6 +103,7 @@ class Validator:
         self,
         model: nn.Module,
         image: torch.Tensor,
+        divisible_by: int,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Full‑image/volume inference with overlapping tiles.
@@ -150,9 +151,9 @@ class Validator:
                 image = F.pad(image, pad_tuple, mode="replicate")
 
         # ----------------------------------------------------------
-        # (B) Second pad until all dims divisible by 16
+        # (B) Second pad until all dims divisible by 
         # ----------------------------------------------------------
-        padded_image, pad_div16 = self._pad_to_valid_size(image, 16)
+        padded_image, pad_div16 = self._pad_to_valid_size(image, divisible_by)
         N, C, *spatial_pad = padded_image.shape
 
         # ----------------------------------------------------------
@@ -165,7 +166,7 @@ class Validator:
             ]
             slices: List[slice] = [slice(None), slice(None)] + [slice(0, t) for t in test_sizes]
             test_patch = padded_image[tuple(slices)]
-            test_patch, _ = self._pad_to_valid_size(test_patch, 16)
+            test_patch, _ = self._pad_to_valid_size(test_patch, divisible_by)
             out_channels = model(test_patch).shape[1]
 
         # Allocate output canvas
