@@ -2,12 +2,12 @@
 seed: 42  # Random seed
 split_cfg:
   seed: 42
-  # index_save_pth: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175-inds"
-  index_save_pth: "/home/ri/Desktop/Projects/Datasets/AL175-inds"
+  index_save_pth: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175-inds"
+  # index_save_pth: "/home/ri/Desktop/Projects/Datasets/AL175-inds"
   sources:
     - type: "ratio"
-      path: "/home/ri/Desktop/Projects/Datasets/AL175"
-      # path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
+      # path: "/home/ri/Desktop/Projects/Datasets/AL175"
+      path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
       layout: "flat"
       modalities:
         image:
@@ -50,7 +50,7 @@ distance_threshold: 15.0          # clip distance maps (null = no clip)
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 2
+train_batch_size: 32
 val_batch_size: 1
 test_batch_size: 1
 num_workers: 4

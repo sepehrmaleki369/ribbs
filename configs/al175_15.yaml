@@ -10,7 +10,7 @@ inference_config: "chunk_3d.yaml"
 callbacks_config: "callbacks_3d.yaml"
 
 # Output directory
-output_dir: "experiments/base_al175_lif_mse"
+output_dir: "experiments/base_al175_lif_mse_cape"
 
 # Trainer configuration
 trainer:

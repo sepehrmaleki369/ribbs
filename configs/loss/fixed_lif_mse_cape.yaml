@@ -32,7 +32,8 @@ secondary_loss:
     three_dimensional: true
     distance_threshold: 15.0
     dilation_radius: 10.0 
+    single_edge: true
 
 # # Mixing parameters
-alpha: 0.01  # Weight for the secondary loss (0 to 1)
-start_epoch: 4980  # Epoch to start using the secondary loss
+alpha: 0.5  # Weight for the secondary loss (0 to 1)
+start_epoch: 5000  # Epoch to start using the secondary loss
