@@ -373,5 +373,5 @@ def process_in_chuncks(image, output, process, patch_size, patch_margin):
         ###############################
         
         output[semicol+semicol+destin_c] = proc_crop[semicol+semicol+valid_c]
-    print('process_in_chuncks done', output.shape, output.dtype, output.device)
+    # print('process_in_chuncks done', output.shape, output.dtype, output.device)
     return output

@@ -30,8 +30,8 @@ secondary_loss:
   params:
     window_size: 48
     three_dimensional: true
-    distance_threshold: 15.0
-    dilation_radius: 10.0 
+    distance_threshold: 15
+    dilation_radius: 10 
     single_edge: true
 
 # # Mixing parameters
