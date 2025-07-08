@@ -184,6 +184,9 @@ def binarize(
         return mask_bool
     return mask_bool.astype(np.uint8)
 
+def boolian(image):
+    return image.astype(np.uint8)
+
 
 def normalize(
     image: np.ndarray,
@@ -217,9 +220,10 @@ def normalize(
         return clip_normalize(image, **kwargs)
     elif method == "binarize":
         return binarize(image, **kwargs)
-    else:
-        logger.error(f"Unknown normalization method '{method}', using minmax.")
-        return min_max_normalize(image, **kwargs)
+    elif method == "boolian":
+        # print('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')
+        return boolian(image)
+    raise ValueError(f"Unknown normalization method: {method}")
 
 # Alias for backward compatibility
 normalize_image = normalize

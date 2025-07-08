@@ -114,13 +114,13 @@ def visualize_batch_3d(
             #   YZ: collapse X axis -> (Z, H) then transpose for display (H, Z)
             proj_xy = project(vol, axis=0)
             proj_xz = project(vol, axis=1)
-            proj_yz = project(vol, axis=2).T
+            proj_yz = project(vol, axis=2)
 
             projs = {"XY": proj_xy, "XZ": proj_xz, "YZ": proj_yz}
 
             for col, (name, proj) in enumerate(projs.items()):
                 ax = axs[row, col] if nrows > 1 else axs[col]
-                ax.imshow(proj, cmap='gray')
+                ax.imshow(proj)
                 ax.set_title(f"{mod} - {name} view")
                 ax.axis("off")
 

@@ -13,7 +13,8 @@ from core.general_dataset.modalities  import compute_distance_map, compute_sdf
 from core.general_dataset.patch_validity       import check_min_thrsh_road
 from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
 from core.general_dataset.normalizations import normalize_image
-from core.general_dataset.augmentations import augment_image
+from core.general_dataset.augmentations import augment_images
+from core.general_dataset.crop import crop
 from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
 from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
@@ -58,8 +59,6 @@ class GeneralizedDataset(Dataset):
         self.order_ops: List[str] = config.get("order_ops", ["crop", "aug", "norm"])
         self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
         self.aug_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("augmentation", None)
-        assert set(self.order_ops) == {"crop", "aug", "norm"}, \
-                       f"order_ops must be a permutation of ['crop','aug','norm'], got {self.order_ops}"
 
         if self.patch_size is None:
             raise ValueError("patch_size must be specified in the config.")
@@ -133,6 +132,7 @@ class GeneralizedDataset(Dataset):
             if cfg:
                 method = cfg.get('method', None)
                 params = {k: v for k, v in cfg.items() if k != 'method'}
+                # print(method, params)
                 normalized_image[key] = normalize_image(arr, method=method, **params)
             else:
                 normalized_image[key] = arr.copy()
@@ -140,14 +140,18 @@ class GeneralizedDataset(Dataset):
     
     def augment_data(self, normalized_image):
         augmented_image = {}
+        for aug in self.aug_cfg:
+            modalities = self.aug_cfg[aug].get('modalities', None)
+            if modalities is None:
+                raise ValueError(f"Augmentation config for {aug} is missing 'modalities'")
+            selected = {k: normalized_image[k] for k in modalities if k in normalized_image}
+            rng = np.random.RandomState(self.seed)
+            augmented = augment_images(selected, aug, self.aug_cfg[aug], self.data_dim, rng)
+            for k_aug, v_aug in augmented.items():
+                augmented_image[k_aug] = v_aug
         for key, arr in list(normalized_image.items()):
-            # print('aug', key)
-            if self.aug_cfg:
-                # print('aug', self.aug_cfg)
-                rng = np.random.RandomState(self.seed)
-                augmented_image[key] = augment_image(arr, self.aug_cfg, self.data_dim, rng)
-            else:
-                augmented_image[key] = arr
+            if key not in augmented_image:
+                augmented_image[key] = arr.copy()
         return augmented_image
 
     @staticmethod
@@ -162,70 +166,11 @@ class GeneralizedDataset(Dataset):
             return data  # keep full image / volume for inference
 
         # ---------- determine crop coordinates from the first key ----------
-        sample_key = next(k for k in data)
-        sample = data[sample_key]
-
-        if self.data_dim == 2:
-            H, W = sample.shape
-            ph = max(0, self.patch_size - H)
-            pw = max(0, self.patch_size - W)
-
-            # pad if necessary
-            if ph > 0 or pw > 0:
-                for k in data:
-                    arr = data[k]
-                    data[k] = self._pad_reflect(
-                        arr,
-                        pad_before=(ph // 2, pw // 2),
-                        pad_after=(ph - ph // 2, pw - pw // 2),
-                    )
-                H += ph
-                W += pw
-
-            # random top-left corner
-            top = random.randint(0, H - self.patch_size)
-            left = random.randint(0, W - self.patch_size)
-
-            # crop every modality
-            for k in data:
-                data[k] = data[k][
-                    top : top + self.patch_size,
-                    left: left + self.patch_size,
-                ]
-
-        else:  # ----------------------------- 3-D ---------------------------
-            patch_z = self.config.get("patch_size_z", 1)
-            D, H, W = sample.shape
-
-            pd = max(0, patch_z       - D)
-            ph = max(0, self.patch_size - H)
-            pw = max(0, self.patch_size - W)
-
-            if pd or ph or pw:
-                for k in data:
-                    arr = data[k]
-                    data[k] = self._pad_reflect(
-                        arr,
-                        pad_before=(pd // 2, ph // 2, pw // 2),
-                        pad_after=(pd - pd // 2, ph - ph // 2, pw - pw // 2),
-                    )
-                D += pd
-                H += ph
-                W += pw
-
-            front = random.randint(0, D - patch_z)
-            top   = random.randint(0, H - self.patch_size)
-            left  = random.randint(0, W - self.patch_size)
-
-            for k in data:
-                data[k] = data[k][
-                    front : front + patch_z,
-                    top   : top   + self.patch_size,
-                    left  : left  + self.patch_size,
-                ]
-
+        data = crop(data, self.split, self.patch_size, self.data_dim,
+                    patch_size_z=self.config.get("patch_size_z", 1),
+                    pad_reflect=self._pad_reflect)
         return data
-
+    
     def _postprocess_patch(self, data: Dict[str, np.ndarray], augment: bool) -> Dict[str, np.ndarray]:
         # ------------------------------------------------------------
         # 1. Run the ops in user-defined order
@@ -236,9 +181,10 @@ class GeneralizedDataset(Dataset):
             "norm": lambda d: self.normalize_data(d),
         }
         for step in self.order_ops:
+            # print('before ', step, data['label'].shape, data['label'].min(), data['label'].max())
             data = op[step](data)
             # if step == 'norm':
-                # print('after norm', data['label'].min(), data['label'].max())
+            # print('after ', step, data['label'].shape, data['label'].min(), data['label'].max())
 
         # ------------------------------------------------------------
         # 2. Mark everything as *_patch  (↓ this is the only new line)
@@ -306,161 +252,11 @@ if __name__ == "__main__":
         ]
     }
 
-    # ------------------------------------
-    # full config for GeneralizedDataset
-    # ------------------------------------
-    config = {
-        # which split to load
-        "split": "train",
-
-        # pass the splitter cfg here
-        "split_cfg": split_cfg,
-
-        # patch extraction params
-        "patch_size": 256,
-        "patch_size_z": 1,             # keep at 1 for 2D data
-
-        # optional small‐window check
-        "small_window_size": 8,
-
-        # require a minimum fraction of road pixels in each patch
-        "validate_road_ratio": True,
-        "threshold": 0.025,
-
-        # if you want to limit to just N images (for debugging), set here
-        "max_images": 5,
-
-        # random seeds & workers
-        "seed": 42,
-        "num_workers": 4,
-        "verbose": True,
-
-        # train‐time augmentations
-        "augmentations": ["flip_h", "flip_v", "rotation"],
-
-        # distance & SDF modalities: compute if missing
-        "distance_threshold": 15.0,
-        "sdf_iterations": 3,
-        "sdf_thresholds": [-7, 7],
-        "compute_again_modalities": False,
-        "save_computed": True,
-
-        # only used if you ever switch to ratio‐based splitting
-        "split_ratios": {"train": 0.7, "valid": 0.15, "test": 0.15},
-
-        # these are the “base” modalities that must all be present
-        "base_modalities": ["image", "label"],
-
-        # 2D vs 3D
-        "data_dim": 2,
-
-        "normalization": {
-            "image":    {"method":  "minmax",
-                    "old_min": 0,     # your supplied min
-                    "old_max": 255.0,   # your supplied max
-                    "new_min": 0.0,
-                    "new_max": 1.0},
-
-            # "distance": {"method": "zscore"},
-            "sdf":      {},            # empty → no normalization
-            "label":    None,          # or null in JSON → skip
-        },
-        "augmentation_params": {
-            "scale":             {"min": 1.5,  "max": 5.8},
-            # "elastic":           {"alpha_min": 5.0,  "alpha_max": 10.0,
-                                # "sigma_min": 3.0,  "sigma_max": 6.0},
-            "brightness_contrast":{"alpha_min": 0.9,"alpha_max": 1.1,
-                                "beta_min": -30.0,"beta_max": 30.0},
-            "gamma":             {"min": 0.7,  "max": 1.5},
-            # "gaussian_noise":    {"min": 0.01, "max": 0.03},
-            # "gaussian_blur":     {"min": 0.5,  "max": 1.5},
-            # "bias_field":        {"min": 0.2,  "max": 0.4},
-            # "rotation":          {"min": 0.0,  "max": 360.0},
-            # flips and flip_d remain Bernoulli(0.5), no extra params needed
-        },
-    }
-
-    # split_cfg = {
-    #     "seed": 42,
-    #     "sources": [
-    #         {
-    #             "type": "ratio",
-    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-    #             "layout": "flat",
-    #             "modalities": {
-    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
-    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-    #             },
-    #             "ratios": {
-    #                 "train": 0.7,
-    #                 "valid": 0.15,
-    #                 "test":  0.15,
-    #             }
-    #         },
-    #         {
-    #             "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-    #             "layout": "flat",
-    #             "modalities": {
-    #                 "image":    {"pattern": r"^cube_(.*)\.npy$"},
-    #                 "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-    #                 "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-    #             },
-
-    #             "type": "kfold",
-    #             "num_folds": 5,
-    #             "fold_idx": 0,
-    #             "test_source":{
-    #                 "type": "ratio",
-    #                 "path": "/home/ri/Desktop/Projects/Datasets/AL175",
-    #                 "layout": "flat",
-    #                 "modalities": {
-    #                     "image":    {"pattern": r"^cube_(.*)\.npy$"},
-    #                     "label":    {"pattern": r"^lbl_(.*)\.npy$"},
-    #                     "distance": {"pattern": r"^distlbl_(.*)\.npy$"},
-    #                 },
-    #                 "ratios": {
-    #                     "train": 0.01,
-    #                     "valid": 0.9,
-    #                     "test":  0.01,
-    #                 }
-    #             }
-    #         }
-    #     ]
-    # }
-
-    # config = {
-    #     "split": "train",                # one of "train","valid","test"
-    #     "split_cfg": split_cfg,
-
-    #     "data_dim": 3,                   # your .npy volumes are 3D
-    #     "patch_size": 90,                # XY window size
-    #     "patch_size_z": 90,              # Z-depth
-
-    #     "augmentations": ["flip_h","flip_v","flip_d","rotation"],
-    #     "validate_road_ratio": False,    # set True if you want to enforce label coverage
-    #     "threshold": 0.05,
-
-    #     "distance_threshold": None,      # clip distance map if desired
-    #     "sdf_iterations": 3,             # only if you compute SDF
-    #     "sdf_thresholds": [-5, 5],       # ditto
-
-    #     "save_computed": True,          # we already have distlbl_*.npy
-    #     "compute_again_modalities": False,
-
-    #     "max_images": None,
-    #     "max_attempts": 10,
-    #     "seed": 42,
-    #     "num_workers": 4,
-    #     "verbose": True,
-    #     "base_modalities": ['image', 'label']
-    # }
-
     import yaml
     # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
         # yaml.dump(config, f_out)
     with open('./configs/dataset/AL175_15.yaml', 'r') as f:
-    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/massroads.yaml', 'r') as f:
+    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/mass.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
     # Create dataset and dataloader.
@@ -484,6 +280,6 @@ if __name__ == "__main__":
             if config["data_dim"] == 2:
                 visualize_batch_2d(batch, num_per_batch=2)
             else:
-                visualize_batch_3d(batch, projection='max', num_per_batch=2)
+                visualize_batch_3d(batch, projection='max', num_per_batch=3)
 
             # break  # Uncomment to visualize only one batch.

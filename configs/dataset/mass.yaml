@@ -2,32 +2,35 @@
 seed: 42  # Random seed
 split_cfg:
   seed: 42
-  index_save_pth: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175-inds"
-  # index_save_pth: "/home/ri/Desktop/Projects/Datasets/AL175-inds"
+  index_save_pth: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/inds"
+  # index_save_pth: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/mass-inds"
   sources:
-    - type: "ratio"
-      # path: "/home/ri/Desktop/Projects/Datasets/AL175"
-      path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
-      layout: "flat"
+    - type: "folder"
+      path: "/home/ri/Desktop/Projects/Datasets/Mass_Roads/dataset"
+      # path: "/cvlabdata2/cvlab/home/oner/Elyar/datasets/dataset"
+      layout: "folders"
       modalities:
         image:
-          pattern: "^cube_(.*)\\.npy$"
+          folder: "sat"
         label:
-          pattern: "^lbl_(.*)\\.npy$"
-        distance:
-          pattern: "^distlbl_(.*)\\.npy$"
-      ratios:
-        train: 0.75
-        valid: 0.2
-        test:  0.05
+          folder: "label"
+        # distance:
+          # folder: "distance"
+        sdf:
+          folder: "sdf"
+      splits:
+        train: "train"
+        valid: "valid"
+        test:  "test"
 
 base_modalities: ["label", "image"]
+
 
 
 # -----------------------------------------------------------------------------
 # Dimensionality & Patch Extraction
 # -----------------------------------------------------------------------------
-data_dim: 3                # 2 = 2D patches, 3 = 3D volumes
+data_dim: 2                # 2 = 2D patches, 3 = 3D volumes
 patch_size: 96            # XY patch size
 patch_size_z: 96           # Z-depth (only for 3D)
 small_window_size: 8       # window for texture/variance check
@@ -44,8 +47,8 @@ save_computed: true               # save new distance/SDF files
 compute_again_modalities: false   # overwrite existing if true
 
 distance_threshold: 15.0          # clip distance maps (null = no clip)
-# sdf_iterations: 3                 # dilation iterations before SDF
-# sdf_thresholds: [-7, 7]           # clip range for SDF values
+sdf_iterations: 3                 # dilation iterations before SDF
+sdf_thresholds: [-7, 7]           # clip range for SDF values
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
@@ -92,64 +95,64 @@ augmentation:
     sigma:  # deformation smoothness
       min: 0.5
       max: 1.5
-  # random_crop:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   size:  # crop size
-  #     x: 96
-  #     y: 96
-  #     z: 96  # only for 3D data
-  # random_resize:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   size:  # resize to this size
-  #     x: 96
-  #     y: 96
-  #     z: 96  # only for 3D data
-  # random_intensity:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  # random_brightness:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   beta_min: -10.0
-  #   beta_max: 20.0
-  # random_gamma:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.8
-  #   max: 1.2
-  # random_gaussian_noise:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.01
-  #   max: 0.03 
-  # random_gaussian_blur:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.5
-  #   max: 1.5
-  # random_bias_field:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.2
-  #   max: 0.4  
-  # random_brightness_contrast:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  #   beta_min: -10.0
-  #   beta_max: 20.0
-  # random_color_jitter:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   brightness: 0.1     
-  #   contrast: 0.1
-  #   saturation: 0.1
-  #   hue: 0.1
+  random_crop:
+    modalities: ["image", "label", "distance", "sdf"]
+    prob: 0.5
+    size:  # crop size
+      x: 96
+      y: 96
+      z: 96  # only for 3D data
+  random_resize:
+    modalities: ["image", "label", "distance", "sdf"]
+    prob: 0.5
+    size:  # resize to this size
+      x: 96
+      y: 96
+      z: 96  # only for 3D data
+  random_intensity:
+    modalities: ["image"]
+    prob: 0.5
+    alpha_min: 0.9
+    alpha_max: 1.1
+  random_brightness:
+    modalities: ["image"]
+    prob: 0.5
+    beta_min: -10.0
+    beta_max: 20.0
+  random_gamma:
+    modalities: ["image"]
+    prob: 0.5
+    min: 0.8
+    max: 1.2
+  random_gaussian_noise:
+    modalities: ["image"]
+    prob: 0.5
+    min: 0.01
+    max: 0.03 
+  random_gaussian_blur:
+    modalities: ["image"]
+    prob: 0.5
+    min: 0.5
+    max: 1.5
+  random_bias_field:
+    modalities: ["image"]
+    prob: 0.5
+    min: 0.2
+    max: 0.4  
+  random_brightness_contrast:
+    modalities: ["image"]
+    prob: 0.5
+    alpha_min: 0.9
+    alpha_max: 1.1
+    beta_min: -10.0
+    beta_max: 20.0
+  random_color_jitter:
+    modalities: ["image"]
+    prob: 0.5
+    brightness: 0.1     
+    contrast: 0.1
+    saturation: 0.1
+    hue: 0.1
 
 
 # -----------------------------------------------------------------------------
@@ -171,10 +174,10 @@ normalization:
     max_val: 15
 
   # # 3) Robust normalization: clip to [lower_q, upper_q] quantiles, then min–max to [0,1]
-  # sdf:
-  #   method: "clip"
-  #   min_val: -7    
-  #   max_val: 7  
+  sdf:
+    method: "clip"
+    min_val: -7    
+    max_val: 7  
 
   # label:
   #   method: "boolian"
