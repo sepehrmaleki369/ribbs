@@ -114,6 +114,7 @@ def main():
         val_metrics_every_n_epochs=val_metrics_every_n,
         train_metric_frequencies=metrics_cfg.get("train_frequencies", {}),
         val_metric_frequencies=metrics_cfg.get("val_frequencies", {}),
+        divisible_by=inference_cfg.get('chunk_divisible_by', 16)
     )
 
     # --- callbacks ---
@@ -147,8 +148,8 @@ def main():
     trainer = pl.Trainer(**trainer_kwargs)
 
     batch = next(iter(dm.train_dataloader()))
-    print("image_patch shape:", batch["image_patch"].shape)   # (B, C, H, W)
-    print("UNet expects    :", lit.model.in_channels)
+    logger.info("image_patch shape:", batch["image_patch"].shape)   # (B, C, H, W)
+    logger.debug("UNet expects    :", lit.model.in_channels)
 
 
     # --- run ---
@@ -213,6 +214,7 @@ class SegLitModule(pl.LightningModule):
         val_metrics_every_n_epochs: int = 1,
         train_metric_frequencies: Dict[str, int] = None,
         val_metric_frequencies: Dict[str, int] = None,
+        divisible_by: int = 16
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
@@ -229,6 +231,8 @@ class SegLitModule(pl.LightningModule):
         self.val_freq = val_metrics_every_n_epochs
         self.train_metric_frequencies = train_metric_frequencies or {}
         self.val_metric_frequencies = val_metric_frequencies or {}
+
+        self.divisible_by = divisible_by
 
         self.py_logger = logging.getLogger(__name__)
     
@@ -267,7 +271,7 @@ class SegLitModule(pl.LightningModule):
         # otherwise (val/test/predict), run full-image chunked inference
         # (validator will pad to divisible-by-16 under the hood)
         with torch.no_grad():
-            y_hat = self.validator.run_chunked_inference(self.model, x)
+            y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
         return y_hat
     
     def on_train_epoch_start(self):
@@ -311,8 +315,20 @@ class SegLitModule(pl.LightningModule):
                 # print('y_int.shape', y_hat.shape)
                 # print('y_int.shape', y_hat.shape)
                 # print(name, metric(y_hat, y_int))
-                self.log(f"train_metrics/{name}", metric(y_hat, y_int),
-                         prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                if name == "ccq":
+                    ccq_value = metric(y_hat, y_int)
+                    correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
+                    completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
+                    quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
+                    self.log(f"train_metrics/{name}/correctness", correctness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"train_metrics/{name}/completeness", completeness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"train_metrics/{name}/quality", quality,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                else:
+                    self.log(f"train_metrics/{name}", metric(y_hat, y_int),
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
         
         # ——— Log GT / Pred stats for TensorBoard ———
         # flatten tensors
@@ -350,7 +366,7 @@ class SegLitModule(pl.LightningModule):
 
         # chunked inference (with built-in padding)
         with torch.no_grad():
-            y_hat = self.validator.run_chunked_inference(self.model, x)
+            y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
         loss_dict = self.loss_fn(y_hat, y)
@@ -377,7 +393,19 @@ class SegLitModule(pl.LightningModule):
                 # print('y_int.shape', y_hat.shape)
                 # print('y_int.shape', y_hat.shape)
                 # print(name, metric(y_hat, y_int))
-                self.log(f"val_metrics/{name}", metric(y_hat, y_int),
+                if name == "ccq":
+                    ccq_value = metric(y_hat, y_int)
+                    correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
+                    completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
+                    quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
+                    self.log(f"val_metrics/{name}/correctness", correctness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"val_metrics/{name}/completeness", completeness,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                    self.log(f"val_metrics/{name}/quality", quality,
+                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                else:
+                    self.log(f"val_metrics/{name}", metric(y_hat, y_int),
                          prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         
         # ——— Log GT / Pred stats for TensorBoard ———
@@ -409,7 +437,7 @@ class SegLitModule(pl.LightningModule):
             x, y = x.unsqueeze(0), y.unsqueeze(0)
 
         with torch.no_grad():
-            y_hat = self.validator.run_chunked_inference(self.model, x)
+            y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
         loss_dict = self.loss_fn(y_hat, y)
@@ -424,7 +452,19 @@ class SegLitModule(pl.LightningModule):
 
         y_int = y
         for name, metric in self.metrics.items():
-            self.log(f"test_metrics/{name}", metric(y_hat, y_int),
+            if name == "ccq":
+                ccq_value = metric(y_hat, y_int)
+                correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
+                completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
+                quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
+                self.log(f"test_metrics/{name}/correctness", correctness,
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                self.log(f"test_metrics/{name}/completeness", completeness,
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                self.log(f"test_metrics/{name}/quality", quality,
+                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+            else:
+                self.log(f"test_metrics/{name}", metric(y_hat, y_int),
                      prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
         return {"predictions": y_hat, "test_loss": loss_dict["mixed"], "gts": y}
@@ -674,6 +714,7 @@ class Validator:
         self,
         model: nn.Module,
         image: torch.Tensor,
+        divisible_by: int,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Full‑image/volume inference with overlapping tiles.
@@ -721,9 +762,9 @@ class Validator:
                 image = F.pad(image, pad_tuple, mode="replicate")
 
         # ----------------------------------------------------------
-        # (B) Second pad until all dims divisible by 16
+        # (B) Second pad until all dims divisible by 
         # ----------------------------------------------------------
-        padded_image, pad_div16 = self._pad_to_valid_size(image, 16)
+        padded_image, pad_div16 = self._pad_to_valid_size(image, divisible_by)
         N, C, *spatial_pad = padded_image.shape
 
         # ----------------------------------------------------------
@@ -736,7 +777,7 @@ class Validator:
             ]
             slices: List[slice] = [slice(None), slice(None)] + [slice(0, t) for t in test_sizes]
             test_patch = padded_image[tuple(slices)]
-            test_patch, _ = self._pad_to_valid_size(test_patch, 16)
+            test_patch, _ = self._pad_to_valid_size(test_patch, divisible_by)
             out_channels = model(test_patch).shape[1]
 
         # Allocate output canvas
@@ -1310,7 +1351,7 @@ def process_in_chuncks(image, output, process, patch_size, patch_margin):
     """
     N,C,D1,D2,...,Dn
     """
-    print('process_in_chuncks',image.shape, output.shape, patch_size, patch_margin)
+    # print('process_in_chuncks',image.shape, output.shape, patch_size, patch_margin)
     assert len(image.shape)==len(output.shape), f'{len(image.shape)}=?{len(output.shape)}'
     assert (len(image.shape)-2)==len(patch_size), f'{(len(image.shape)-2)}?={len(patch_size)} - image.shape:{image.shape}, patch_size:{patch_size}'
     assert len(patch_margin)==len(patch_size)
@@ -1323,98 +1364,71 @@ def process_in_chuncks(image, output, process, patch_size, patch_margin):
 
         crop = image[semicol+semicol+source_c]
         proc_crop = process(crop)
-        print(image.shape, crop.shape, proc_crop.shape)
-        print('proc_crop', proc_crop.detach().cpu().numpy())
-        print('crop', proc_crop.detach().cpu().numpy())
+        # print(image.shape, crop.shape, proc_crop.shape)
+        # print('proc_crop', proc_crop.detach().cpu().numpy())
+        # print('crop', proc_crop.detach().cpu().numpy())
         ########### Changed by Fayzad:
         if len(proc_crop.shape) == 3:  
             proc_crop = proc_crop.unsqueeze(1)  # Convert [1, H, W] -> [1, 1, H, W]
         ###############################
         
         output[semicol+semicol+destin_c] = proc_crop[semicol+semicol+valid_c]
-    print('process_in_chuncks done', output.shape, output.dtype, output.device)
+    # print('process_in_chuncks done', output.shape, output.dtype, output.device)
     return output
 
 
 # ------------------------------------
 # core/mix_loss.py
 # ------------------------------------
-"""
-Mixed loss module that switches between primary and secondary loss functions based on epoch.
-
-This module provides functionality to mix multiple loss functions with configurable weights
-and a switchover epoch for the secondary loss.
-"""
-
-from typing import Any, Dict, List, Optional, Union, Callable
-
 import torch
 import torch.nn as nn
+from typing import Callable, Dict, Optional, Union
 
 
 class MixedLoss(nn.Module):
     """
-    A loss module that mixes multiple loss functions with configurable weights.
-    
-    The secondary loss will only be activated after a specified epoch.
-    
-    Attributes:
-        primary_loss: The primary loss function (used from epoch 0)
-        secondary_loss: The secondary loss function (activated after start_epoch)
-        alpha: Weight for the secondary loss (between 0 and 1)
-        start_epoch: Epoch to start using the secondary loss
-        current_epoch: Current training epoch (updated externally)
+    Primary loss always active; secondary loss kicks in
+    *only* during training (module.train()) and after
+    `start_epoch`.  Nothing extra is required in val/test.
     """
-    
+
     def __init__(
-        self, 
-        primary_loss: Union[nn.Module, Callable], 
+        self,
+        primary_loss: Union[nn.Module, Callable],
         secondary_loss: Optional[Union[nn.Module, Callable]] = None,
         alpha: float = 0.5,
-        start_epoch: int = 0
+        start_epoch: int = 0,
     ):
-        """
-        Initialize the MixedLoss module.
-        
-        Args:
-            primary_loss: The primary loss function (used from epoch 0)
-            secondary_loss: The secondary loss function (used after start_epoch)
-            alpha: Weight for the secondary loss (between 0 and 1)
-            start_epoch: Epoch to start using the secondary loss
-        """
         super().__init__()
         self.primary_loss = primary_loss
         self.secondary_loss = secondary_loss
         self.alpha = alpha
         self.start_epoch = start_epoch
-        self.current_epoch = 0
-    
+        self.current_epoch = 0  # call update_epoch() each epoch
+
+    # ------------------------------------------------------------------
+    # public helpers
+    # ------------------------------------------------------------------
     def update_epoch(self, epoch: int) -> None:
-        """
-        Update the current epoch.
-        
-        Args:
-            epoch: The current epoch number
-        """
-        self.current_epoch = epoch
-    
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Calculate the mixed loss.
-        
-        Args:
-            y_pred: Predicted values
-            y_true: Ground truth values
-            
-        Returns:
-            Tensor containing the calculated loss
-        """
+        self.current_epoch = int(epoch)
+
+    # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
+    def forward(self, y_pred, y_true) -> Dict[str, torch.Tensor]:
         p = self.primary_loss(y_pred, y_true)
-        if self.secondary_loss is None or self.current_epoch < self.start_epoch:
-            s = torch.tensor(0.0, device=p.device, dtype=p.dtype)
-        else:
+
+        use_secondary = (
+            self.secondary_loss is not None
+            and self.training                       # train() vs eval()
+            and self.current_epoch >= self.start_epoch
+        )
+        if use_secondary:
             s = self.secondary_loss(y_pred, y_true)
-        m = (1 - self.alpha) * p + self.alpha * s
+        else:
+            s = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+
+        m = p + self.alpha * s
         return {"primary": p, "secondary": s, "mixed": m}
 
 # ------------------------------------
@@ -3346,7 +3360,6 @@ class Split:
             print(f"→ Split '{sp}': {stem_count} stems")
             for mod, files in mod2files.items():
                 print(f"     {mod:8s}: {len(files)} files")
-            print()
         # ---- end summary ----
 
         self._split2mod2files = split2mod2files
@@ -4022,6 +4035,166 @@ def visualize_batch_3d(
         plt.show()
 
 # ------------------------------------
+# metrics/connected_components.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+import numpy as np
+from skimage import measure
+from typing import Any, List, Tuple, Set
+
+
+class ConnectedComponentsQuality(nn.Module):
+    """
+    Connected Components Quality (CCQ) metric for segmentation.
+
+    Evaluates detection+shape accuracy of connected components in binary
+    (or thresholded) predictions vs. ground truth, on 2-D or 3-D volumes.
+    """
+    def __init__(
+        self,
+        data_dim: int = 2,
+        min_size: int = 5,
+        tolerance: float = 2.0,
+        alpha: float = 0.5,
+        threshold: float = 0.5,
+        greater_is_road: bool = True,
+        eps: float = 1e-8,
+    ):
+        """
+        Args:
+            data_dim: 2 for (H,W) images, 3 for (D,H,W) volumes.
+            min_size: minimum component area/volume to keep.
+            tolerance: max centroid distance (pixels/voxels) to match.
+            alpha: weight [0–1] blending detection vs. shape scores.
+            threshold: binarization cutoff.
+            greater_is_road: direction of thresholding.
+            eps: stability constant.
+        """
+        super().__init__()
+        if data_dim not in (2, 3):
+            raise ValueError("data_dim must be 2 or 3")
+        self.data_dim        = data_dim
+        self.min_size        = int(min_size)
+        self.tolerance       = float(tolerance)
+        self.alpha           = float(alpha)
+        self.threshold       = float(threshold)
+        self.greater_is_road = bool(greater_is_road)
+        self.eps             = float(eps)
+
+    def _bin(self, arr: np.ndarray) -> np.ndarray:
+        return (arr > self.threshold) if self.greater_is_road else (arr <= self.threshold)
+
+    def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
+        # If t is (B, H, W) or (B, D, H, W), insert channel at axis=1
+        if t.dim() == self.data_dim + 1:
+            return t.unsqueeze(1)
+        # Else assume channel present: (B,1,H,W) or (B,1,D,H,W)
+        return t
+
+    def _label_connectivity(self) -> int:
+        # skimage: connectivity=2 for 2-D 8-nbr, =1 for full 3-D adjacency
+        return 2 if self.data_dim == 2 else 1
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            y_pred: (B, …) logits/prob maps or distance maps.
+            y_true: (B, …) ground truth mask or continuous map.
+        Returns:
+            scalar CCQ score (higher is better).
+        """
+        # check for at least (B,H,W) or (B,D,H,W)
+        if y_pred.dim() < self.data_dim + 1 or y_true.dim() < self.data_dim + 1:
+            raise ValueError(f"Inputs must be at least {(self.data_dim+1)}-D")
+
+        # unify channel dimension
+        y_pred = self._ensure_channel(y_pred)
+        y_true = self._ensure_channel(y_true)
+        if y_pred.shape != y_true.shape:
+            raise ValueError(f"Shape mismatch: {y_pred.shape} vs {y_true.shape}")
+
+        B, C = y_pred.shape[:2]
+        if C != 1:
+            raise ValueError(f"CCQ only supports binary masks; got C={C}")
+
+        conn = self._label_connectivity()
+        scores: List[float] = []
+
+        for b in range(B):
+            pred_np = self._bin(y_pred[b,0].detach().cpu().numpy()).astype(np.uint8)
+            true_np = self._bin(y_true[b,0].detach().cpu().numpy()).astype(np.uint8)
+
+            # If ground truth is empty
+            if true_np.sum() == 0:
+                scores.append(1.0 if pred_np.sum() == 0 else 0.0)
+                continue
+
+            # label connected components
+            true_lbl = measure.label(true_np, connectivity=conn)
+            pred_lbl = measure.label(pred_np, connectivity=conn)
+
+            true_props = [p for p in measure.regionprops(true_lbl) if p.area >= self.min_size]
+            pred_props = [p for p in measure.regionprops(pred_lbl) if p.area >= self.min_size]
+
+            # no significant GT components
+            if not true_props:
+                scores.append(1.0 if not pred_props else 0.0)
+                continue
+            # no significant predicted components
+            if not pred_props:
+                scores.append(0.0)
+                continue
+
+            # match components by centroid
+            matches = self._match_components(true_props, pred_props)
+
+            tp = len(matches)
+            fp = len(pred_props) - tp
+            fn = len(true_props) - tp
+            detection = tp / (tp + fp + fn + self.eps)
+
+            # shape: mean IoU over matched pairs
+            shape_scores = []
+            for t_idx, p_idx in matches:
+                t_mask = (true_lbl == true_props[t_idx].label)
+                p_mask = (pred_lbl == pred_props[p_idx].label)
+                inter = np.logical_and(t_mask, p_mask).sum()
+                union = np.logical_or(t_mask, p_mask).sum()
+                shape_scores.append(inter / (union + self.eps))
+            shape = float(np.mean(shape_scores)) if shape_scores else 0.0
+
+            scores.append(self.alpha * detection + (1 - self.alpha) * shape)
+
+        avg = float(np.mean(scores))
+        return torch.tensor(avg, device=y_pred.device)
+
+    def _match_components(
+        self,
+        true_props: List[Any],
+        pred_props: List[Any],
+    ) -> List[Tuple[int, int]]:
+        matches: List[Tuple[int, int]] = []
+        used_pred: Set[int] = set()
+
+        for t_idx, t_prop in enumerate(true_props):
+            tx, ty = t_prop.centroid[:2]
+            best_dist, best_idx = float('inf'), None
+            for p_idx, p_prop in enumerate(pred_props):
+                if p_idx in used_pred:
+                    continue
+                px, py = p_prop.centroid[:2]
+                d = np.hypot(tx - px, ty - py)
+                if d <= self.tolerance and d < best_dist:
+                    best_dist, best_idx = d, p_idx
+            if best_idx is not None:
+                matches.append((t_idx, best_idx))
+                used_pred.add(best_idx)
+
+        return matches
+
+
+# ------------------------------------
 # metrics/dice.py
 # ------------------------------------
 import torch
@@ -4055,6 +4228,7 @@ class ThresholdedDiceMetric(nn.Module):
         multiclass: bool = False,
         zero_division: float = 1.0,
         greater_is_road: bool = True,
+        data_dim: int = 2  # 2D or 3D data
     ):
         super().__init__()
         self.threshold      = float(threshold)
@@ -4062,6 +4236,7 @@ class ThresholdedDiceMetric(nn.Module):
         self.multiclass     = bool(multiclass)
         self.zero_division  = float(zero_division)
         self.greater_is_road = bool(greater_is_road)
+        self.data_dim = int(data_dim)
 
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
         if self.greater_is_road:
@@ -4070,16 +4245,16 @@ class ThresholdedDiceMetric(nn.Module):
             return (x <= self.threshold).float()
 
     def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
-        # (B, H, W) → (B,1,H,W); (B, D, H, W) → (B,1,D,H,W)
-        if t.dim() == 3:
+        """
+        Ensure a channel dimension for 2D or 3D data.
+        For 2D: (B,H,W) -> (B,1,H,W)
+        For 3D: (B,D,H,W) -> (B,1,D,H,W)
+        Leaves (B,1,H,W) or (B,1,D,H,W) unchanged.
+        """
+        expected_dim = 2 + self.data_dim  # batch + channel + spatial
+        if t.dim() == expected_dim - 1:
+            # Missing channel dimension
             return t.unsqueeze(1)
-        if t.dim() == 4:
-            # could be (B, C, H, W) or (B, D, H, W)
-            # if binary mode & C==1, assume it's already channel
-            if not self.multiclass and t.shape[1] == 1:
-                return t
-            return t.unsqueeze(1)
-        # dims == 5: (B, C, D, H, W) already good
         return t
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -4190,6 +4365,7 @@ class ThresholdedIoUMetric(nn.Module):
         multiclass: bool = False,
         zero_division: float = 1.0,
         greater_is_road: bool = True,
+        data_dim: int = 2  # 2D or 3D data
     ):
         super().__init__()
         self.threshold       = float(threshold)
@@ -4197,36 +4373,24 @@ class ThresholdedIoUMetric(nn.Module):
         self.multiclass      = bool(multiclass)
         self.zero_division   = float(zero_division)
         self.greater_is_road = bool(greater_is_road)
-
+        self.data_dim = int(data_dim)
     # --------------------------------------------------------------------- #
     # helpers
     # --------------------------------------------------------------------- #
     def _binarize(self, x: torch.Tensor) -> torch.Tensor:
         return (x > self.threshold).float() if self.greater_is_road else (x <= self.threshold).float()
     
-    
-    # (B, H, W) → becomes (B, 1, H, W)
-    # (B, D, H, W) → becomes (B, 1, D, H, W)
-    # (B, C, H, W) with C==1 in binary mode → stays (B,1,H,W)
-    # (B, C, H, W) with C>1 in multiclass mode → stays (B,C,H,W)
-    # (B, C, D, H, W) → stays (B,C,D,H,W)
     def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Insert a channel dimension for:
-          - 2D no-channel: (B, H, W)   → (B, 1, H, W)
-          - 3D no-channel: (B, D, H, W) → (B, 1, D, H, W)
-        Leave (B, C, H, W) and (B, C, D, H, W) untouched.
+        Ensure a channel dimension for 2D or 3D data.
+        For 2D: (B,H,W) -> (B,1,H,W)
+        For 3D: (B,D,H,W) -> (B,1,D,H,W)
+        Leaves (B,1,H,W) or (B,1,D,H,W) unchanged.
         """
-        if t.dim() == 3:
-            # (B, H, W)
+        expected_dim = 2 + self.data_dim  # batch + channel + spatial
+        if t.dim() == expected_dim - 1:
+            # Missing channel dimension
             return t.unsqueeze(1)
-        if t.dim() == 4:
-            # Could be (B, C, H, W) or (B, D, H, W).
-            # If binary-mode and C==1, treat as channel; else assume depth.
-            if not self.multiclass and t.shape[1] == 1:
-                return t
-            return t.unsqueeze(1)
-        # dims == 5: (B, C, D, H, W) → already good
         return t
 
     # --------------------------------------------------------------------- #
@@ -4419,158 +4583,95 @@ class APLS(nn.Module):
 import torch
 import torch.nn as nn
 import numpy as np
-from skimage import measure
-from typing import Any, List, Tuple, Set
+from scipy import ndimage
+from skimage.morphology import skeletonize
 
+__all__ = ["ThresholdedCCQMetric"]
 
-class ConnectedComponentsQuality(nn.Module):
+class ThresholdedCCQMetric(nn.Module):
     """
-    Connected Components Quality (CCQ) metric for segmentation.
-
-    Evaluates detection+shape accuracy of connected components in binary
-    (or thresholded) predictions vs. ground truth, on 2-D or 3-D volumes.
+    Relaxed Correctness–Completeness–Quality (CCQ) metric for binary masks.
     """
+
     def __init__(
         self,
-        data_dim: int = 2,
-        min_size: int = 5,
-        tolerance: float = 2.0,
-        alpha: float = 0.5,
         threshold: float = 0.5,
+        slack: int = 3,
+        eps: float = 1e-12,
         greater_is_road: bool = True,
-        eps: float = 1e-8,
+        data_dim: int = 2,        # 2 = H,W   · 3 = D,H,W
     ):
-        """
-        Args:
-            data_dim: 2 for (H,W) images, 3 for (D,H,W) volumes.
-            min_size: minimum component area/volume to keep.
-            tolerance: max centroid distance (pixels/voxels) to match.
-            alpha: weight [0–1] blending detection vs. shape scores.
-            threshold: binarization cutoff.
-            greater_is_road: direction of thresholding.
-            eps: stability constant.
-        """
         super().__init__()
-        if data_dim not in (2, 3):
-            raise ValueError("data_dim must be 2 or 3")
-        self.data_dim        = data_dim
-        self.min_size        = int(min_size)
-        self.tolerance       = float(tolerance)
-        self.alpha           = float(alpha)
-        self.threshold       = float(threshold)
+        self.threshold = float(threshold)
+        self.slack = int(slack)
+        self.eps = float(eps)
         self.greater_is_road = bool(greater_is_road)
-        self.eps             = float(eps)
+        self.data_dim = int(data_dim)
 
-    def _bin(self, arr: np.ndarray) -> np.ndarray:
-        return (arr > self.threshold) if self.greater_is_road else (arr <= self.threshold)
+    # --------------------------------------------------------------------- #
+    # Helpers
+    # --------------------------------------------------------------------- #
+    def _binarize(self, x: torch.Tensor) -> np.ndarray:
+        """Torch → NumPy Bool with threshold & polarity."""
+        x_np = x.detach().cpu().numpy()
+        return (x_np > self.threshold) if self.greater_is_road else (x_np <= self.threshold)
+
+    def _skeletonize(self, mask: np.ndarray) -> np.ndarray:
+        return skeletonize(mask)
 
     def _ensure_channel(self, t: torch.Tensor) -> torch.Tensor:
-        # If t is (B, H, W) or (B, D, H, W), insert channel at axis=1
-        if t.dim() == self.data_dim + 1:
+        """Insert missing channel dim → (B,1,...) so we can strip it later."""
+        spatial_dims = 2 + self.data_dim      # B + C + spatial
+        if t.dim() == spatial_dims - 1:
             return t.unsqueeze(1)
-        # Else assume channel present: (B,1,H,W) or (B,1,D,H,W)
         return t
 
-    def _label_connectivity(self) -> int:
-        # skimage: connectivity=2 for 2-D 8-nbr, =1 for full 3-D adjacency
-        return 2 if self.data_dim == 2 else 1
-
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            y_pred: (B, …) logits/prob maps or distance maps.
-            y_true: (B, …) ground truth mask or continuous map.
-        Returns:
-            scalar CCQ score (higher is better).
-        """
-        # check for at least (B,H,W) or (B,D,H,W)
-        if y_pred.dim() < self.data_dim + 1 or y_true.dim() < self.data_dim + 1:
-            raise ValueError(f"Inputs must be at least {(self.data_dim+1)}-D")
-
-        # unify channel dimension
+    # --------------------------------------------------------------------- #
+    # Forward
+    # --------------------------------------------------------------------- #
+    @torch.no_grad()
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> np.ndarray:
         y_pred = self._ensure_channel(y_pred)
         y_true = self._ensure_channel(y_true)
+
         if y_pred.shape != y_true.shape:
-            raise ValueError(f"Shape mismatch: {y_pred.shape} vs {y_true.shape}")
+            raise ValueError(f"Shape mismatch: pred {y_pred.shape}  vs  true {y_true.shape}")
+        if y_pred.shape[1] != 1:
+            raise ValueError("CCQ expects binary masks (C = 1)")
 
-        B, C = y_pred.shape[:2]
-        if C != 1:
-            raise ValueError(f"CCQ only supports binary masks; got C={C}")
+        # ---- to NumPy once ----
+        pred_np = self._binarize(y_pred)[:, 0]      # (B, … spatial …)
+        gt_np   = self._binarize(y_true)[:, 0]
 
-        conn = self._label_connectivity()
-        scores: List[float] = []
+        batch_scores = []
 
-        for b in range(B):
-            pred_np = self._bin(y_pred[b,0].detach().cpu().numpy()).astype(np.uint8)
-            true_np = self._bin(y_true[b,0].detach().cpu().numpy()).astype(np.uint8)
+        for p_bin, g_bin in zip(pred_np, gt_np):
+            p_bin = self._skeletonize(p_bin.astype(bool))
+            g_bin = self._skeletonize(g_bin.astype(bool))
 
-            # If ground truth is empty
-            if true_np.sum() == 0:
-                scores.append(1.0 if pred_np.sum() == 0 else 0.0)
+            # Distance maps on the inverse (background == True)
+            dist_gt   = ndimage.distance_transform_edt(~g_bin)
+            dist_pred = ndimage.distance_transform_edt(~p_bin)
+
+            tp_area = dist_gt   <= self.slack
+            fp_area = dist_gt   >  self.slack
+            fn_area = dist_pred >  self.slack
+
+            TP = np.logical_and(tp_area, p_bin).sum()
+            FP = np.logical_and(fp_area, p_bin).sum()
+            FN = np.logical_and(fn_area, g_bin).sum()
+
+            # Empty–empty special-case  → perfect score
+            if TP + FP + FN == 0:
+                batch_scores.append([1.0, 1.0, 1.0])
                 continue
 
-            # label connected components
-            true_lbl = measure.label(true_np, connectivity=conn)
-            pred_lbl = measure.label(pred_np, connectivity=conn)
+            correctness  = TP / (TP + FP + self.eps)
+            completeness = TP / (TP + FN + self.eps)
+            quality      = TP / (TP + FP + FN + self.eps)
+            batch_scores.append([correctness, completeness, quality])
 
-            true_props = [p for p in measure.regionprops(true_lbl) if p.area >= self.min_size]
-            pred_props = [p for p in measure.regionprops(pred_lbl) if p.area >= self.min_size]
-
-            # no significant GT components
-            if not true_props:
-                scores.append(1.0 if not pred_props else 0.0)
-                continue
-            # no significant predicted components
-            if not pred_props:
-                scores.append(0.0)
-                continue
-
-            # match components by centroid
-            matches = self._match_components(true_props, pred_props)
-
-            tp = len(matches)
-            fp = len(pred_props) - tp
-            fn = len(true_props) - tp
-            detection = tp / (tp + fp + fn + self.eps)
-
-            # shape: mean IoU over matched pairs
-            shape_scores = []
-            for t_idx, p_idx in matches:
-                t_mask = (true_lbl == true_props[t_idx].label)
-                p_mask = (pred_lbl == pred_props[p_idx].label)
-                inter = np.logical_and(t_mask, p_mask).sum()
-                union = np.logical_or(t_mask, p_mask).sum()
-                shape_scores.append(inter / (union + self.eps))
-            shape = float(np.mean(shape_scores)) if shape_scores else 0.0
-
-            scores.append(self.alpha * detection + (1 - self.alpha) * shape)
-
-        avg = float(np.mean(scores))
-        return torch.tensor(avg, device=y_pred.device)
-
-    def _match_components(
-        self,
-        true_props: List[Any],
-        pred_props: List[Any],
-    ) -> List[Tuple[int, int]]:
-        matches: List[Tuple[int, int]] = []
-        used_pred: Set[int] = set()
-
-        for t_idx, t_prop in enumerate(true_props):
-            tx, ty = t_prop.centroid[:2]
-            best_dist, best_idx = float('inf'), None
-            for p_idx, p_prop in enumerate(pred_props):
-                if p_idx in used_pred:
-                    continue
-                px, py = p_prop.centroid[:2]
-                d = np.hypot(tx - px, ty - py)
-                if d <= self.tolerance and d < best_dist:
-                    best_dist, best_idx = d, p_idx
-            if best_idx is not None:
-                matches.append((t_idx, best_idx))
-                used_pred.add(best_idx)
-
-        return matches
+        return np.mean(batch_scores, axis=0)
 
 
 # ------------------------------------

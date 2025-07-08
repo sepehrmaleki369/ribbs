@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import os
 import json
 import random
@@ -11,13 +11,19 @@ from torch.utils.data import Dataset, DataLoader
 from core.general_dataset.io          import load_array_from_file
 from core.general_dataset.modalities  import compute_distance_map, compute_sdf
 from core.general_dataset.patch_validity       import check_min_thrsh_road
-from core.general_dataset.augments    import get_augmentation_metadata, extract_condition_augmentations
 from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
 from core.general_dataset.normalizations import normalize_image
+from core.general_dataset.augmentations import augment_image
 from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
 from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
+import torch
 
+def _to_tensor(obj):
+    """Convert numpy ↦ torch (shared memory) but keep others unchanged."""
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)          # 0-copy, preserves shape/dtype
+    return obj
 
 class GeneralizedDataset(Dataset):
     """
@@ -37,8 +43,6 @@ class GeneralizedDataset(Dataset):
         self.fold = config.get("fold")
         self.num_folds = config.get("num_folds")
         self.verbose: bool = config.get("verbose", False)
-        self.augmentations: List[str] = config.get("augmentations", ["flip_h", "flip_v", "rotation"])
-        self.augmentation_params: Dict[str, Any] = config.get("augmentation_params", {})
         self.distance_threshold: Optional[float] = config.get("distance_threshold")
         self.sdf_iterations: int = config.get("sdf_iterations")
         self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
@@ -51,8 +55,12 @@ class GeneralizedDataset(Dataset):
         self.data_dim    = config.get("data_dim", 2)
         self.split_cfg = config["split_cfg"]
         self.split_cfg['seed'] = self.seed
+        self.order_ops: List[str] = config.get("order_ops", ["crop", "aug", "norm"])
         self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
-        
+        self.aug_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("augmentation", None)
+        assert set(self.order_ops) == {"crop", "aug", "norm"}, \
+                       f"order_ops must be a permutation of ['crop','aug','norm'], got {self.order_ops}"
+
         if self.patch_size is None:
             raise ValueError("patch_size must be specified in the config.")
         if self.data_dim not in (2, 3):
@@ -96,6 +104,7 @@ class GeneralizedDataset(Dataset):
                     else:
                         raise ValueError(f"Unsupported modality {key}")
 
+    
     def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
         imgs: Dict[str, np.ndarray] = {}
         for key in self.modalities:
@@ -113,52 +122,139 @@ class GeneralizedDataset(Dataset):
                 else:
                     raise ValueError(f"Unsupported modality {key}")
             imgs[key] = arr
-        # if self.data_dim == 3:
-        #     for k, v in imgs.items():
-        #         if v.ndim == 3:                # (D, H, W)  →  (1, D, H, W)
-        #             imgs[k] = v[np.newaxis, ...].astype(np.float32)
         if self.verbose:
             print('imgs[key] shape:', imgs[key].shape)
         return imgs
 
-    def _postprocess_patch(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        # Binarize, clip, normalize per modality
+    def normalize_data(self, data):
+        normalized_image = {}
         for key, arr in list(data.items()):
-            if not key.endswith('_patch'):
-                continue
-            modality = key[:-6]
-            patch = arr.astype(np.float32)
-            if modality == 'label':
-                thresh = 127 if patch.max() > 1 else 0
-                data[key] = (patch > thresh).astype(np.uint8)
-            elif modality == 'distance' and self.distance_threshold is not None:
-                data[key] = np.clip(patch, 0, self.distance_threshold)
-            elif modality == 'sdf' and self.sdf_thresholds is not None:
-                lo, hi = self.sdf_thresholds
-                data[key] = np.clip(patch, lo, hi)
-            else:
-                data[key] = patch
-        # Normalization
-        for key, arr in list(data.items()):
-            if not key.endswith('_patch'):
-                continue
-            modality = key[:-6]
-            cfg = self.norm_cfg.get(modality)
-            if isinstance(cfg, dict):
-                method = cfg.get('method', 'minmax')
+            cfg = self.norm_cfg.get(key, None)
+            if cfg:
+                method = cfg.get('method', None)
                 params = {k: v for k, v in cfg.items() if k != 'method'}
-                data[key] = normalize_image(arr, method=method, **params)
+                normalized_image[key] = normalize_image(arr, method=method, **params)
+            else:
+                normalized_image[key] = arr.copy()
+        return normalized_image
+    
+    def augment_data(self, normalized_image):
+        augmented_image = {}
+        for key, arr in list(normalized_image.items()):
+            # print('aug', key)
+            if self.aug_cfg:
+                # print('aug', self.aug_cfg)
+                rng = np.random.RandomState(self.seed)
+                augmented_image[key] = augment_image(arr, self.aug_cfg, self.data_dim, rng)
+            else:
+                augmented_image[key] = arr
+        return augmented_image
 
-        for key, arr in list(data.items()):
-            if not key.endswith("_patch") or not isinstance(arr, np.ndarray):
-                continue
-            # 2-D image  -> (1, H, W)
-            if arr.ndim == 2:
-                data[key] = arr[np.newaxis, ...]
-            # 3-D volume -> (1, D, H, W)
-            elif arr.ndim == 3 and self.data_dim == 3:
-                data[key] = arr[np.newaxis, ...]
+    @staticmethod
+    def _pad_reflect(arr: np.ndarray,
+                     pad_before: Tuple[int, ...],
+                     pad_after:  Tuple[int, ...]) -> np.ndarray:
+        pads = tuple(zip(pad_before, pad_after))
+        return np.pad(arr, pads, mode="reflect")
+
+    def crop(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        if self.split != "train":
+            return data  # keep full image / volume for inference
+
+        # ---------- determine crop coordinates from the first key ----------
+        sample_key = next(k for k in data)
+        sample = data[sample_key]
+
+        if self.data_dim == 2:
+            H, W = sample.shape
+            ph = max(0, self.patch_size - H)
+            pw = max(0, self.patch_size - W)
+
+            # pad if necessary
+            if ph > 0 or pw > 0:
+                for k in data:
+                    arr = data[k]
+                    data[k] = self._pad_reflect(
+                        arr,
+                        pad_before=(ph // 2, pw // 2),
+                        pad_after=(ph - ph // 2, pw - pw // 2),
+                    )
+                H += ph
+                W += pw
+
+            # random top-left corner
+            top = random.randint(0, H - self.patch_size)
+            left = random.randint(0, W - self.patch_size)
+
+            # crop every modality
+            for k in data:
+                data[k] = data[k][
+                    top : top + self.patch_size,
+                    left: left + self.patch_size,
+                ]
+
+        else:  # ----------------------------- 3-D ---------------------------
+            patch_z = self.config.get("patch_size_z", 1)
+            D, H, W = sample.shape
+
+            pd = max(0, patch_z       - D)
+            ph = max(0, self.patch_size - H)
+            pw = max(0, self.patch_size - W)
+
+            if pd or ph or pw:
+                for k in data:
+                    arr = data[k]
+                    data[k] = self._pad_reflect(
+                        arr,
+                        pad_before=(pd // 2, ph // 2, pw // 2),
+                        pad_after=(pd - pd // 2, ph - ph // 2, pw - pw // 2),
+                    )
+                D += pd
+                H += ph
+                W += pw
+
+            front = random.randint(0, D - patch_z)
+            top   = random.randint(0, H - self.patch_size)
+            left  = random.randint(0, W - self.patch_size)
+
+            for k in data:
+                data[k] = data[k][
+                    front : front + patch_z,
+                    top   : top   + self.patch_size,
+                    left  : left  + self.patch_size,
+                ]
+
         return data
+
+    def _postprocess_patch(self, data: Dict[str, np.ndarray], augment: bool) -> Dict[str, np.ndarray]:
+        # ------------------------------------------------------------
+        # 1. Run the ops in user-defined order
+        # ------------------------------------------------------------
+        op = {
+            "crop": lambda d: self.crop(d),
+            "aug":  lambda d: self.augment_data(d) if augment else d,
+            "norm": lambda d: self.normalize_data(d),
+        }
+        for step in self.order_ops:
+            data = op[step](data)
+            # if step == 'norm':
+                # print('after norm', data['label'].min(), data['label'].max())
+
+        # ------------------------------------------------------------
+        # 2. Mark everything as *_patch  (↓ this is the only new line)
+        # ------------------------------------------------------------
+        data = {f"{k}_patch": v for k, v in data.items()}
+
+        # ------------------------------------------------------------
+        # 3. Add channel dim for PyTorch
+        # ------------------------------------------------------------
+        for k, arr in list(data.items()):
+            if arr.ndim == 2:
+                data[k] = arr[None, ...]             # (1, H, W)
+            elif arr.ndim == 3 and self.data_dim == 3:
+                data[k] = arr[None, ...]             # (1, D, H, W)
+        return data
+
 
     def __len__(self) -> int:
         return len(self.modality_files['image'])
@@ -168,60 +264,16 @@ class GeneralizedDataset(Dataset):
         if imgs is None:
             return self.__getitem__((idx + 1) % len(self))
 
-        img = imgs['image']
-        # Determine shape for slicing
-        if self.data_dim == 3:
-            if img.ndim == 4:
-                _, D, H, W = img.shape
-            elif img.ndim == 3:
-                D, H, W = img.shape
-            else:
-                raise ValueError(f"Expected 3D data for data_dim=3; got {img.ndim}D")
-        else:
-            if img.ndim == 2:
-                C, H, W = 1, *img.shape
-            elif img.ndim == 3:
-                C, H, W = img.shape
-            else:
-                raise ValueError(f"Expected 2D or 3-channel image for data_dim=2; got {img.ndim}D")
-
-        # Validation/test: return full image as one patch
+        # Validation/test: returnimage_idx full image as one patch
         if self.split != 'train':
-            data = {}
-            for key, array in imgs.items():
-                data[f"{key}_patch"] = array
-            data['metadata'] = {"image_idx": idx, "x": -1, "y": -1}
-            return self._postprocess_patch(data)
+            return self._postprocess_patch(imgs, augment=False)
 
         # Training: random crop
         attempts = 0
         while attempts < self.max_attempts:
-            x = random.randint(0, W - self.patch_size)
-            y = random.randint(0, H - self.patch_size)
-            patch_meta: Dict[str, Any] = {"image_idx": idx, "x": x, "y": y}
-            if self.augmentations:
-                patch_meta.update(get_augmentation_metadata(self.augmentations, self.data_dim, self.augmentation_params))
-            # Extract patch
-            if self.data_dim == 2:
-                data: Dict[str, np.ndarray] = {}
-                for key, array in imgs.items():
-                    if array.ndim == 2:
-                        patch = array[y:y+self.patch_size, x:x+self.patch_size]
-                    else:
-                        patch = array[:, y:y+self.patch_size, x:x+self.patch_size]
-                    data[f"{key}_patch"] = patch
-                data['metadata'] = patch_meta
-                data = self._postprocess_patch(data)
-            else:
-                data = extract_condition_augmentations(
-                    imgs, patch_meta,
-                    patch_size_xy=self.patch_size,
-                    patch_size_z=self.config.get('patch_size_z', 1),
-                    augmentations=self.augmentations,
-                    data_dim=self.data_dim
-                )
-                data['metadata'] = patch_meta
-                data = self._postprocess_patch(data)
+            data = self._postprocess_patch(imgs, augment=True)
+            for k, v in data.items():
+                data[k] = _to_tensor(v)
 
             # Validate road ratio if needed
             if not self.validate_road_ratio or check_min_thrsh_road(data['label_patch'], self.patch_size, self.threshold):

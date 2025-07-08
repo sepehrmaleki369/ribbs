@@ -96,13 +96,17 @@ def visualize_batch_3d(
         nrows = len(mods)
         ncols = 3
         fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows))
-        project = {
-            "max": np.max,
-            "min": np.min,
-            "mean": np.mean
-        }[projection]
+        
         print(f'Patch {i} ({projection}-projection)')
         for row, mod in enumerate(mods):
+            if 'distance' in mod:
+                projection = 'min' 
+            project = {
+                "max": np.max,
+                "min": np.min,
+                "mean": np.mean
+            }[projection]
+
             vol = vols[mod]
             # Compute projections along axes:
             #   XY: collapse Z axis -> (H, W)

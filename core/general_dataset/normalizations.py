@@ -7,7 +7,8 @@ Define multiple strategies and a unified `normalize` dispatcher, plus a binariza
 import numpy as np
 from core.general_dataset.logger import logger
 from typing import Optional
-
+import numpy as np
+from typing import Union
 
 def min_max_normalize(
     image: np.ndarray,
@@ -79,29 +80,109 @@ def clip_normalize(image: np.ndarray, min_val: float, max_val: float) -> np.ndar
         return np.zeros_like(img)
     return (clipped - min_val) / (max_val - min_val)
 
+def clip_(image: np.ndarray, min_val: float, max_val: float) -> np.ndarray:
+    """
+    Clip intensities to [min_val, max_val] then scale to [0,1].
+    """
+    img = image.astype(np.float32)
+    clipped = np.clip(img, min_val, max_val)
+    if max_val == min_val:
+        logger.warning("Clip normalization: min_val == max_val, returning zeros.")
+        return np.zeros_like(img)
+    return clipped
+
+def divide_by(image: np.ndarray, threshold: float) -> np.ndarray:
+    img = image / threshold
+    return img
+
 
 def binarize(
     image: np.ndarray,
-    threshold: float,
-    greater_is_road: bool = True
+    threshold: Union[float, int],
+    *,
+    greater_is_road: bool = True,
+    return_bool: bool = True,
+    verbose: bool = False,
 ) -> np.ndarray:
-    """
-    Binarize the image based on a threshold.
+    """Convert a label / probability map to a binary road mask.
 
-    Args:
-        image:    Input array.
-        threshold: Value to threshold at.
-        greater_is_road: If True, pixels > threshold become 1; else pixels < threshold become 1.
+    Parameters
+    ----------
+    image : np.ndarray
+        Input array (any dtype convertible to ``np.float32``). Can be 2‑D or 3‑D; the
+        function is applied element‑wise so channels / depth are preserved.
+    threshold : float or int
+        Threshold value.  Pixels **strictly greater** than the threshold become
+        road (1) if ``greater_is_road`` is ``True``; otherwise the inequality is
+        reversed.
+    greater_is_road : bool, default=True
+        Direction of the inequality: if *True*  → ``mask = img > thr``  else
+        ``mask = img <= thr``.
+    return_bool : bool, default=False
+        If *True* the mask is returned as ``bool``; otherwise ``uint8`` (0/1).
+    verbose : bool, default=False
+        Print a small Rich table with min/max, dtype, chosen threshold, etc.  If
+        the *rich* library is not installed this falls back to plain ``print``.
 
-    Returns:
-        A uint8 array of 0s and 1s.
+    Returns
+    -------
+    np.ndarray
+        Binary mask of the same shape as *image* and dtype ``bool`` or
+        ``uint8``.
+
+    Notes
+    -----
+    * If *image* already looks binary (all values in {0,1}), it is returned as
+     ‑is (with optional dtype conversion).
+    * ``threshold`` is **not** auto‑scaled; pass in a value consistent with the
+      actual range of the array.
     """
-    img = image.astype(np.float32)
+
+    # ------------------------------------------------------------
+    # 0. Type & range sanity‑check
+    # ------------------------------------------------------------
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"image must be a numpy array, got {type(image)}")
+
+    if image.dtype.kind not in "iu":  # not int/uint/float
+        raise TypeError(
+            "Unsupported dtype: {} (expected int/uint/float types)".format(image.dtype)
+        )
+
+    # Identity fast‑path: already binary
+    if image.min() >= 0 and image.max() <= 1:
+        mask_bool = image.astype(bool) if image.dtype != bool else image  # cheap
+        return mask_bool if return_bool else mask_bool.astype(np.uint8)
+
+    # ------------------------------------------------------------
+    # 1. Thresholding
+    # ------------------------------------------------------------
+    img_f32 = image.astype(np.float32, copy=False)
     if greater_is_road:
-        mask = img > threshold
+        mask_bool = img_f32 > threshold
     else:
-        mask = img <= threshold
-    return mask.astype(np.uint8)
+        mask_bool = img_f32 <= threshold
+
+    # ------------------------------------------------------------
+    # 2. Optional pretty print with Rich
+    # ------------------------------------------------------------
+    if verbose:
+        msg = {
+            "dtype": str(image.dtype),
+            "shape": image.shape,
+            "min": float(image.min()),
+            "max": float(image.max()),
+            "threshold": float(threshold),
+            "greater_is_road": greater_is_road,
+        }
+        print("[binarize]", msg)
+
+    # ------------------------------------------------------------
+    # 3. Dtype of the output
+    # ------------------------------------------------------------
+    if return_bool:
+        return mask_bool
+    return mask_bool.astype(np.uint8)
 
 
 def normalize(
@@ -109,6 +190,7 @@ def normalize(
     method: str = "minmax",
     **kwargs
 ) -> np.ndarray:
+    # print('image.min(), image.max() before norm', image.min(), image.max())
     """
     Dispatch to a normalization method. Supported methods:
       - 'minmax'    : min_max_normalize
@@ -128,6 +210,10 @@ def normalize(
     elif method == "percentile":
         return percentile_normalize(image, **kwargs)
     elif method == "clip":
+        return clip_(image, **kwargs)
+    elif method == "divide_by":
+        return divide_by(image, **kwargs)
+    elif method == "clip_normalize":
         return clip_normalize(image, **kwargs)
     elif method == "binarize":
         return binarize(image, **kwargs)
