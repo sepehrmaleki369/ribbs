@@ -145,7 +145,7 @@ class GeneralizedDataset(Dataset):
             if modalities is None:
                 raise ValueError(f"Augmentation config for {aug} is missing 'modalities'")
             selected = {k: normalized_image[k] for k in modalities if k in normalized_image}
-            rng = np.random.RandomState(self.seed)
+            rng = np.random.RandomState(np.random.randint(0, 2**32))
             augmented = augment_images(selected, aug, self.aug_cfg[aug], self.data_dim, rng)
             for k_aug, v_aug in augmented.items():
                 augmented_image[k_aug] = v_aug
@@ -163,7 +163,8 @@ class GeneralizedDataset(Dataset):
 
     def crop(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         if self.split != "train":
-            return data  # keep full image / volume for inference
+            # return {k: _to_tensor(v) for k, v in data.items()}  # keep full image / volume for inference
+            return data
 
         # ---------- determine crop coordinates from the first key ----------
         data = crop(data, self.split, self.patch_size, self.data_dim,
@@ -180,11 +181,15 @@ class GeneralizedDataset(Dataset):
             "aug":  lambda d: self.augment_data(d) if augment else d,
             "norm": lambda d: self.normalize_data(d),
         }
+        # print('before ', data['label'].shape, data['label'].min(), data['label'].max())
         for step in self.order_ops:
             # print('before ', step, data['label'].shape, data['label'].min(), data['label'].max())
+            # log_stats('before', step, data['label'])
             data = op[step](data)
             # if step == 'norm':
             # print('after ', step, data['label'].shape, data['label'].min(), data['label'].max())
+            # log_stats('after', step, data['label'])
+        # print('='*50)
 
         # ------------------------------------------------------------
         # 2. Mark everything as *_patch  (↓ this is the only new line)
@@ -212,7 +217,9 @@ class GeneralizedDataset(Dataset):
 
         # Validation/test: returnimage_idx full image as one patch
         if self.split != 'train':
-            return self._postprocess_patch(imgs, augment=False)
+            data = self._postprocess_patch(imgs, augment=False)
+            # convert everything to tensors once all ops are done
+            return {k: _to_tensor(v) for k, v in data.items()}
 
         # Training: random crop
         attempts = 0
@@ -228,6 +235,14 @@ class GeneralizedDataset(Dataset):
 
         logger.warning("No valid patch found after %d attempts on image %d; skipping.", self.max_attempts, idx)
         return self.__getitem__((idx + 1) % len(self))
+
+def log_stats(stage: str, step: str, label: np.ndarray) -> None:
+    """
+    Print shape, min, and max of the label array.
+    """
+    shape = label.shape
+    min_val, max_val = label.min(), label.max()
+    print(f"{stage:<6} | Step: {step:<10} | Shape: {shape!s:<15} | Min: {min_val:.4f} | Max: {max_val:.4f}")
 
 if __name__ == "__main__":
     split_cfg = {

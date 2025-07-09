@@ -39,19 +39,30 @@ def crop(
         ph = max(0, patch_size - H)
         pw = max(0, patch_size - W)
 
-        # pad as needed along spatial dims, preserving channel axis
+        # pad as needed along spatial dims, but never reflect the channel axis
         if ph > 0 or pw > 0:
             for k, arr in data.items():
-                # build pad widths: one tuple per axis
                 if has_channel and arr.ndim == 3:
-                    # (C, H, W)
+                    # arr shape = (C, H, W)
                     pad_before = (0, ph // 2, pw // 2)
                     pad_after  = (0, ph - ph // 2, pw - pw // 2)
+                    pads = tuple(zip(pad_before, pad_after))
+                    # pad channel axis with zeros, spatial axes with reflect
+                    data[k] = np.pad(
+                        arr,
+                        pads,
+                        mode=('constant', 'reflect', 'reflect'),
+                        constant_values=0
+                    )
                 else:
-                    # (H, W)
+                    # arr shape = (H, W)
                     pad_before = (ph // 2, pw // 2)
                     pad_after  = (ph - ph // 2, pw - pw // 2)
-                data[k] = pad_reflect(arr, pad_before=pad_before, pad_after=pad_after)
+                    data[k] = pad_reflect(
+                        arr,
+                        pad_before=pad_before,
+                        pad_after=pad_after
+                    )
             H += ph
             W += pw
 
@@ -79,14 +90,25 @@ def crop(
         if pd > 0 or ph > 0 or pw > 0:
             for k, arr in data.items():
                 if has_channel and arr.ndim == 4:
-                    # (C, D, H, W)
+                    # arr shape = (C, D, H, W)
                     pad_before = (0, pd // 2, ph // 2, pw // 2)
                     pad_after  = (0, pd - pd // 2, ph - ph // 2, pw - pw // 2)
+                    pads = tuple(zip(pad_before, pad_after))
+                    data[k] = np.pad(
+                        arr,
+                        pads,
+                        mode=('constant', 'reflect', 'reflect', 'reflect'),
+                        constant_values=0
+                    )
                 else:
-                    # (D, H, W)
+                    # arr shape = (D, H, W)
                     pad_before = (pd // 2, ph // 2, pw // 2)
                     pad_after  = (pd - pd // 2, ph - ph // 2, pw - pw // 2)
-                data[k] = pad_reflect(arr, pad_before=pad_before, pad_after=pad_after)
+                    data[k] = pad_reflect(
+                        arr,
+                        pad_before=pad_before,
+                        pad_after=pad_after
+                    )
             D0 += pd
             H0 += ph
             W0 += pw
@@ -98,14 +120,16 @@ def crop(
 
         for k, arr in data.items():
             if has_channel and arr.ndim == 4:
-                data[k] = arr[:,
-                               front:front + patch_z,
-                               top:top   + patch_size,
-                               left:left + patch_size]
+                data[k] = arr[
+                    :,
+                    front:front + patch_z,
+                    top:top + patch_size,
+                    left:left + patch_size
+                ]
             else:
                 data[k] = arr[
                     front:front + patch_z,
-                    top:top   + patch_size,
+                    top:top + patch_size,
                     left:left + patch_size
                 ]
 

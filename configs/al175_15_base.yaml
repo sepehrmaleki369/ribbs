@@ -4,13 +4,13 @@
 # Sub-config references
 dataset_config: "AL175_15.yaml"
 model_config: "baseline_3d.yaml"
-loss_config: "fixed_lif_mse_cape.yaml"
+loss_config: "fixed_lif_mse.yaml"
 metrics_config: "dice_iou_ccq.yaml"
 inference_config: "chunk_3d.yaml"
 callbacks_config: "callbacks_3d.yaml"
 
 # Output directory
-output_dir: "experiments/al175_lif_mse_cape_a1"
+output_dir: "experiments/al175_lif_mse"
 
 # Trainer configuration
 trainer:

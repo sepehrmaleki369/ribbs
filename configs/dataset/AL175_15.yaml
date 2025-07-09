@@ -50,7 +50,7 @@ distance_threshold: 15.0          # clip distance maps (null = no clip)
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 2
+train_batch_size: 32
 val_batch_size: 1
 test_batch_size: 1
 num_workers: 4
@@ -76,7 +76,7 @@ augmentation:
     angle:  # degrees
       min: -180.0
       max: 180.0
-      pad: true
+    pad: true
   scale:
     modalities: ["image", "label", "distance", "sdf"]
     prob: 0.5
@@ -84,14 +84,14 @@ augmentation:
       min: 0.75
       max: 1.25
   elastic:
-    modalities: ["image"]
-    prob: 0.5
-    alpha:  # deformation strength
-      min: 0.5
-      max: 1.5
-    sigma:  # deformation smoothness
-      min: 0.5
-      max: 1.5
+    modalities: ["image", "label", "distance", "sdf"]
+    prob: 0.2
+    alpha:
+      min: 0.1
+      max: 0.3
+    sigma:
+      min: 0.1
+      max: 0.3
   # random_crop:
   #   modalities: ["image", "label", "distance", "sdf"]
   #   prob: 0.5

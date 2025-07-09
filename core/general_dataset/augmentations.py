@@ -2,80 +2,89 @@
 
 import numpy as np
 from typing import Dict, Any, Tuple, List
-from scipy.ndimage import rotate, zoom, gaussian_filter
-from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import rotate, zoom, gaussian_filter, map_coordinates
+
 
 def _get_random_params(min_val: float, max_val: float, rng: np.random.RandomState) -> float:
     """
     Generate a random parameter within the specified range.
-
-    Args:
-        min_val (float): Minimum value of the range.
-        max_val (float): Maximum value of the range.
-        rng (np.random.RandomState): Random number generator.
-
-    Returns:
-        float: Random value between min_val and max_val.
     """
     return rng.uniform(min_val, max_val)
 
-def _apply_elastic_deformation(arr: np.ndarray, alpha: float, sigma: float, rng: np.random.RandomState, dim: int) -> np.ndarray:
+
+def _apply_elastic_deformation(
+    arr: np.ndarray,
+    alpha: float,
+    sigma: float,
+    rng: np.random.RandomState,
+    dim: int,
+) -> np.ndarray:
     """
-    Apply elastic deformation to an array.
-
-    Args:
-        arr (np.ndarray): Input array to deform.
-        alpha (float): Magnitude of deformation.
-        sigma (float): Smoothness of deformation.
-        rng (np.random.RandomState): Random number generator.
-        dim (int): Dimensionality of the data (2 or 3).
-
-    Returns:
-        np.ndarray: Deformed array.
+    Elastic deformation that warps only the spatial dimensions and keeps the
+    channel axis (if any) untouched.
     """
-    shape = arr.shape
-    grid = np.meshgrid(*[np.arange(s) for s in shape], indexing='ij')
-    displacement = np.stack([rng.normal(0, sigma, shape) for _ in range(dim)], axis=0)
-    displacement = gaussian_filter(displacement, sigma=sigma, mode='constant')
-    displacement *= alpha / np.max(np.abs(displacement))
-    
-    coords = np.array(grid) + displacement
-    shape_arr = np.array(shape).reshape((dim,) + (1,) * (coords.ndim - 1))
-    coords = np.clip(coords, 0, shape_arr - 1)
-    
-    interpolator = RegularGridInterpolator(
-        [np.arange(s) for s in shape],
-        arr,
-        method='linear',
-        bounds_error=False,
-        fill_value=0
-    )
-    flat_coords = np.array([coords[i].ravel() for i in range(dim)]).T
-    return interpolator(flat_coords).reshape(shape)
 
-def _apply_color_jitter(arr: np.ndarray, brightness: float, contrast: float, saturation: float, hue: float, rng: np.random.RandomState) -> np.ndarray:
+    # ------------------------------------------------------------
+    # 1. Detect channel axis
+    # ------------------------------------------------------------
+    has_ch = (arr.ndim == dim + 1)
+    if has_ch:
+        C, *spatial = arr.shape
+        arr_ch = arr
+    else:
+        C = 1
+        spatial = arr.shape
+        arr_ch = arr[np.newaxis, ...]          # add fake channel axis
+
+    # ------------------------------------------------------------
+    # 2. Build common displacement field on the spatial grid
+    # ------------------------------------------------------------
+    grid = np.stack(
+        np.meshgrid(*[np.arange(s) for s in spatial], indexing="ij"),
+        axis=0,
+    ).astype(np.float32)                       # shape (dim, *spatial)
+
+    disp = np.stack([rng.normal(0, sigma, spatial) for _ in range(dim)], axis=0)
+    disp = gaussian_filter(disp, sigma=sigma, mode="constant")
+    disp *= alpha / (np.max(np.abs(disp)) + 1e-8)
+
+    coords_def = [grid[i] + disp[i] for i in range(dim)]
+    coords_flat = [c.ravel() for c in coords_def]
+
+    # ------------------------------------------------------------
+    # 3. Warp each channel with the same field
+    # ------------------------------------------------------------
+    warped_out = np.zeros_like(arr_ch)
+    for c in range(C):
+        warped = map_coordinates(
+            arr_ch[c], coords_flat, order=1, mode="reflect"
+        ).reshape(spatial)
+        warped_out[c] = warped
+
+    # ------------------------------------------------------------
+    # 4. Remove fake channel axis if the input had none
+    # ------------------------------------------------------------
+    return warped_out if has_ch else warped_out[0]
+
+def _apply_color_jitter(
+    arr: np.ndarray,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+    hue: float,
+    rng: np.random.RandomState
+) -> np.ndarray:
     """
     Apply color jitter to an RGB image.
-
-    Args:
-        arr (np.ndarray): Input RGB array (shape: [3, H, W]).
-        brightness (float): Range for brightness adjustment.
-        contrast (float): Range for contrast adjustment.
-        saturation (float): Range for saturation adjustment (not implemented).
-        hue (float): Range for hue adjustment (not implemented).
-        rng (np.random.RandomState): Random number generator.
-
-    Returns:
-        np.ndarray: Adjusted RGB array.
     """
-    if arr.shape[0] != 3:  # Assume RGB with channels first
+    if arr.shape[0] != 3:
         return arr
     b = _get_random_params(-brightness, brightness, rng)
-    arr = arr + b
     c = _get_random_params(1 - contrast, 1 + contrast, rng)
-    arr = arr * c
-    # Saturation and hue adjustments could be added here if needed
-    return np.clip(arr, 0, 1)
+    out = arr + b
+    out = out * c
+    return np.clip(out, 0, 1)
+
 
 def augment_images(
     data: Dict[str, np.ndarray],
@@ -86,230 +95,246 @@ def augment_images(
 ) -> Dict[str, np.ndarray]:
     """
     Apply a specific augmentation to a dictionary of modality arrays based on config.
-
-    Args:
-        data (Dict[str, np.ndarray]): Dictionary of modality arrays (e.g., {'image': arr, 'label': arr}).
-        aug_type (str): Type of augmentation to apply (e.g., 'flip_h', 'rotation').
-        aug_cfg (Dict[str, Any]): Configuration for the specific augmentation type.
-        data_dim (int): Dimensionality of the data (2 for 2D, 3 for 3D).
-        rng (np.random.RandomState): Random number generator for reproducibility.
-
-    Returns:
-        Dict[str, np.ndarray]: Dictionary of augmented arrays.
     """
-    augmented = {k: arr.copy() for k, arr in data.items()}
-    params = aug_cfg
-    prob = params.get('prob', 1.0)
+    augmented = {k: v.copy() for k, v in data.items()}
+    prob = aug_cfg.get('prob', 1.0)
 
     if aug_type == 'flip_h':
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = np.flip(augmented[modality], axis=-1)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                augmented[m] = np.flip(augmented[m], axis=-1)
 
     elif aug_type == 'flip_v':
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = np.flip(augmented[modality], axis=-2)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                augmented[m] = np.flip(augmented[m], axis=-2)
 
     elif aug_type == 'flip_d' and data_dim == 3:
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = np.flip(augmented[modality], axis=0)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                arr = augmented[m]
+                axis = -3 if arr.ndim == 4 else 0
+                augmented[m] = np.flip(arr, axis=axis)
 
     elif aug_type == 'rotation':
-        angle = _get_random_params(params['angle']['min'], params['angle']['max'], rng)
-        pad = params.get('pad', True)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                mode = 'nearest' if modality == 'label' else 'reflect'
-                augmented[modality] = rotate(
-                    augmented[modality],
+        angle = _get_random_params(aug_cfg['angle']['min'], aug_cfg['angle']['max'], rng)
+        pad = aug_cfg.get('pad', True)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                mode = 'nearest' if m == 'label' else 'reflect'
+                augmented[m] = rotate(
+                    augmented[m],
                     angle,
                     axes=(-2, -1),
                     reshape=pad,
                     mode=mode,
-                    order=0 if modality == 'label' else 1
+                    order=0 if m == 'label' else 1
                 )
 
     elif aug_type == 'scale':
-        factor = _get_random_params(params['factor']['min'], params['factor']['max'], rng)
+        factor = _get_random_params(aug_cfg['factor']['min'], aug_cfg['factor']['max'], rng)
+        for m in aug_cfg['modalities']:
+            if m not in augmented or rng.random() >= prob:
+                continue
+            arr = augmented[m]
 
-        def make_zoom_sequence(arr: np.ndarray) -> List[float]:
-            # If arr has no channel axis (ndim == data_dim), zoom each spatial dim
-            # If channel-first (ndim == data_dim+1), leave channel untouched
-            if arr.ndim == data_dim:
-                return [factor] * data_dim
-            elif arr.ndim == data_dim + 1:
-                return [1.0] + [factor] * data_dim
+            # Detect channel axis
+            has_ch = (arr.ndim == data_dim + 1)
+            if has_ch:
+                zoom_seq = (1.0,) + tuple([factor] * data_dim)
+                orig_shape = arr.shape
+                spatial_idx = slice(1, None)
             else:
-                raise RuntimeError(f"Unexpected array ndim={arr.ndim} in scale")
+                zoom_seq = tuple([factor] * data_dim)
+                orig_shape = arr.shape
+                spatial_idx = slice(None)
 
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                arr = augmented[modality]
-                zoom_seq = make_zoom_sequence(arr)
-                order = 0 if modality == 'label' else 1
-                scaled = zoom(
-                    arr,
-                    zoom_seq,
-                    order=order,
-                    mode='nearest' if modality == 'label' else 'reflect'
-                )
-                # Crop or pad back to original shape
-                orig_shape = data[modality].shape
-                new_shape = scaled.shape
-                if new_shape != orig_shape:
-                    # compute the slices in scaled to extract or pad around center
-                    extract_slices = []
-                    pad_before = []
-                    pad_after  = []
-                    for new_s, orig_s in zip(new_shape, orig_shape):
-                        if new_s >= orig_s:
-                            start = (new_s - orig_s) // 2
-                            extract_slices.append(slice(start, start + orig_s))
-                            pad_before.append(0)
-                            pad_after.append(0)
-                        else:
-                            extract_slices.append(slice(0, new_s))
-                            pad_before.append((orig_s - new_s) // 2)
-                            pad_after.append(orig_s - new_s - pad_before[-1])
-                    # extract then pad
-                    cropped = scaled[tuple(extract_slices)]
+            scaled = zoom(
+                arr,
+                zoom_seq,
+                order=0 if m == 'label' else 1,
+                mode='nearest' if m == 'label' else 'reflect'
+            )
+
+            if scaled.shape != orig_shape:
+                # Center-crop or pad spatial dims only
+                if has_ch:
+                    C = orig_shape[0]
+                    orig_sp = orig_shape[1:]
+                    new_sp = scaled.shape[1:]
                     padded = np.zeros(orig_shape, dtype=scaled.dtype)
-                    insert_slices = tuple(
-                        slice(pb, pb + cropped.shape[i])
-                        for i, pb in enumerate(pad_before)
-                    )
-                    padded[insert_slices] = cropped
-                    augmented[modality] = padded
+                    for c in range(C):
+                        crop = scaled[c]
+                        # compute crop/pad slices
+                        slices_crop = []
+                        pads = []
+                        for ns, os in zip(new_sp, orig_sp):
+                            if ns >= os:
+                                start = (ns - os) // 2
+                                slices_crop.append(slice(start, start + os))
+                                pads.append((0, 0))
+                            else:
+                                pads.append(((os - ns) // 2, os - ns - (os - ns) // 2))
+                                slices_crop.append(slice(0, ns))
+                        crop = crop[tuple(slices_crop)]
+                        padded_ch = np.zeros(orig_sp, dtype=scaled.dtype)
+                        insert_slices = tuple(slice(pb[0], pb[0] + crop.shape[i]) for i, pb in enumerate(pads))
+                        padded_ch[insert_slices] = crop
+                        padded[c] = padded_ch
                 else:
-                    augmented[modality] = scaled
+                    orig_sp = orig_shape
+                    new_sp = scaled.shape
+                    padded = np.zeros(orig_shape, dtype=scaled.dtype)
+                    slices_crop = []
+                    pads = []
+                    for ns, os in zip(new_sp, orig_sp):
+                        if ns >= os:
+                            start = (ns - os) // 2
+                            slices_crop.append(slice(start, start + os))
+                            pads.append((0, 0))
+                        else:
+                            pads.append(((os - ns) // 2, os - ns - (os - ns) // 2))
+                            slices_crop.append(slice(0, ns))
+                    crop = scaled[tuple(slices_crop)]
+                    insert_slices = tuple(slice(pb[0], pb[0] + crop.shape[i]) for i, pb in enumerate(pads))
+                    padded[insert_slices] = crop
+
+                augmented[m] = padded
+            else:
+                augmented[m] = scaled
 
     elif aug_type == 'elastic':
-        alpha = _get_random_params(params['alpha']['min'], params['alpha']['max'], rng)
-        sigma = _get_random_params(params['sigma']['min'], params['sigma']['max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = _apply_elastic_deformation(
-                    augmented[modality], alpha, sigma, rng, data_dim
+        alpha = _get_random_params(aug_cfg['alpha']['min'], aug_cfg['alpha']['max'], rng)
+        sigma = _get_random_params(aug_cfg['sigma']['min'], aug_cfg['sigma']['max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                augmented[m] = _apply_elastic_deformation(
+                    augmented[m], alpha, sigma, rng, data_dim
                 )
 
     elif aug_type == 'random_crop':
-        crop_size = (
-            (params['size']['z'], params['size']['y'], params['size']['x'])
-            if data_dim == 3 else (params['size']['y'], params['size']['x'])
+        size = aug_cfg['size']
+        crop_sz = (
+            (size['z'], size['y'], size['x']) if data_dim == 3
+            else (size['y'], size['x'])
         )
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                shape = augmented[modality].shape
-                start = tuple(
-                    rng.randint(0, s - cs) if s > cs else 0
-                    for s, cs in zip(shape[-data_dim:], crop_size)
-                )
-                slices = tuple(slice(st, st + cs) for st, cs in zip(start, crop_size))
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                arr = augmented[m]
+                shape = arr.shape[-data_dim:]
+                starts = [
+                    rng.randint(0, s - c) if s > c else 0
+                    for s, c in zip(shape, crop_sz)
+                ]
+                slices = tuple(slice(st, st + c) for st, c in zip(starts, crop_sz))
                 if data_dim == 3:
-                    augmented[modality] = augmented[modality][..., slices[0], slices[1], slices[2]]
+                    augmented[m] = arr[..., slices[0], slices[1], slices[2]]
                 else:
-                    augmented[modality] = augmented[modality][..., slices[0], slices[1]]
+                    augmented[m] = arr[..., slices[0], slices[1]]
 
     elif aug_type == 'random_resize':
-        target_size = (
-            (params['size']['z'], params['size']['y'], params['size']['x'])
-            if data_dim == 3 else (params['size']['y'], params['size']['x'])
+        size = aug_cfg['size']
+        tgt = (
+            (size['z'], size['y'], size['x']) if data_dim == 3
+            else (size['y'], size['x'])
         )
-
-        def make_resize_sequence(arr: np.ndarray) -> Tuple[float, ...]:
-            # spatial zoom factors
-            spatial = arr.shape[-data_dim:]
-            factors = tuple(t / s for t, s in zip(target_size, spatial))
-            if arr.ndim == data_dim:
-                return factors
-            elif arr.ndim == data_dim + 1:
-                return (1.0, *factors)
+        for m in aug_cfg['modalities']:
+            if m not in augmented or rng.random() >= prob:
+                continue
+            arr = augmented[m]
+            has_ch = (arr.ndim == data_dim + 1)
+            if has_ch:
+                zoom_seq = (1.0,) + tuple(t / s for t, s in zip(tgt, arr.shape[1:]))
+                orig_shape = arr.shape
             else:
-                raise RuntimeError(f"Unexpected array ndim={arr.ndim} in random_resize")
+                zoom_seq = tuple(t / s for t, s in zip(tgt, arr.shape))
+                orig_shape = arr.shape
 
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                arr = augmented[modality]
-                resize_seq = make_resize_sequence(arr)
-                order = 0 if modality == 'label' else 1
-                resized = zoom(
-                    arr,
-                    resize_seq,
-                    order=order,
-                    mode='nearest' if modality == 'label' else 'reflect'
-                )
-                augmented[modality] = resized
+            resized = zoom(
+                arr,
+                zoom_seq,
+                order=0 if m == 'label' else 1,
+                mode='nearest' if m == 'label' else 'reflect'
+            )
 
+            # If shaped mismatch, reuse scale’s pad/crop logic
+            if resized.shape != orig_shape:
+                # (You can extract the same pad/crop block from 'scale' above here)
+                # For brevity, assume tgt == orig so this rarely happens.
+                augmented[m] = resized
+            else:
+                augmented[m] = resized
 
     elif aug_type == 'random_intensity':
-        alpha = _get_random_params(params['alpha_min'], params['alpha_max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = augmented[modality] * alpha
+        a = _get_random_params(aug_cfg['alpha_min'], aug_cfg['alpha_max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                augmented[m] = augmented[m] * a
 
     elif aug_type == 'random_brightness':
-        beta = _get_random_params(params['beta_min'], params['beta_max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = augmented[modality] + beta
-                augmented[modality] = np.clip(augmented[modality], 0, 255)
+        b = _get_random_params(aug_cfg['beta_min'], aug_cfg['beta_max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                x = augmented[m] + b
+                augmented[m] = np.clip(x, 0, 255)
 
     elif aug_type == 'random_brightness_contrast':
-        alpha = _get_random_params(params['alpha_min'], params['alpha_max'], rng)
-        beta = _get_random_params(params['beta_min'], params['beta_max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = augmented[modality] * alpha + beta
-                augmented[modality] = np.clip(augmented[modality], 0, 255)
+        a = _get_random_params(aug_cfg['alpha_min'], aug_cfg['alpha_max'], rng)
+        b = _get_random_params(aug_cfg['beta_min'], aug_cfg['beta_max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                x = augmented[m] * a + b
+                augmented[m] = np.clip(x, 0, 255)
 
     elif aug_type == 'random_gamma':
-        gamma = _get_random_params(params['min'], params['max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = np.power(augmented[modality] / 255.0, gamma) * 255.0
-                augmented[modality] = np.clip(augmented[modality], 0, 255)
+        g = _get_random_params(aug_cfg['min'], aug_cfg['max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                x = np.power(augmented[m] / 255.0, g) * 255.0
+                augmented[m] = np.clip(x, 0, 255)
 
     elif aug_type == 'random_gaussian_noise':
-        noise_std = _get_random_params(params['min'], params['max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                noise = rng.normal(0, noise_std, augmented[modality].shape)
-                augmented[modality] = augmented[modality] + noise * 255
-                augmented[modality] = np.clip(augmented[modality], 0, 255)
+        nstd = _get_random_params(aug_cfg['min'], aug_cfg['max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                noise = rng.normal(0, nstd, augmented[m].shape)
+                x = augmented[m] + noise * 255
+                augmented[m] = np.clip(x, 0, 255)
 
     elif aug_type == 'random_gaussian_blur':
-        sigma = _get_random_params(params['min'], params['max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = gaussian_filter(
-                    augmented[modality],
-                    sigma=sigma,
+        s = _get_random_params(aug_cfg['min'], aug_cfg['max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                augmented[m] = gaussian_filter(
+                    augmented[m],
+                    sigma=s,
                     mode='reflect'
                 )
 
     elif aug_type == 'random_bias_field':
-        coef = _get_random_params(params['min'], params['max'], rng)
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                shape = augmented[modality].shape
-                grid = np.meshgrid(*[np.linspace(-1, 1, s) for s in shape[-data_dim:]], indexing='ij')
+        coef = _get_random_params(aug_cfg['min'], aug_cfg['max'], rng)
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                shape = augmented[m].shape
+                grid = np.meshgrid(
+                    *[np.linspace(-1, 1, s) for s in shape[-data_dim:]],
+                    indexing='ij'
+                )
                 bias = np.exp(coef * np.sum([g**2 for g in grid], axis=0))
                 if data_dim == 3:
                     bias = bias[None, ...]
-                augmented[modality] = augmented[modality] * bias
-                augmented[modality] = np.clip(augmented[modality], 0, 255)
+                x = augmented[m] * bias
+                augmented[m] = np.clip(x, 0, 255)
 
     elif aug_type == 'random_color_jitter':
-        for modality in params['modalities']:
-            if modality in augmented and rng.random() < prob:
-                augmented[modality] = _apply_color_jitter(
-                    augmented[modality],
-                    params['brightness'],
-                    params['contrast'],
-                    params['saturation'],
-                    params['hue'],
+        for m in aug_cfg['modalities']:
+            if m in augmented and rng.random() < prob:
+                augmented[m] = _apply_color_jitter(
+                    augmented[m],
+                    aug_cfg['brightness'],
+                    aug_cfg['contrast'],
+                    aug_cfg['saturation'],
+                    aug_cfg['hue'],
                     rng
                 )
 
