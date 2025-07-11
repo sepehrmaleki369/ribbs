@@ -89,4 +89,10 @@ class ThresholdedCCQMetric(nn.Module):
             quality      = TP / (TP + FP + FN + self.eps)
             batch_scores.append([correctness, completeness, quality])
 
-        return np.mean(batch_scores, axis=0)
+        mean_scores = np.mean(batch_scores, axis=0)
+        correctness_mean, completeness_mean, quality_mean = mean_scores
+        return {
+                "correctness": correctness_mean,
+                "completeness": completeness_mean,
+                "quality": quality_mean
+            }

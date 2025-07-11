@@ -8,7 +8,9 @@ callbacks:
       metric_names:
         - dice
         - iou
-        - ccq
+        - ccq_correctness
+        - ccq_completeness
+        - ccq_quality
         - apls
       mode: max               # or "min" (or a dict per metric)
       save_last: true

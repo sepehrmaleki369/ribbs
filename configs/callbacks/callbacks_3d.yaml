@@ -6,10 +6,12 @@ callbacks:
       dirpath: checkpoints
       # must match your metric loader
       metric_names:
-        - dive
+        - dice
         - iou
-        - ccq
-        # - apls
+        - correctness
+        - completeness
+        - quality
+        - apls
       mode: max               # or "min" (or a dict per metric)
       save_last: true
       last_k: 1

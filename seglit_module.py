@@ -123,24 +123,19 @@ class SegLitModule(pl.LightningModule):
         y_int = y
         for name, metric in self.metrics.items():
             freq = self.train_metric_frequencies.get(name, self.train_freq)
-            if (self.current_epoch+1) % freq == 0:
-                # print('y_int.shape', y_hat.shape)
-                # print('y_int.shape', y_hat.shape)
-                # print(name, metric(y_hat, y_int))
-                if name == "ccq":
-                    ccq_value = metric(y_hat, y_int)
-                    correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
-                    completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
-                    quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
-                    self.log(f"train_metrics/{name}/correctness", correctness,
-                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                    self.log(f"train_metrics/{name}/completeness", completeness,
-                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                    self.log(f"train_metrics/{name}/quality", quality,
-                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                else:
-                    self.log(f"train_metrics/{name}", metric(y_hat, y_int),
-                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+            if (self.current_epoch + 1) % freq != 0:
+                continue
+            result = metric(y_hat, y_int)
+            if isinstance(result, dict):
+                for subname, value in result.items():
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+            else:
+                if isinstance(result, torch.Tensor):
+                    result = result.item()
+                self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+
         
         # ——— Log GT / Pred stats for TensorBoard ———
         # flatten tensors
@@ -205,21 +200,17 @@ class SegLitModule(pl.LightningModule):
                 # print('y_int.shape', y_hat.shape)
                 # print('y_int.shape', y_hat.shape)
                 # print(name, metric(y_hat, y_int))
-                if name == "ccq":
-                    ccq_value = metric(y_hat, y_int)
-                    correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
-                    completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
-                    quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
-                    self.log(f"val_metrics/{name}/correctness", correctness,
-                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                    self.log(f"val_metrics/{name}/completeness", completeness,
-                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                    self.log(f"val_metrics/{name}/quality", quality,
-                             prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+                result = metric(y_hat, y_int)
+                if isinstance(result, dict):
+                    for subname, value in result.items():
+                        if isinstance(value, torch.Tensor):
+                            value = value.item()
+                        self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
                 else:
-                    self.log(f"val_metrics/{name}", metric(y_hat, y_int),
-                         prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
-        
+                    if isinstance(result, torch.Tensor):
+                        result = result.item()
+                    self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+
         # ——— Log GT / Pred stats for TensorBoard ———
         # flatten tensors
         pred_flat = y_hat.flatten()
@@ -264,20 +255,16 @@ class SegLitModule(pl.LightningModule):
 
         y_int = y
         for name, metric in self.metrics.items():
-            if name == "ccq":
-                ccq_value = metric(y_hat, y_int)
-                correctness = ccq_value[0].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[0]
-                completeness = ccq_value[1].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[1]
-                quality = ccq_value[2].item() if isinstance(ccq_value, torch.Tensor) else ccq_value[2]
-                self.log(f"test_metrics/{name}/correctness", correctness,
-                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                self.log(f"test_metrics/{name}/completeness", completeness,
-                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
-                self.log(f"test_metrics/{name}/quality", quality,
-                            prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0))
+            result = metric(y_hat, y_int)
+            if isinstance(result, dict):
+                for subname, value in result.items():
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
             else:
-                self.log(f"test_metrics/{name}", metric(y_hat, y_int),
-                     prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+                if isinstance(result, torch.Tensor):
+                    result = result.item()
+                self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
 
         return {"predictions": y_hat, "test_loss": loss_dict["mixed"], "gts": y}
 

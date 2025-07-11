@@ -7,7 +7,7 @@ primary_loss:
   params:
     sdf_min: -7.0
     sdf_max: 7.0
-    n_bins: 256
+    n_bins: 15
     eps: 0.02
     freeze_after_first: False
     reduction: "mean"
