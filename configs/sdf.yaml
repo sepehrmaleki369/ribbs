@@ -2,7 +2,7 @@
 # This file references all sub-configs and sets high-level training parameters
 
 # Sub-config references
-dataset_config: "massroads.yaml"
+dataset_config: "mass.yaml"
 model_config: "baseline.yaml"
 loss_config: "fixed_lif_mse_chamfer.yaml"
 metrics_config: "segmentation.yaml"

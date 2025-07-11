@@ -31,6 +31,7 @@ from core.general_dataset.logger import logger
 #         else:
 #             collated[key] = items
 #     return collated
+
 def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch = [b for b in batch if b is not None]
     if not batch:
@@ -45,6 +46,7 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             collated[key] = items                  # e.g. metadata strings
     return collated
+
 def worker_init_fn(worker_id):
     """
     DataLoader worker initialization to ensure different random seeds for each worker.
@@ -52,3 +54,4 @@ def worker_init_fn(worker_id):
     seed = torch.initial_seed() % 2**32
     np.random.seed(seed)
     random.seed(seed)
+    torch.manual_seed(seed)

@@ -14,7 +14,7 @@ from core.general_dataset.patch_validity       import check_min_thrsh_road
 from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
 from core.general_dataset.normalizations import normalize_image
 from core.general_dataset.augmentations import augment_images
-from core.general_dataset.crop import crop
+from core.general_dataset.crop import bigger_crop, center_crop
 from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
 from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
@@ -34,19 +34,13 @@ class GeneralizedDataset(Dataset):
         super().__init__()
         self.config = config
         self.split: str = config.get("split", "train")
-        self.patch_size: int = config.get("patch_size", 128)
-        self.small_window_size: int = config.get("small_window_size", 8)
-        self.threshold: float = config.get("threshold", 0.05)
+        self.patch_size: List[int] = config.get("patch_size", [128,128])
         self.max_images: Optional[int] = config.get("max_images")
-        self.max_attempts: int = config.get("max_attempts", 10)
-        self.validate_road_ratio: bool = config.get("validate_road_ratio", False)
         self.seed: int = config.get("seed", 42)
         self.fold = config.get("fold")
         self.num_folds = config.get("num_folds")
         self.verbose: bool = config.get("verbose", False)
-        self.distance_threshold: Optional[float] = config.get("distance_threshold")
         self.sdf_iterations: int = config.get("sdf_iterations")
-        self.sdf_thresholds: List[float] = config.get("sdf_thresholds")
         self.num_workers: int = config.get("num_workers", 4)
         self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
         self.source_folder: str = config.get("source_folder", "")
@@ -60,12 +54,8 @@ class GeneralizedDataset(Dataset):
         self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
         self.aug_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("augmentation", None)
 
-        if self.patch_size is None:
-            raise ValueError("patch_size must be specified in the config.")
         if self.data_dim not in (2, 3):
             raise ValueError(f"data_dim must be 2 or 3, got {self.data_dim}")
-        if self.data_dim == 3 and config.get("patch_size_z", 1) < 2:
-            raise ValueError("patch_size_z must > 1 for 3D")
 
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -103,7 +93,6 @@ class GeneralizedDataset(Dataset):
                     else:
                         raise ValueError(f"Unsupported modality {key}")
 
-    
     def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
         imgs: Dict[str, np.ndarray] = {}
         for key in self.modalities:
@@ -138,15 +127,16 @@ class GeneralizedDataset(Dataset):
                 normalized_image[key] = arr.copy()
         return normalized_image
     
-    def augment_data(self, normalized_image):
+    def augment_data(self, normalized_image, sample_rng):
+        if self.aug_cfg is None:
+            return normalized_image
         augmented_image = {}
         for aug in self.aug_cfg:
             modalities = self.aug_cfg[aug].get('modalities', None)
             if modalities is None:
                 raise ValueError(f"Augmentation config for {aug} is missing 'modalities'")
             selected = {k: normalized_image[k] for k in modalities if k in normalized_image}
-            rng = np.random.RandomState(np.random.randint(0, 2**32))
-            augmented = augment_images(selected, aug, self.aug_cfg[aug], self.data_dim, rng)
+            augmented = augment_images(selected, aug, self.aug_cfg[aug], self.data_dim, rng=sample_rng)
             for k_aug, v_aug in augmented.items():
                 augmented_image[k_aug] = v_aug
         for key, arr in list(normalized_image.items()):
@@ -154,51 +144,29 @@ class GeneralizedDataset(Dataset):
                 augmented_image[key] = arr.copy()
         return augmented_image
 
-    @staticmethod
-    def _pad_reflect(arr: np.ndarray,
-                     pad_before: Tuple[int, ...],
-                     pad_after:  Tuple[int, ...]) -> np.ndarray:
-        pads = tuple(zip(pad_before, pad_after))
-        return np.pad(arr, pads, mode="reflect")
 
-    def crop(self, data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        if self.split != "train":
-            # return {k: _to_tensor(v) for k, v in data.items()}  # keep full image / volume for inference
-            return data
-
-        # ---------- determine crop coordinates from the first key ----------
-        data = crop(data, self.split, self.patch_size, self.data_dim,
-                    patch_size_z=self.config.get("patch_size_z", 1),
-                    pad_reflect=self._pad_reflect)
-        return data
-    
-    def _postprocess_patch(self, data: Dict[str, np.ndarray], augment: bool) -> Dict[str, np.ndarray]:
-        # ------------------------------------------------------------
-        # 1. Run the ops in user-defined order
-        # ------------------------------------------------------------
+    def _postprocess_patch(self, data: Dict[str, np.ndarray], sample_rng: np.random.Generator) -> Dict[str, np.ndarray]:
+        augment = True if self.split =='train' else False
         op = {
-            "crop": lambda d: self.crop(d),
-            "aug":  lambda d: self.augment_data(d) if augment else d,
+            "aug":  lambda d: self.augment_data(d, sample_rng) if augment else d,
             "norm": lambda d: self.normalize_data(d),
         }
-        # print('before ', data['label'].shape, data['label'].min(), data['label'].max())
-        for step in self.order_ops:
-            # print('before ', step, data['label'].shape, data['label'].min(), data['label'].max())
-            # log_stats('before', step, data['label'])
-            data = op[step](data)
-            # if step == 'norm':
-            # print('after ', step, data['label'].shape, data['label'].min(), data['label'].max())
-            # log_stats('after', step, data['label'])
-        # print('='*50)
 
-        # ------------------------------------------------------------
-        # 2. Mark everything as *_patch  (↓ this is the only new line)
-        # ------------------------------------------------------------
+        if augment:
+            data = bigger_crop(data, self.patch_size, pad_mode='edge', rng=sample_rng)
+
+        log_stats('before', 'step', data['label'])
+        for step in self.order_ops:
+            log_stats('before', step, data['label'])
+            data = op[step](data)
+            log_stats('after', step, data['label'])
+        print('='*50)
+
+        if augment:
+            data = center_crop(data, self.patch_size)
+
         data = {f"{k}_patch": v for k, v in data.items()}
 
-        # ------------------------------------------------------------
-        # 3. Add channel dim for PyTorch
-        # ------------------------------------------------------------
         for k, arr in list(data.items()):
             if arr.ndim == 2:
                 data[k] = arr[None, ...]             # (1, H, W)
@@ -211,30 +179,19 @@ class GeneralizedDataset(Dataset):
         return len(self.modality_files['image'])
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        worker_info = torch.utils.data.get_worker_info()
+        base_seed   = self.seed + (worker_info.id if worker_info else 0)
+        sample_rng  = np.random.default_rng(base_seed ^ idx)
+
         imgs = self._load_datapoint(idx)
         if imgs is None:
             return self.__getitem__((idx + 1) % len(self))
 
-        # Validation/test: returnimage_idx full image as one patch
-        if self.split != 'train':
-            data = self._postprocess_patch(imgs, augment=False)
-            # convert everything to tensors once all ops are done
-            return {k: _to_tensor(v) for k, v in data.items()}
+        data = self._postprocess_patch(imgs, sample_rng)
+        for k, v in data.items():
+            data[k] = _to_tensor(v)
 
-        # Training: random crop
-        attempts = 0
-        while attempts < self.max_attempts:
-            data = self._postprocess_patch(imgs, augment=True)
-            for k, v in data.items():
-                data[k] = _to_tensor(v)
-
-            # Validate road ratio if needed
-            if not self.validate_road_ratio or check_min_thrsh_road(data['label_patch'], self.patch_size, self.threshold):
-                return data
-            attempts += 1
-
-        logger.warning("No valid patch found after %d attempts on image %d; skipping.", self.max_attempts, idx)
-        return self.__getitem__((idx + 1) % len(self))
+        return data
 
 def log_stats(stage: str, step: str, label: np.ndarray) -> None:
     """
@@ -270,8 +227,8 @@ if __name__ == "__main__":
     import yaml
     # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
         # yaml.dump(config, f_out)
-    with open('./configs/dataset/AL175_15.yaml', 'r') as f:
-    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/mass.yaml', 'r') as f:
+    # with open('./configs/dataset/AL175_15.yaml', 'r') as f:
+    with open('./configs/dataset/mass.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
     # Create dataset and dataloader.
@@ -282,7 +239,7 @@ if __name__ == "__main__":
         shuffle=True,
         collate_fn=custom_collate_fn,
         num_workers=4,
-        # worker_init_fn=worker_init_fn
+        worker_init_fn=worker_init_fn
     )
     logger.info('len(dataloader): %d', len(dataloader))
     for epoch in range(10):

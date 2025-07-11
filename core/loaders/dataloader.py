@@ -33,11 +33,6 @@ class SegmentationDataModule(pl.LightningDataModule):
         def make_cfg(split: str) -> Dict[str, Any]:
             cfg = self.config.copy()
             cfg['split'] = split
-            # disable sampling and augmentations for val/test
-            if split in ('valid', 'test'):
-                cfg['validate_road_ratio'] = False
-                cfg['max_attempts'] = 1
-                cfg['augmentations'] = []  # no augmentations
             return cfg
 
         if stage in ('fit', None):

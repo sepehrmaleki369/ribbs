@@ -31,12 +31,8 @@ base_modalities: ["label", "image"]
 # Dimensionality & Patch Extraction
 # -----------------------------------------------------------------------------
 data_dim: 2                # 2 = 2D patches, 3 = 3D volumes
-patch_size: 96            # XY patch size
-patch_size_z: 96           # Z-depth (only for 3D)
-small_window_size: 8       # window for texture/variance check
-validate_road_ratio: false # enforce minimum label coverage
-threshold: 0.05            # minimum road fraction if above = true
-# max_images: 10           # limit number of loaded images (null = no limit)
+patch_size: [512, 512]            
+max_images: 10           # limit number of loaded images (null = no limit)
 # max_images: null           # limit number of loaded images (null = no limit)
 # max_attempts: 10           # retries to find a valid patch
 
@@ -46,9 +42,7 @@ threshold: 0.05            # minimum road fraction if above = true
 save_computed: true               # save new distance/SDF files
 compute_again_modalities: false   # overwrite existing if true
 
-distance_threshold: 15.0          # clip distance maps (null = no clip)
 sdf_iterations: 3                 # dilation iterations before SDF
-sdf_thresholds: [-7, 7]           # clip range for SDF values
 
 # -----------------------------------------------------------------------------
 # DataLoader Settings
@@ -63,96 +57,96 @@ pin_memory: true
 # Augmentation
 # -----------------------------------------------------------------------------
 
-augmentation:
-  flip_h: 
-    modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-  flip_v: 
-    modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-  flip_d: 
-    modalities: ["image", "label", "distance", "sdf"] 
-    prob: 0.5
-  rotation:
-    modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-    angle:  # degrees
-      min: -180.0
-      max: 180.0
-      pad: true
-  scale:
-    modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-    factor:  # scale factor
-      min: 0.75
-      max: 1.25
-  elastic:
-    modalities: ["image"]
-    prob: 0.5
-    alpha:  # deformation strength
-      min: 0.5
-      max: 1.5
-    sigma:  # deformation smoothness
-      min: 0.5
-      max: 1.5
-  random_crop:
-    modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-    size:  # crop size
-      x: 96
-      y: 96
-      z: 96  # only for 3D data
-  random_resize:
-    modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-    size:  # resize to this size
-      x: 96
-      y: 96
-      z: 96  # only for 3D data
-  random_intensity:
-    modalities: ["image"]
-    prob: 0.5
-    alpha_min: 0.9
-    alpha_max: 1.1
-  random_brightness:
-    modalities: ["image"]
-    prob: 0.5
-    beta_min: -10.0
-    beta_max: 20.0
-  random_gamma:
-    modalities: ["image"]
-    prob: 0.5
-    min: 0.8
-    max: 1.2
-  random_gaussian_noise:
-    modalities: ["image"]
-    prob: 0.5
-    min: 0.01
-    max: 0.03 
-  random_gaussian_blur:
-    modalities: ["image"]
-    prob: 0.5
-    min: 0.5
-    max: 1.5
-  random_bias_field:
-    modalities: ["image"]
-    prob: 0.5
-    min: 0.2
-    max: 0.4  
-  random_brightness_contrast:
-    modalities: ["image"]
-    prob: 0.5
-    alpha_min: 0.9
-    alpha_max: 1.1
-    beta_min: -10.0
-    beta_max: 20.0
-  random_color_jitter:
-    modalities: ["image"]
-    prob: 0.5
-    brightness: 0.1     
-    contrast: 0.1
-    saturation: 0.1
-    hue: 0.1
+# augmentation:
+#   flip_h: 
+#     modalities: ["image", "label", "distance", "sdf"]
+#     prob: 0.5
+#   flip_v: 
+#     modalities: ["image", "label", "distance", "sdf"]
+#     prob: 0.5
+  # flip_d: 
+  #   modalities: ["image", "label", "distance", "sdf"] 
+  #   prob: 0.5
+  # rotation:
+  #   modalities: ["image", "label", "distance", "sdf"]
+  #   prob: 0.5
+  #   angle:  # degrees
+  #     min: -180.0
+  #     max: 180.0
+  #     pad: true
+  # scale:
+  #   modalities: ["image", "label", "distance", "sdf"]
+  #   prob: 0.5
+  #   factor:  # scale factor
+  #     min: 0.75
+  #     max: 1.25
+  # elastic:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   alpha:  # deformation strength
+  #     min: 0.5
+  #     max: 1.5
+  #   sigma:  # deformation smoothness
+  #     min: 0.5
+  #     max: 1.5
+  # random_crop:
+  #   modalities: ["image", "label", "distance", "sdf"]
+  #   prob: 0.5
+  #   size:  # crop size
+  #     x: 96
+  #     y: 96
+  #     z: 96  # only for 3D data
+  # random_resize:
+  #   modalities: ["image", "label", "distance", "sdf"]
+  #   prob: 0.5
+  #   size:  # resize to this size
+  #     x: 96
+  #     y: 96
+  #     z: 96  # only for 3D data
+  # random_intensity:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   alpha_min: 0.9
+  #   alpha_max: 1.1
+  # random_brightness:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   beta_min: -10.0
+  #   beta_max: 20.0
+  # random_gamma:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   min: 0.8
+  #   max: 1.2
+  # random_gaussian_noise:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   min: 0.01
+  #   max: 0.03 
+  # random_gaussian_blur:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   min: 0.5
+  #   max: 1.5
+  # random_bias_field:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   min: 0.2
+  #   max: 0.4  
+  # random_brightness_contrast:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   alpha_min: 0.9
+  #   alpha_max: 1.1
+  #   beta_min: -10.0
+  #   beta_max: 20.0
+  # random_color_jitter:
+  #   modalities: ["image"]
+  #   prob: 0.5
+  #   brightness: 0.1     
+  #   contrast: 0.1
+  #   saturation: 0.1
+  #   hue: 0.1
 
 
 # -----------------------------------------------------------------------------
@@ -179,8 +173,8 @@ normalization:
     min_val: -7    
     max_val: 7  
 
-  # label:
-  #   method: "boolian"
+  label:
+    method: "boolian"
   
   # label:
   #   method: "binarize"
@@ -188,12 +182,10 @@ normalization:
   #   greater_is_road: True
   #   return_bool: true
 
-order_ops: ["crop", "norm", "aug"]   # crop → normalise → augment 
-# order_ops: ["norm", "aug", "crop"] # old behaviour
-# order_ops: ["aug", "crop", "norm"] # yes, that works too
+order_ops: ["norm", "aug"]   # normalise → augment 
 
 
 # -----------------------------------------------------------------------------
 # Miscellaneous
 # -----------------------------------------------------------------------------
-verbose: false
+verbose: true

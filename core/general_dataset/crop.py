@@ -1,136 +1,133 @@
+from __future__ import annotations
+
+"""Patch‑sampling utilities (channel‑aware).
+Public API
+~~~~~~~~~~
+* **bigger_crop** - pad spatial dims, then return a random crop whose spatial
+  size is ``ceil(√D · patch_size)``.
+* **center_crop** - symmetric crop back to *patch_size* in spatial dims.
+
+"""
+
+from typing import Dict, Sequence, Tuple
+import math
 import random
-from typing import Dict, Any, Tuple, Callable
 import numpy as np
 
+__all__ = [
+    "bigger_crop",
+    "center_crop",
+]
 
-def crop(
+# -----------------------------------------------------------------------------
+# Internal helpers
+# -----------------------------------------------------------------------------
+
+def _channel_flags_and_spatial_shape(
     data: Dict[str, np.ndarray],
-    split: str,
-    patch_size: int,
-    data_dim: int,
-    patch_size_z: int,
-    pad_reflect: Callable[[np.ndarray, Tuple[int, ...], Tuple[int, ...]], np.ndarray]
+    dim: int,
+) -> Tuple[Tuple[int, ...], Dict[str, bool]]:
+    """Return common *spatial* shape and ``{key: has_channel_axis}`` mapping."""
+    if not data:
+        raise ValueError("`data` must contain at least one modality.")
+
+    spatial_shape: Tuple[int, ...] | None = None
+    ch_flag: Dict[str, bool] = {}
+    for k, v in data.items():
+        if v.ndim not in (dim, dim + 1):
+            raise ValueError(f"'{k}' must have {dim} or {dim+1} dims, got {v.ndim}")
+        cur_spatial = v.shape[-dim:]
+        if spatial_shape is None:
+            spatial_shape = cur_spatial
+        elif cur_spatial != spatial_shape:
+            raise ValueError(
+                f"All modalities must share spatial shape {spatial_shape}, but '{k}' has {cur_spatial}."
+            )
+        ch_flag[k] = (v.ndim == dim + 1)
+    return spatial_shape, ch_flag
+
+
+def _compute_sizes(dim: int, patch_size: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
+    if len(patch_size) != dim:
+        raise ValueError("`patch_size` length must match spatial dim")
+    scale = math.sqrt(dim)
+    patch_size = np.asarray(patch_size, dtype=int)
+    big = np.ceil(scale * patch_size).astype(int)
+    pad = ((big - patch_size) + 1) // 2  # ceil‑to‑left
+    return pad, big
+
+
+def _random_start(
+    rng: random.Random | np.random.RandomState | np.random.Generator,
+    full_shape: Sequence[int],
+    crop_shape: Sequence[int],
+) -> np.ndarray:
+    """Random spatial corner so *crop_shape* fits inside *full_shape*."""
+    max_start = np.array(full_shape) - np.array(crop_shape)
+    if np.any(max_start < 0):
+        raise ValueError("`crop_shape` larger than padded shape - bug in logic.")
+
+    starts = []
+    for m in max_start:
+        if hasattr(rng, "integers"):
+            starts.append(int(rng.integers(0, m + 1)))  # numpy Generator
+        else:
+            starts.append(int(rng.randint(0, int(m))))  # RandomState or random.Random
+    return np.asarray(starts, dtype=int)
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+
+def bigger_crop(
+    data: Dict[str, np.ndarray],
+    patch_size: Sequence[int],
+    *,
+    pad_mode: str = "edge",
+    rng: random.Random | np.random.RandomState | np.random.Generator | None = None,
 ) -> Dict[str, np.ndarray]:
-    """
-    Crop and pad modalities consistently for training, handling optional channel-first arrays.
+    rng = rng or np.random.default_rng()
+    dim = len(patch_size)
 
-    Args:
-        data: dict of modality arrays (e.g., {'image': arr, 'label': arr}).
-        split: dataset split name ('train', 'valid', 'test').
-        patch_size: spatial size for height and width.
-        data_dim: 2 for 2D, 3 for 3D.
-        patch_size_z: depth for 3D; ignored if data_dim==2.
-        pad_reflect: function to reflect-pad an array: pad_reflect(arr, pad_before, pad_after).
+    _, has_ch = _channel_flags_and_spatial_shape(data, dim)
+    pad, big = _compute_sizes(dim, patch_size)
+    pad_spatial = [(int(p), int(p)) for p in pad]
 
-    Returns:
-        Cropped (and possibly padded) data dict.
-    """
-    # Only crop during training
-    if split != "train":
-        return data
+    # Pad spatial dims
+    padded = {}
+    for k, v in data.items():
+        pad_cfg = pad_spatial if not has_ch[k] else [(0, 0)] + pad_spatial
+        padded[k] = np.pad(v, pad_cfg, mode=pad_mode)
 
-    # Infer spatial shape (drop channel if present)
-    sample = next(iter(data.values()))
-    has_channel = sample.ndim == data_dim + 1
-    spatial_shape = sample.shape[-data_dim:]
+    # One random crop applied to all modalities
+    spatial_full = padded[next(iter(padded))].shape[-dim:]
+    start = _random_start(rng, spatial_full, big)
+    end = start + big
+    spatial_slice = tuple(slice(int(s), int(e)) for s, e in zip(start, end))
 
-    if data_dim == 2:
-        H, W = spatial_shape
-        ph = max(0, patch_size - H)
-        pw = max(0, patch_size - W)
+    cropped = {}
+    for k, v in padded.items():
+        full_slice = (slice(None),) + spatial_slice if has_ch[k] else spatial_slice
+        cropped[k] = v[full_slice]
+    return cropped
 
-        # pad as needed along spatial dims, but never reflect the channel axis
-        if ph > 0 or pw > 0:
-            for k, arr in data.items():
-                if has_channel and arr.ndim == 3:
-                    # arr shape = (C, H, W)
-                    pad_before = (0, ph // 2, pw // 2)
-                    pad_after  = (0, ph - ph // 2, pw - pw // 2)
-                    pads = tuple(zip(pad_before, pad_after))
-                    # pad channel axis with zeros, spatial axes with reflect
-                    data[k] = np.pad(
-                        arr,
-                        pads,
-                        mode=('constant', 'reflect', 'reflect'),
-                        constant_values=0
-                    )
-                else:
-                    # arr shape = (H, W)
-                    pad_before = (ph // 2, pw // 2)
-                    pad_after  = (ph - ph // 2, pw - pw // 2)
-                    data[k] = pad_reflect(
-                        arr,
-                        pad_before=pad_before,
-                        pad_after=pad_after
-                    )
-            H += ph
-            W += pw
 
-        # choose random crop origin
-        top  = random.randint(0, H - patch_size)
-        left = random.randint(0, W - patch_size)
+def center_crop(
+    data: Dict[str, np.ndarray],
+    patch_size: Sequence[int],
+) -> Dict[str, np.ndarray]:
+    dim = len(patch_size)
+    _, has_ch = _channel_flags_and_spatial_shape(data, dim)
+    patch_sz_arr = np.asarray(patch_size, dtype=int)
 
-        # apply crop on spatial dims
-        for k, arr in data.items():
-            if has_channel and arr.ndim == 3:
-                # arr shape (C, H, W)
-                data[k] = arr[:, top:top + patch_size, left:left + patch_size]
-            else:
-                # arr shape (H, W)
-                data[k] = arr[top:top + patch_size, left:left + patch_size]
-
-    else:
-        # 3D cropping
-        D0, H0, W0 = spatial_shape
-        patch_z = patch_size_z
-        pd = max(0, patch_z - D0)
-        ph = max(0, patch_size - H0)
-        pw = max(0, patch_size - W0)
-
-        if pd > 0 or ph > 0 or pw > 0:
-            for k, arr in data.items():
-                if has_channel and arr.ndim == 4:
-                    # arr shape = (C, D, H, W)
-                    pad_before = (0, pd // 2, ph // 2, pw // 2)
-                    pad_after  = (0, pd - pd // 2, ph - ph // 2, pw - pw // 2)
-                    pads = tuple(zip(pad_before, pad_after))
-                    data[k] = np.pad(
-                        arr,
-                        pads,
-                        mode=('constant', 'reflect', 'reflect', 'reflect'),
-                        constant_values=0
-                    )
-                else:
-                    # arr shape = (D, H, W)
-                    pad_before = (pd // 2, ph // 2, pw // 2)
-                    pad_after  = (pd - pd // 2, ph - ph // 2, pw - pw // 2)
-                    data[k] = pad_reflect(
-                        arr,
-                        pad_before=pad_before,
-                        pad_after=pad_after
-                    )
-            D0 += pd
-            H0 += ph
-            W0 += pw
-
-        # random 3D crop origin
-        front = random.randint(0, D0 - patch_z)
-        top   = random.randint(0, H0 - patch_size)
-        left  = random.randint(0, W0 - patch_size)
-
-        for k, arr in data.items():
-            if has_channel and arr.ndim == 4:
-                data[k] = arr[
-                    :,
-                    front:front + patch_z,
-                    top:top + patch_size,
-                    left:left + patch_size
-                ]
-            else:
-                data[k] = arr[
-                    front:front + patch_z,
-                    top:top + patch_size,
-                    left:left + patch_size
-                ]
-
-    return data
+    out = {}
+    for k, v in data.items():
+        spatial_shape = np.array(v.shape[-dim:])
+        extra = spatial_shape - patch_sz_arr
+        if np.any(extra < 0):
+            raise ValueError("`patch_size` larger than input along some axis.")
+        offset = extra // 2
+        spatial_slice = tuple(slice(int(o), int(o + p)) for o, p in zip(offset, patch_sz_arr))
+        full_slice = (slice(None),) + spatial_slice if has_ch[k] else spatial_slice
+        out[k] = v[full_slice]
+    return out
