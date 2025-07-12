@@ -2,7 +2,7 @@
 # This file references all sub-configs and sets high-level training parameters
 
 # Sub-config references
-dataset_config: "AL175_15.yaml"
+dataset_config: "AL175.yaml"
 model_config: "baseline_3d.yaml"
 loss_config: "fixed_lif_mse_cape.yaml"
 metrics_config: "dice_iou_ccq.yaml"

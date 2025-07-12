@@ -60,8 +60,7 @@ def visualize_batch_2d(batch: Dict[str, Any], num_per_batch: Optional[int] = Non
 
 def visualize_batch_3d(
     batch: Dict[str, Any],
-    projection: str = "max",
-    num_per_batch: Optional[int] = None
+    slice_dim: int = 2
 ) -> None:
     """
     Visualizes 3D patches in a batch by projecting along the Z axis.
@@ -71,61 +70,52 @@ def visualize_batch_3d(
         projection: one of "max", "min", "mean"
         num_per_batch: how many samples to plot
     """
-    assert projection in ("max","min","mean"), "projection must be max, min, or mean"
-    
-    # which modalities?
-    print('batch', batch.keys())
-    mods = [k.replace("_patch","") for k in batch if k.endswith("_patch")]
-    print('batch["image_patch"].shape:', batch["image_patch"].shape)
-    num_to_plot = batch["image_patch"].shape[0]
-    if num_per_batch:
-        num_to_plot = min(num_to_plot, num_per_batch)
-    
-    for i in range(num_to_plot):
-        # gather each modality’s volume
-        vols = {}
-        for mod in mods:
-            arr = batch[f"{mod}_patch"][i].numpy()
-            # arr is either (Z,H,W) or (C,Z,H,W)
-            if arr.ndim == 4:
-                # collapse channels by max
-                arr = arr.max(axis=0)
-            vols[mod] = arr  # now Z×H×W
+    images = batch["image_patch"]
+    distlbls = batch["distance_patch"]
+    lbls = batch["label_patch"]
+
+    for img, distlbl, lbl in zip(images, distlbls, lbls):
+        # Projections
+        img_proj  = img[0].numpy().max(slice_dim)
+        dist_proj = distlbl[0].numpy().min(slice_dim)
+        lbl_proj  = lbl[0].numpy().max(slice_dim)
+
+        # Plot side by side images
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        for ax, proj, title in zip(
+            axes[:3],
+            (img_proj, dist_proj, lbl_proj),
+            ("Image Projection", "Distance Map", "Label Projection"),
+        ):
+            ax.imshow(proj)
+            ax.set_title(title)
+            ax.axis("off")
         
-        # set up subplot grid: rows=modalities, cols=1
-        nrows = len(mods)
-        ncols = 3
-        fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows))
+        # Compute stats
+        stats = {
+            'Image': (img_proj.min(), img_proj.max(), img_proj.mean()),
+            'Distance': (dist_proj.min(), dist_proj.max(), dist_proj.mean()),
+            'Label': (lbl_proj.min(), lbl_proj.max(), lbl_proj.mean()),
+        }
+        print(stats)
+        # Bar chart of stats
+        categories = list(stats.keys())
+        mins = [stats[k][0] for k in categories]
+        maxs = [stats[k][1] for k in categories]
+        means = [stats[k][2] for k in categories]
         
-        print(f'Patch {i} ({projection}-projection)')
-        for row, mod in enumerate(mods):
-            if 'distance' in mod:
-                projection = 'min' 
-            project = {
-                "max": np.max,
-                "min": np.min,
-                "mean": np.mean
-            }[projection]
-
-            vol = vols[mod]
-            # Compute projections along axes:
-            #   XY: collapse Z axis -> (H, W)
-            #   XZ: collapse Y axis -> (Z, W)
-            #   YZ: collapse X axis -> (Z, H) then transpose for display (H, Z)
-            proj_xy = project(vol, axis=0)
-            proj_xz = project(vol, axis=1)
-            proj_yz = project(vol, axis=2)
-
-            projs = {"XY": proj_xy, "XZ": proj_xz, "YZ": proj_yz}
-
-            for col, (name, proj) in enumerate(projs.items()):
-                ax = axs[row, col] if nrows > 1 else axs[col]
-                ax.imshow(proj)
-                ax.set_title(f"{mod} - {name} view")
-                ax.axis("off")
-
-                # Print projection stats
-                print(f'  {mod} {name}: min={proj.min():.3f}, max={proj.max():.3f}, mean={proj.mean():.3f}')
+        x = np.arange(len(categories))
+        width = 0.2
+        
+        ax_stats = axes[3]
+        ax_stats.bar(x - width, mins,    width, label='Min')
+        ax_stats.bar(x,         means,  width, label='Mean')
+        ax_stats.bar(x + width, maxs,    width, label='Max')
+        ax_stats.set_xticks(x)
+        ax_stats.set_xticklabels(categories)
+        ax_stats.set_title('Min/Mean/Max per Projection')
+        ax_stats.legend()
+        ax_stats.grid(True, linestyle='--', alpha=0.5)
 
         plt.tight_layout()
         plt.show()

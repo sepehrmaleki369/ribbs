@@ -1564,3 +1564,8 @@ cfg_ratio_flat = {
 3. Pass that dict as `split_cfg` when you build the `Split` class (which your new `base.py` then consumes).
 
 Copy-paste → tweak → train. Done.
+
+
+
+# pip install elasticdeform
+

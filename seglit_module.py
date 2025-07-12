@@ -87,6 +87,10 @@ class SegLitModule(pl.LightningModule):
         return y_hat
     
     def on_train_epoch_start(self):
+        dm = self.trainer.datamodule
+        if dm and hasattr(dm, "train_dataset") and hasattr(dm.train_dataset, "set_epoch"):
+            dm.train_dataset.set_epoch(self.current_epoch)
+            
         self._train_preds = []
         self._train_gts   = []
 
