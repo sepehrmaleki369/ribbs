@@ -267,6 +267,7 @@ if __name__ == "__main__":
     )
     logger.info('len(dataloader): %d', len(dataloader))
     for epoch in range(10):
+        dataset.set_epoch(epoch)  
         for i, batch in enumerate(dataloader):
             if batch is None:
                 continue
