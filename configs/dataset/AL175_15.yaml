@@ -61,95 +61,226 @@ pin_memory: true
 # -----------------------------------------------------------------------------
 
 augmentation:
-  flip_h: 
+# ───────────────────────── 2-D GEOMETRIC ─────────────────────────
+  flip_h:                       # random left↔right mirror
+    type: RandomHorizontalFlip
+    params: {p: 0.5}
     modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-  flip_v: 
+
+  flip_v:                       # random top↕bottom mirror
+    type: RandomVerticalFlip
+    params: {p: 0.5}
     modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-  flip_d: 
-    modalities: ["image", "label", "distance", "sdf"] 
-    prob: 0.5
-  rotation:
+
+  rotate:                       # ±15° free rotation
+    type: RandomRotation
+    params: {degrees: 15.0, p: 0.5}
     modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-    angle:  # degrees
-      min: -180.0
-      max: 180.0
-    pad: true
-  scale:
+
+  affine:                       # shift/zoom/shear/rot combo
+    type: RandomAffine
+    params:
+      degrees: 10.0
+      translate: [0.1, 0.1]
+      scale: [0.9, 1.1]
+      shear: 5.0
+      p: 0.5
     modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.5
-    factor:  # scale factor
-      min: 0.75
-      max: 1.25
-  elastic:
+
+  zoom_only:                    # pure zoom 80-120 % (no crop)
+    type: RandomAffine
+    params: {degrees: 0.0, translate: [0,0], scale: [0.8,1.2], p: 0.5}
     modalities: ["image", "label", "distance", "sdf"]
-    prob: 0.2
-    alpha:
-      min: 0.1
-      max: 0.3
-    sigma:
-      min: 0.1
-      max: 0.3
-  # random_crop:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   size:  # crop size
-  #     x: 96
-  #     y: 96
-  #     z: 96  # only for 3D data
-  # random_resize:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   size:  # resize to this size
-  #     x: 96
-  #     y: 96
-  #     z: 96  # only for 3D data
-  # random_intensity:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  # random_brightness:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   beta_min: -10.0
-  #   beta_max: 20.0
-  # random_gamma:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.8
-  #   max: 1.2
-  # random_gaussian_noise:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.01
-  #   max: 0.03 
-  # random_gaussian_blur:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.5
-  #   max: 1.5
-  # random_bias_field:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.2
-  #   max: 0.4  
-  # random_brightness_contrast:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  #   beta_min: -10.0
-  #   beta_max: 20.0
-  # random_color_jitter:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   brightness: 0.1     
-  #   contrast: 0.1
-  #   saturation: 0.1
-  #   hue: 0.1
+
+  shear:                        # small X-axis shear
+    type: RandomShear
+    params: {shear: [-5.0, 5.0], p: 0.3}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  perspective:                  # mild four-point warp
+    type: RandomPerspective
+    params: {distortion_scale: 0.5, p: 0.3}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  thin_plate_spline:            # smooth non-linear warp
+    type: RandomThinPlateSpline
+    params: {scale: 0.2, p: 0.3}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  elastic:                      # elastic grid deformation
+    type: RandomElasticTransform
+    params:
+      kernel_size: [31,31]
+      sigma: [4.0,4.0]
+      alpha: [1.0,1.0]
+      p: 0.3
+    modalities: ["image", "label", "distance", "sdf"]
+
+# ──────────────────────── 2-D INTENSITY (IMAGE) ───────────────────
+  auto_contrast:                # stretch histogram to full range
+    type: RandomAutoContrast
+    params: {clip_output: true, p: 0.5}
+    modalities: ["image"]
+
+  brightness:                   # random brightness scale
+    type: RandomBrightness
+    params: {brightness: [0.8,1.2], p: 0.5}
+    modalities: ["image"]
+
+  contrast:                     # random contrast scale
+    type: RandomContrast
+    params: {contrast: [0.8,1.2], p: 0.5}
+    modalities: ["image"]
+
+  saturation:                   # random saturation tweak
+    type: RandomSaturation
+    params: {saturation: [0.8,1.2], p: 0.5}
+    modalities: ["image"]
+
+  hue:                          # random hue shift
+    type: RandomHue
+    params: {hue: [-0.1,0.1], p: 0.5}
+    modalities: ["image"]
+
+  gamma:                        # gamma correction jitter
+    type: RandomGamma
+    params: {gamma: [0.8,1.2], gain: [1.0,1.0], p: 0.5}
+    modalities: ["image"]
+
+  equalize:                     # global histogram equalization
+    type: RandomEqualize
+    params: {p: 0.3}
+    modalities: ["image"]
+
+  clahe:                        # local contrast enhancement
+    type: RandomClahe
+    params: {clip_limit: [40.0,40.0], grid_size: [8,8], p: 0.3}
+    modalities: ["image"]
+
+  invert:                       # pixel value inversion
+    type: RandomInvert
+    params: {max_val: 1.0, p: 0.2}
+    modalities: ["image"]
+
+  box_blur:                     # mean blur with box kernel
+    type: RandomBoxBlur
+    params: {kernel_size: [3,3], p: 0.3}
+    modalities: ["image"]
+
+  gaussian_blur:                # gaussian blur (rand σ)
+    type: RandomGaussianBlur
+    params: {kernel_size: [3,3], sigma: [0.1,2.0], p: 0.3}
+    modalities: ["image"]
+
+  motion_blur:                  # linear motion blur
+    type: RandomMotionBlur
+    params: {kernel_size: 5, angle: 30.0, direction: 0.5, p: 0.3}
+    modalities: ["image"]
+
+  gaussian_noise:               # additive gaussian noise
+    type: RandomGaussianNoise
+    params: {mean: 0.0, std: 0.05, p: 0.3}
+    modalities: ["image"]
+
+  salt_pepper:                  # salt-and-pepper impulse noise
+    type: RandomSaltAndPepperNoise
+    params: {amount: [0.01,0.05], salt_vs_pepper: [0.4,0.6], p: 0.3}
+    modalities: ["image"]
+
+  rgb_shift:                    # independent R/G/B offsets
+    type: RandomRGBShift
+    params: {r_shift_limit: 0.2, g_shift_limit: 0.2, b_shift_limit: 0.2, p: 0.3}
+    modalities: ["image"]
+
+  jpeg:                         # differentiable JPEG artefacts
+    type: RandomJPEG
+    params: {jpeg_quality: [30.0,70.0], p: 0.3}
+    modalities: ["image"]
+
+  solarize:                     # invert above threshold
+    type: RandomSolarize
+    params: {thresholds: [0.1,0.3], additions: [0.0,0.1], p: 0.2}
+    modalities: ["image"]
+
+  posterize:                    # reduce colour bit-depth
+    type: RandomPosterize
+    params: {bits: [2,6], p: 0.2}
+    modalities: ["image"]
+
+  plasma_brightness:            # fractal brightness map
+    type: RandomPlasmaBrightness
+    params: {roughness: [0.1,0.7], intensity: [0.0,1.0], p: 0.2}
+    modalities: ["image"]
+
+  plasma_contrast:              # fractal contrast map
+    type: RandomPlasmaContrast
+    params: {roughness: [0.1,0.7], p: 0.2}
+    modalities: ["image"]
+
+  plasma_shadow:                # fractal dark-shadows mask
+    type: RandomPlasmaShadow
+    params: {roughness: [0.1,0.7], shade_intensity: [-1.0,0.0], shade_quantity: [0.0,1.0], p: 0.2}
+    modalities: ["image"]
+
+# ───────────────────────── 3-D GEOMETRIC ─────────────────────────
+  flip_x:                       # mirror along width axis
+    type: RandomHorizontalFlip3D
+    params: {p: 0.5}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  flip_y:                       # mirror along height axis
+    type: RandomVerticalFlip3D
+    params: {p: 0.5}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  flip_z:                       # mirror along depth axis
+    type: RandomDepthicalFlip3D
+    params: {p: 0.5}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  rotate_3d:                    # yaw/pitch/roll ±10°
+    type: RandomRotation3D
+    params: {degrees: [10.0,10.0,10.0], p: 0.5}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  affine_3d:                    # 3-D shift/zoom/rot combo
+    type: RandomAffine3D
+    params:
+      degrees: [5.0,5.0,5.0]
+      translate: [0.05,0.05,0.05]
+      scale: [0.9,1.1]
+      p: 0.3
+    modalities: ["image", "label", "distance", "sdf"]
+
+  zoom_3d:                      # pure zoom 80-120 % in 3-D
+    type: RandomAffine3D
+    params: {degrees: [0,0,0], translate: [0,0,0], scale: [0.8,1.2], p: 0.5}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  thin_plate_spline_3d:         # smooth volumetric warp
+    type: RandomThinPlateSpline3D
+    params: {scale: 0.2, p: 0.3}
+    modalities: ["image", "label", "distance", "sdf"]
+
+  elastic_3d:                   # volumetric elastic field
+    type: RandomElasticTransform3D
+    params:
+      kernel_size: [31,31,31]
+      sigma: [4.0,4.0,4.0]
+      alpha: [1.0,1.0,1.0]
+      p: 0.3
+    modalities: ["image", "label", "distance", "sdf"]
+
+# ──────────────────────── 3-D INTENSITY (IMAGE) ──────────────────
+  equalize_3d:                  # histogram equalization 3-D
+    type: RandomEqualize3D
+    params: {p: 0.3}
+    modalities: ["image"]
+
+  motion_blur_3d:               # volumetric motion blur
+    type: RandomMotionBlur3D
+    params: {kernel_size: 3, angle: [10,10,10], direction: 0.5, p: 0.3}
+    modalities: ["image"]
 
 
 # -----------------------------------------------------------------------------

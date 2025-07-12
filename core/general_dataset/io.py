@@ -5,6 +5,7 @@ import rasterio
 import logging
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
+import torch
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 logger = logging.getLogger(__name__)
@@ -36,3 +37,9 @@ def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
     except Exception as e:
         # logger.warning("Failed to load '%s': %s", file_path, e)
         return None
+    
+def to_tensor(obj):
+    """Convert numpy ↦ torch (shared memory) but keep others unchanged."""
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)          # 0-copy, preserves shape/dtype
+    return obj

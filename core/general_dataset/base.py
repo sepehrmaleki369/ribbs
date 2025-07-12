@@ -18,13 +18,9 @@ from core.general_dataset.crop import bigger_crop, center_crop
 from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
 from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
+from core.general_dataset.io import to_tensor as _to_tensor
 import torch
 
-def _to_tensor(obj):
-    """Convert numpy ↦ torch (shared memory) but keep others unchanged."""
-    if isinstance(obj, np.ndarray):
-        return torch.from_numpy(obj)          # 0-copy, preserves shape/dtype
-    return obj
 
 class GeneralizedDataset(Dataset):
     """
@@ -130,22 +126,31 @@ class GeneralizedDataset(Dataset):
     def augment_data(self, normalized_image, sample_rng):
         if self.aug_cfg is None:
             return normalized_image
-        augmented_image = {}
+        augmented_images = {}
         for aug in self.aug_cfg:
-            modalities = self.aug_cfg[aug].get('modalities', None)
+            modalities = aug.get('modalities', None)
             if modalities is None:
                 raise ValueError(f"Augmentation config for {aug} is missing 'modalities'")
-            selected = {k: normalized_image[k] for k in modalities if k in normalized_image}
-            augmented = augment_images(selected, aug, self.aug_cfg[aug], self.data_dim, rng=sample_rng)
+            selected = {k: _to_tensor(normalized_image[k]) for k in modalities if k in normalized_image}
+            augmented = augment_images(selected, aug, self.data_dim, rng=sample_rng, verbose=self.verbose)
             for k_aug, v_aug in augmented.items():
-                augmented_image[k_aug] = v_aug
+                augmented_images[k_aug] = v_aug
         for key, arr in list(normalized_image.items()):
-            if key not in augmented_image:
-                augmented_image[key] = arr.copy()
-        return augmented_image
+            if key not in augmented_images:
+                augmented_images[key] = arr.copy()
+        return augmented_images
 
 
     def _postprocess_patch(self, data: Dict[str, np.ndarray], sample_rng: np.random.Generator) -> Dict[str, np.ndarray]:
+        # channel axis handling
+        # 2d:(C, H, W) - 3d:(C, D, H, W)
+        for k, arr in list(data.items()):
+            if arr.ndim == 2:
+                data[k] = arr[None, ...]             # (1, H, W)
+            elif arr.ndim == 3 and self.data_dim == 3:
+                data[k] = arr[None, ...]             # (1, D, H, W)
+        
+
         augment = True if self.split =='train' else False
         op = {
             "aug":  lambda d: self.augment_data(d, sample_rng) if augment else d,
@@ -155,23 +160,19 @@ class GeneralizedDataset(Dataset):
         if augment:
             data = bigger_crop(data, self.patch_size, pad_mode='edge', rng=sample_rng)
 
-        log_stats('before', 'step', data['label'])
+        self.log_stats('before', 'step', data['label'])
         for step in self.order_ops:
-            log_stats('before', step, data['label'])
+            self.log_stats('before', step, data['label'])
             data = op[step](data)
-            log_stats('after', step, data['label'])
-        print('='*50)
+            self.log_stats('after', step, data['label'])
+        if self.verbose:
+            print('='*50)
 
         if augment:
             data = center_crop(data, self.patch_size)
 
-        data = {f"{k}_patch": v for k, v in data.items()}
+        data = {f"{k}_patch": _to_tensor(v) for k, v in data.items()}
 
-        for k, arr in list(data.items()):
-            if arr.ndim == 2:
-                data[k] = arr[None, ...]             # (1, H, W)
-            elif arr.ndim == 3 and self.data_dim == 3:
-                data[k] = arr[None, ...]             # (1, D, H, W)
         return data
 
 
@@ -188,18 +189,18 @@ class GeneralizedDataset(Dataset):
             return self.__getitem__((idx + 1) % len(self))
 
         data = self._postprocess_patch(imgs, sample_rng)
-        for k, v in data.items():
-            data[k] = _to_tensor(v)
-
+        
         return data
 
-def log_stats(stage: str, step: str, label: np.ndarray) -> None:
-    """
-    Print shape, min, and max of the label array.
-    """
-    shape = label.shape
-    min_val, max_val = label.min(), label.max()
-    print(f"{stage:<6} | Step: {step:<10} | Shape: {shape!s:<15} | Min: {min_val:.4f} | Max: {max_val:.4f}")
+    def log_stats(self, stage: str, step: str, label: np.ndarray) -> None:
+        """
+        Print shape, min, and max of the label array.
+        """
+        if not self.verbose:
+            return
+        shape = label.shape
+        min_val, max_val = label.min(), label.max()
+        print(f"{stage:<6} | Step: {step:<10} | Shape: {shape!s:<15} | Min: {min_val:.4f} | Max: {max_val:.4f}")
 
 if __name__ == "__main__":
     split_cfg = {

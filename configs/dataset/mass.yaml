@@ -56,98 +56,87 @@ pin_memory: true
 # -----------------------------------------------------------------------------
 # Augmentation
 # -----------------------------------------------------------------------------
+augmentation:
+  # ------ Geometry (mirrors, rotations, scales, shifts) ------
+  - name: flip_horizontal         # left-right mirror in X
+    p: 0.8                        # 50 % chance
+    modalities: ["image", "label", "distance", "sdf"]
 
-# augmentation:
-#   flip_h: 
-#     modalities: ["image", "label", "distance", "sdf"]
-#     prob: 0.5
-#   flip_v: 
-#     modalities: ["image", "label", "distance", "sdf"]
-#     prob: 0.5
-  # flip_d: 
-  #   modalities: ["image", "label", "distance", "sdf"] 
-  #   prob: 0.5
-  # rotation:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   angle:  # degrees
-  #     min: -180.0
-  #     max: 180.0
-  #     pad: true
-  # scale:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   factor:  # scale factor
-  #     min: 0.75
-  #     max: 1.25
-  # elastic:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha:  # deformation strength
-  #     min: 0.5
-  #     max: 1.5
-  #   sigma:  # deformation smoothness
-  #     min: 0.5
-  #     max: 1.5
-  # random_crop:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   size:  # crop size
-  #     x: 96
-  #     y: 96
-  #     z: 96  # only for 3D data
-  # random_resize:
-  #   modalities: ["image", "label", "distance", "sdf"]
-  #   prob: 0.5
-  #   size:  # resize to this size
-  #     x: 96
-  #     y: 96
-  #     z: 96  # only for 3D data
-  # random_intensity:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  # random_brightness:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   beta_min: -10.0
-  #   beta_max: 20.0
-  # random_gamma:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.8
-  #   max: 1.2
-  # random_gaussian_noise:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.01
-  #   max: 0.03 
-  # random_gaussian_blur:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.5
-  #   max: 1.5
-  # random_bias_field:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   min: 0.2
-  #   max: 0.4  
-  # random_brightness_contrast:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   alpha_min: 0.9
-  #   alpha_max: 1.1
-  #   beta_min: -10.0
-  #   beta_max: 20.0
-  # random_color_jitter:
-  #   modalities: ["image"]
-  #   prob: 0.5
-  #   brightness: 0.1     
-  #   contrast: 0.1
-  #   saturation: 0.1
-  #   hue: 0.1
+  - name: flip_vertical           # top-bottom mirror in Y
+    p: 0.8
+    modalities: ["image", "label", "distance", "sdf"]
 
+  # 3-D users can uncomment this for Z-axis mirroring.
+  # - name: flip_depth
+  #   p: 0.8
+  #   modalities: ["image", "label", "distance", "sdf"]
+
+  - name: rotation
+    params:
+      degrees: [0, 360]          # inclusive range (°)
+    p: 0.8
+    modalities: ["image", "label", "distance", "sdf"]
+
+  - name: scaling
+    params:
+      scale_limit: [0.7, 1.8]     # isotropic zoom ∈ [0.9, 1.1]
+    p: 0.8
+    modalities: ["image", "label", "distance", "sdf"]
+
+  # - name: translation
+  #   params:
+  #     shift_limit: [-0.01, 0.01]    # fractional shift of image size
+  #   p: 0.8
+  #   modalities: ["image", "label", "distance", "sdf"]
+
+  # - name: elastic_deformation
+  #   params:
+  #     alpha: [5, 10]             # displacement intensity
+  #     sigma: [10, 15]               # smoothing of displacement
+  #   p: 0.8
+  #   modalities: ["image", "label", "distance", "sdf"]
+
+  # ---------------- Intensity-only (images only) -------------
+  - name: brightness
+    params:
+      limit: [-0.2, 0.2]          # factor sampled → brightness=(1+Δ)
+    p: 0.8
+    modalities: ["image"]
+
+  - name: contrast
+    params:
+      limit: [-0.2, 0.2]          # factor sampled similarly
+    p: 0.8
+    modalities: ["image"]
+
+  - name: gamma
+    params:
+      gamma_limit: [0.8, 1.2]     # γ correction range
+    p: 0.8
+    modalities: ["image"]
+
+  - name: gaussian_noise
+    params:
+      std: [0.0, 0.01]            # σ of additive Gaussian noise
+      mean: 0                     # μ (keep at 0 for white noise)
+    p: 0.8
+    modalities: ["image"]
+
+  - name: blur            # Gaussian blur with random odd kernel
+    params:
+      sigma: [0, 0.1]
+      kernel_size: [3, 9] # random odd integer ∈ {3,5,7,9}
+    p: 0.8
+    modalities: ["image"]
+
+  - name: color_jitter
+    params:
+      brightness: [0.1, 0.3]  # factor sampled uniformly in this range
+      contrast:   [0.4, 0.6]  # likewise; gives wider/stronger jitter
+      saturation: [-0.2,0.2]         # scalar still OK → symmetric ±20 %
+      hue:        [-0.1, 0.1] # explicit low/high for hue shift (rad)
+    p: 0.8
+    modalities: ["image"]
 
 # -----------------------------------------------------------------------------
 # Normalization Settings
@@ -174,7 +163,7 @@ normalization:
     max_val: 7  
 
   label:
-    method: "boolian"
+    method: "boolean"
   
   # label:
   #   method: "binarize"
