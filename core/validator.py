@@ -1,6 +1,6 @@
 """
 Validator module for handling chunked inference in validation/test phases.
-Now supports **both 2‑D (N, C, H, W)** and **3‑D (N, C, D, H, W)** inputs.
+Now supports **both 2‑D (N, C, H, W)** and **3‑D (N, C, D, H, W)** inputs.
 Implemented with robust size handling
 and automatic dimensionality detection.
 """
@@ -20,7 +20,7 @@ class Validator:
 
     • Works with arbitrary batch size and channel count.
     • Pads the sample so every spatial dimension is divisible by a given
-      *divisor* (default: 16) before tiling, then removes the pad.
+      *divisor* (default: 16) before tiling, then removes the pad.
     • Uses `patch_size` and `patch_margin` to create overlapping tiles.
       Only the *centre* region of each model prediction is kept and
       stitched together.
@@ -29,7 +29,7 @@ class Validator:
     ----------
     config : dict
         Dictionary with at least the keys:
-            ``patch_size``   – tuple/list[int] (len == 2 or 3)
+            ``patch_size``   – tuple/list[int] (len == 2 or 3)
             ``patch_margin`` – tuple/list[int] same length as
                                  ``patch_size``
         Any other keys are ignored by this class.
@@ -68,9 +68,9 @@ class Validator:
         Parameters
         ----------
         image : torch.Tensor
-            ``(N, C, H, W)`` or ``(N, C, D, H, W)`` tensor.
+            ``(N, C, H, W)`` or ``(N, C, D, H, W)`` tensor.
         divisor : int, optional
-            The divisor (default 16).
+            The divisor (default 16).
 
         Returns
         -------
@@ -86,7 +86,7 @@ class Validator:
         # pair per dim starting with the last spatial dim.
         pad_tuple: List[int] = []
         for p in reversed(pad_each):
-            pad_tuple.extend([0, p])  # (left = 0, right = p)
+            pad_tuple.extend([0, p])  # (left = 0, right = p)
 
         if any(pad_each):
             try:
@@ -113,7 +113,7 @@ class Validator:
         2) **Div‑16 pad** so every spatial dim is divisible by 16.
         3) **Sliding‑window** inference:
             • window      = ``patch_size``
-            • window step = ``patch_size − 2*patch_margin``
+            • window step = ``patch_size − 2*patch_margin``
             • model is applied on each window; only the *centre* region
               is placed into the output canvas.
         4) **Remove** the div‑16 pad.
@@ -122,7 +122,7 @@ class Validator:
         Returns
         -------
         torch.Tensor
-            Prediction of shape ``(N, out_channels, *original_spatial*)``.
+            Prediction of shape ``(N, out_channels, *original_spatial*)``.
         """
 
         if device is None:

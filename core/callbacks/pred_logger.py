@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 class PredictionLogger(Callback):
     """
-    Validation‐only: accumulates up to `max_samples` and writes one PNG per epoch.
+    Validation-only: accumulates up to `max_samples` and writes one PNG per epoch.
     Now uses *separate* vmin/vmax for GT vs. prediction.
     """
     def __init__(self,

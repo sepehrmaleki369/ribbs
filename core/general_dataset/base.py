@@ -165,12 +165,12 @@ class GeneralizedDataset(Dataset):
         # channel axis handling
         # 2d:(C, H, W) - 3d:(C, D, H, W)
         for k, arr in list(data.items()):
-            print('_postprocess_patch beginning0', k, data[k].ndim, data[k].shape)
+            # print('_postprocess_patch beginning0', k, data[k].ndim, data[k].shape)
             if arr.ndim == 2:
                 data[k] = arr[None, ...]             # (1, H, W)
             elif arr.ndim == 3 and self.data_dim == 3:
                 data[k] = arr[None, ...]             # (1, D, H, W)
-            print('_postprocess_patch beginning', k, data[k].ndim, data[k].shape)
+            # print('_postprocess_patch beginning', k, data[k].ndim, data[k].shape)
 
         augment = True if self.split =='train' else False
         op = {
@@ -266,7 +266,7 @@ if __name__ == "__main__":
         worker_init_fn=worker_init_fn
     )
     logger.info('len(dataloader): %d', len(dataloader))
-    for epoch in range(10):
+    for epoch in range(10): 
         dataset.set_epoch(epoch)  
         for i, batch in enumerate(dataloader):
             if batch is None:

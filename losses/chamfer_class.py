@@ -1,10 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import matplotlib.pyplot as plt
-import numpy as np
-from scipy.ndimage import distance_transform_edt, binary_dilation
-
 
 # ---------------------------------------------------------------------
 # Core Functions
@@ -73,6 +68,9 @@ def extract_zero_crossings_interpolated_positions(sdf, requires_grad=False):
 
 
 def manual_chamfer_grad(pred, pred_zc, gt_zc, update_scale=1.0, dist_threshold=3.0):
+    if pred_zc.numel() == 0 or gt_zc.numel() == 0:
+        return torch.zeros_like(pred)
+    
     dSDF = torch.zeros_like(pred)
     normals = compute_normals(pred)
     sampled = []
@@ -91,8 +89,13 @@ def manual_chamfer_grad(pred, pred_zc, gt_zc, update_scale=1.0, dist_threshold=3
     sampled = torch.stack(sampled,0) if sampled else torch.empty((0,2),device=pred.device)
     gt_pts=gt_zc.detach().cpu(); pr_pts=pred_zc.detach().cpu()
     for i,p in enumerate(pr_pts):
-        diffs = gt_pts-p; dists = torch.norm(diffs,dim=1)
-        md,idx = torch.min(dists,0)
+        # diffs = gt_pts-p; dists = torch.norm(diffs,dim=1)
+        # md,idx = torch.min(dists,0)
+        diffs = gt_pts - p
+        if diffs.shape[0] == 0:
+            continue
+        dists = torch.norm(diffs, dim=1)
+        md, idx = torch.min(dists, 0)
         if md>dist_threshold: continue
         dir = (gt_pts[idx]-p).to(pred.device)
         n = sampled[i]
@@ -114,6 +117,11 @@ class ChamferBoundarySDFLoss(nn.Module):
         self.w_inject, self.w_pixel = w_inject, w_pixel
         self.latest = {}
     def forward(self, pred_sdf, gt_sdf):
+        # [B,1,H,W] -> [B,H,W]
+        if pred_sdf.dim() == 4:
+            pred_sdf = pred_sdf.squeeze(1)
+        if gt_sdf.dim() == 4:
+            gt_sdf = gt_sdf.squeeze(1)
         if pred_sdf.dim()==2:
             pred_sdf,gt_sdf = pred_sdf.unsqueeze(0), gt_sdf.unsqueeze(0)
         batch_inj,batch_pix=[],[]
@@ -131,3 +139,52 @@ class ChamferBoundarySDFLoss(nn.Module):
         self.latest={"inject":inject.item(),"pixel":pixel.item()}
         return total
 
+# TODO: Making truely vectorized later
+
+
+"""
+
+### 1. **`w_inject`**
+
+This is the weight applied to the **“injection”** term:
+
+```python
+inj = torch.sum(pred * dSDF.detach())
+```
+
+* **What it measures**: how well the predicted SDF aligns its zero-level set to the ground-truth boundary **along the local normal direction**.
+* **Interpretation**: you're “injecting” boundary-normal corrections into the predicted field.
+* **Effect of a larger `w_inject`**: you force the network to pay more attention to getting the *orientation and sharpness* of the boundary right.
+
+---
+
+### 2. **`w_pixel`**
+
+This is the weight applied to the **“pixel” (point-based Chamfer) term**:
+
+```python
+vals = sample_pred_at_positions(pred, pred_zc)
+pix = vals.sum()
+```
+
+* **What it measures**: for each zero-crossing point in your prediction, you sample the SDF value *at* that exact subpixel location and sum them.
+* **Interpretation**: you're penalizing predicted boundary points that lie *far* from any true boundary—i.e. a point-to-set Chamfer distance.
+* **Effect of a larger `w_pixel`**: you encourage the network to place its zero-crossing points *exactly* on the ground-truth boundary, reducing geometric offset.
+
+---
+
+### Putting it together
+
+```python
+total_loss = w_inject * inject_term   +   w_pixel * pixel_term
+```
+
+* If you set both weights to 1.0, you give equal importance to matching boundary orientation (`inject`) and exact boundary location (`pixel`).
+* If your logs show the **pixel term** is numerically much smaller, but you still want it to matter, crank up `w_pixel`.
+* Similarly, boost `w_inject` if you need the normals-based alignment to dominate.
+
+---
+
+**In practice** you'll often sweep over a few values (e.g. `w_inject=10, 50, 100`) to see which gives the best final segmentation boundary quality.
+
+"""

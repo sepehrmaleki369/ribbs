@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 dir_tree_html.py  – Generate a pretty, chronologically-sorted HTML “tree view”
-                    (newest‐modified items first) of any directory,
+                    (newest-modified items first) of any directory,
                     with optional file/folder filters.
 
 Usage

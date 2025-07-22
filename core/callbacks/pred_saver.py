@@ -22,9 +22,9 @@ class PredictionSaver(pl.Callback):
         self.after = save_after_epoch
         self.max_samples = max_samples
         self._counter = 0
-        # Per‐epoch switch
+        # Per-epoch switch
         self._save_gts_this_epoch = False
-        # Ever‐saved guard to ensure GTs only once
+        # Ever-saved guard to ensure GTs only once
         self._gts_already_saved = False
 
     def _should_save(self, epoch: int) -> bool:

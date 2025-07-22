@@ -12,5 +12,5 @@ params:
   norm_type: "group"           # batch / group
   num_groups: 8            # use GroupNorm (8 groups) after each conv
   upsampling: "bilinear"       # "deconv" for transposed conv; alternatives: "nearest", "bilinear"
-  pooling: "max"             # pooling type in down‐blocks ("max" or "avg")
+  pooling: "max"             # pooling type in down-blocks ("max" or "avg")
   apply_final_relu: true     # ReLU after last 1×1 conv (clips negatives to zero)
