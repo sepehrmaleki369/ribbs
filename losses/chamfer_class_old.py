@@ -111,42 +111,33 @@ def manual_chamfer_grad(pred, pred_zc, gt_zc, update_scale=1.0, dist_threshold=3
 # Loss Class
 # ---------------------------------------------------------------------
 class ChamferBoundarySDFLoss(nn.Module):
-    def __init__(self, update_scale=1., dist_threshold=3.,
-                 w_inject=1., w_pixel=1., eps=1e-8):
+    def __init__(self, update_scale=1.0, dist_threshold=3.0, w_inject=1.0, w_pixel=1.0):
         super().__init__()
-        self.update_scale = update_scale
-        self.dist_threshold = dist_threshold
-        self.w_inject = w_inject
-        self.w_pixel = w_pixel
-        self.eps = eps
-
+        self.update_scale, self.dist_threshold = update_scale, dist_threshold
+        self.w_inject, self.w_pixel = w_inject, w_pixel
+        self.latest = {}
     def forward(self, pred_sdf, gt_sdf):
+        # [B,1,H,W] -> [B,H,W]
         if pred_sdf.dim() == 4:
             pred_sdf = pred_sdf.squeeze(1)
-            gt_sdf   = gt_sdf.squeeze(1)
-
-        batch_inj, batch_pix = [], []
-        for pred, gt in zip(pred_sdf, gt_sdf):
-            gt_zc   = extract_zero_crossings_interpolated_positions(gt)
+        if gt_sdf.dim() == 4:
+            gt_sdf = gt_sdf.squeeze(1)
+        if pred_sdf.dim()==2:
+            pred_sdf,gt_sdf = pred_sdf.unsqueeze(0), gt_sdf.unsqueeze(0)
+        batch_inj,batch_pix=[],[]
+        for pred,gt in zip(pred_sdf,gt_sdf):
+            gt_zc = extract_zero_crossings_interpolated_positions(gt)
             pred_zc = extract_zero_crossings_interpolated_positions(pred.detach())
-
-            dSDF = manual_chamfer_grad(pred, pred_zc, gt_zc,
-                                       self.update_scale, self.dist_threshold)
-
-            # ---- inject term (normalised) --------------------------------
-            inj = torch.sum(pred * dSDF.detach()) / (pred.numel() + self.eps)
-
-            # ---- pixel term (mean, not sum) ------------------------------
-            vals = sample_pred_at_positions(pred, pred_zc)
-            pix  = vals.mean() if vals.numel() else pred.new_zeros(())
-
+            dSDF = manual_chamfer_grad(pred,pred_zc,gt_zc,self.update_scale,self.dist_threshold)
+            inj = torch.sum(pred * dSDF.detach())
+            vals=sample_pred_at_positions(pred,pred_zc)
+            pix = vals.sum() if vals.numel() else torch.tensor(0.,device=pred.device)
             batch_inj.append(inj)
             batch_pix.append(pix)
-
         inject = torch.stack(batch_inj).mean()
         pixel  = torch.stack(batch_pix).mean()
-        total  = self.w_inject * inject + self.w_pixel * pixel
-        self.latest = {"inject": inject.item(), "pixel": pixel.item()}
+        total  = self.w_inject*inject + self.w_pixel*pixel
+        self.latest={"inject":inject.item(),"pixel":pixel.item()}
         return total
 
 # TODO: Making truely vectorized later

@@ -1924,6 +1924,2866 @@ def load_callbacks(
 
 
 # ------------------------------------
+# core/callbacks/periodic_ckpt.py
+# ------------------------------------
+import os
+import pytorch_lightning as pl
+
+class PeriodicCheckpoint(pl.Callback):
+    """
+    Save the trainer / model state every `every_n_epochs` epochs.
+
+    Args
+    ----
+    dirpath : str
+        Where the *.ckpt* files will be written.
+    every_n_epochs : int
+        Save interval.
+    prefix : str
+        Filename prefix (default: "epoch").
+    """
+
+    def __init__(self, dirpath: str, every_n_epochs: int = 5, prefix: str = "epoch"):
+        super().__init__()
+        self.dirpath = dirpath
+        self.every_n_epochs = every_n_epochs
+        self.prefix = prefix
+        os.makedirs(self.dirpath, exist_ok=True)
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        epoch = trainer.current_epoch + 1  # epochs are 0-indexed internally
+        if epoch % self.every_n_epochs == 0:
+            filename = f"{self.prefix}{epoch:06d}.ckpt"
+            ckpt_path = os.path.join(self.dirpath, filename)
+            trainer.save_checkpoint(ckpt_path)
+            # optional: log the path so you can grep it later
+            pl_module.logger.experiment.add_text("checkpoints/saved", ckpt_path, epoch)
+
+
+# ------------------------------------
+# core/callbacks/config_archiver.py
+# ------------------------------------
+import os
+import shutil
+import logging
+import zipfile
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+
+
+class ConfigArchiver(Callback):
+    """
+    Callback to archive configuration files and source code at the start of training.
+
+    This callback creates:
+      - A ZIP archive of config and source
+      - A parallel folder copy of the same files (optional)
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        project_root: str,
+        copy_folder: bool = True
+    ):
+        """
+        Initialize the ConfigArchiver callback.
+
+        Args:
+            output_dir: Directory to save archives and/or copies
+            project_root: Root directory of the project containing the code to archive
+            copy_folder: Whether to also copy files into a folder alongside the ZIP
+        """
+        super().__init__()
+        self.output_dir = output_dir
+        self.project_root = project_root
+        self.copy_folder = copy_folder
+        self.logger = logging.getLogger(__name__)
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        Archive configuration and source code at the start of training.
+
+        Creates a ZIP archive and, if enabled, copies the files to a folder.
+
+        Args:
+            trainer: PyTorch Lightning trainer
+            pl_module: PyTorch Lightning module
+        """
+        os.makedirs(self.output_dir, exist_ok=True)
+        # Use epoch and timestamp for uniqueness
+        timestamp = trainer.logger.experiment.current_epoch if hasattr(trainer.logger.experiment, 'current_epoch') else pl_module.current_epoch
+        base_name = f"code_snapshot_{timestamp}"
+
+        # Create ZIP archive
+        zip_path = os.path.join(self.output_dir, f"{base_name}.zip")
+        version = 1
+        while os.path.exists(zip_path):
+            zip_path = os.path.join(self.output_dir, f"{base_name}_v{version}.zip")
+            version += 1
+
+        self.logger.info(f"Creating ZIP archive at {zip_path}")
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
+            # Archive directories
+            for folder in ['configs', 'core', 'models', 'losses', 'metrics', 'scripts', 'callbacks']:
+                src_dir = os.path.join(self.project_root, folder)
+                if os.path.isdir(src_dir):
+                    for root, _, files in os.walk(src_dir):
+                        for fname in files:
+                            if fname.endswith(('.py', '.yaml', '.yml')):
+                                full_path = os.path.join(root, fname)
+                                arcname = os.path.relpath(full_path, self.project_root)
+                                zipf.write(full_path, arcname)
+            # train.py
+            train_py = os.path.join(self.project_root, 'train.py')
+            if os.path.exists(train_py):
+                zipf.write(train_py, 'train.py')
+            # seglit_module.py
+            seglit_py = os.path.join(self.project_root, 'seglit_module.py')
+            if os.path.exists(seglit_py):
+                zipf.write(seglit_py, 'seglit_module.py')
+        self.logger.info(f"ZIP archive created: {zip_path}")
+
+        # Optionally create a folder copy
+        if self.copy_folder:
+            copy_path = os.path.join(self.output_dir, base_name)
+            if os.path.exists(copy_path):
+                copy_path = f"{copy_path}_v{version - 1}"  # same version count
+            self.logger.info(f"Copying files to folder {copy_path}")
+            os.makedirs(copy_path, exist_ok=True)
+            for folder in ['configs', 'core', 'models', 'losses', 'metrics']:
+                src_dir = os.path.join(self.project_root, folder)
+                dst_dir = os.path.join(copy_path, folder)
+                if os.path.isdir(src_dir):
+                    shutil.copytree(src_dir, dst_dir)
+            # train.py
+            if os.path.exists(train_py):
+                shutil.copy2(train_py, copy_path)
+            # seglit_module.py
+            if os.path.exists(seglit_py):
+                shutil.copy2(seglit_py, copy_path)
+            self.logger.info(f"Folder copy created at: {copy_path}")
+
+
+# ------------------------------------
+# core/callbacks/pred_logger.py
+# ------------------------------------
+
+import os
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+import matplotlib.pyplot as plt
+
+class PredictionLogger(Callback):
+    """
+    Validation-only: accumulates up to `max_samples` and writes one PNG per epoch.
+    Now uses *separate* vmin/vmax for GT vs. prediction.
+    """
+    def __init__(self,
+                 log_dir: str,
+                 log_every_n_epochs: int = 1,
+                 max_samples: int = 4,
+                 cmap: str = "coolwarm"):
+        super().__init__()
+        self.log_dir = log_dir
+        self.log_every_n_epochs = log_every_n_epochs
+        self.max_samples = max_samples
+        self.cmap = cmap
+        self.logger = pl.utilities.logger.get_logs_dir_logger()
+        self._reset_buffers()
+
+    def _reset_buffers(self):
+        self._images = []
+        self._gts = []
+        self._preds = []
+        self._collected = 0
+        self._logged_this_epoch = False
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if (trainer.current_epoch+1) % self.log_every_n_epochs == 0:
+            self._reset_buffers()
+        else:
+            self._logged_this_epoch = True
+
+    def on_validation_batch_end(self,
+                                trainer,
+                                pl_module,
+                                outputs,
+                                batch,
+                                batch_idx,
+                                dataloader_idx=0):
+        if self._logged_this_epoch \
+           or ((trainer.current_epoch+1) % self.log_every_n_epochs != 0):
+            return
+
+        x       = batch[pl_module.input_key].detach().cpu()
+        y_true  = batch[pl_module.target_key].detach().cpu()
+        y_pred  = outputs["predictions"].detach().cpu()
+
+        take = min(self.max_samples - self._collected, x.shape[0])
+        self._images.append(x[:take])
+        self._gts   .append(y_true[:take])
+        self._preds .append(y_pred[:take])
+        self._collected += take
+
+        if self._collected < self.max_samples:
+            return
+
+        imgs  = torch.cat(self._images, dim=0)
+        gts   = torch.cat(self._gts,    dim=0)
+        preds = torch.cat(self._preds,  dim=0)
+
+        # separate signed limits
+        vlim_gt   = float(gts.abs().max())
+        vlim_pred = float(preds.abs().max())
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        filename = os.path.join(
+            self.log_dir,
+            f"pred_epoch_{trainer.current_epoch:06d}.png"
+        )
+
+        fig, axes = plt.subplots(self.max_samples, 3,
+                                 figsize=(12, 4 * self.max_samples),
+                                 tight_layout=True)
+
+        for i in range(self.max_samples):
+            # Input
+            ax = axes[i, 0]
+            if imgs.shape[1] == 1:
+                ax.imshow(imgs[i, 0], cmap='gray')
+            else:
+                im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
+                ax.imshow(im)
+            ax.set_title('Input')
+            ax.axis('off')
+
+            # Ground truth
+            ax = axes[i, 1]
+            ax.imshow(gts[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_gt,
+                      vmax=vlim_gt)
+            ax.set_title('Ground Truth')
+            ax.axis('off')
+
+            # Prediction
+            ax = axes[i, 2]
+            ax.imshow(preds[i, 0],
+                      cmap=self.cmap,
+                      vmin=-vlim_pred,
+                      vmax=vlim_pred)
+            ax.set_title('Prediction')
+            ax.axis('off')
+
+        plt.savefig(filename, dpi=150)
+        plt.close(fig)
+
+        self.logger.info(f"Saved prediction visualization: {filename}")
+        self._logged_this_epoch = True
+
+
+# ------------------------------------
+# core/callbacks/sample_plot.py
+# ------------------------------------
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+
+
+def _gather_from_outputs(batch, outputs, pl_module):
+    """
+    Extract input, ground‑truth and prediction tensors from ``batch`` and
+    ``outputs`` without re‑running the model.
+    """
+    x = batch[pl_module.input_key].float()
+    y = batch[pl_module.target_key].float()
+    if y.dim() == 3:
+        y = y.unsqueeze(1)  # (B, 1, H, W)
+    preds = outputs.get("predictions").float()
+    return x.cpu(), y.cpu(), preds.detach().cpu()
+
+
+def _signed_scale(arr: torch.Tensor, pos_max: float, neg_min: float) -> torch.Tensor:
+    """Scale *signed* ``arr`` so that
+
+    * 0 → 0
+    * (arr > 0) are mapped linearly onto ``(0,  +1]`` where the *largest* value
+      becomes +1.
+    * (arr < 0) are mapped linearly onto ``[−1, 0)`` where the *most‑negative*
+      value becomes −1.
+
+    Positive and negative parts are treated independently so that sign symmetry
+    is preserved.
+    """
+    if pos_max <= 0 and neg_min >= 0:  # all‑zero tensor
+        return torch.zeros_like(arr)
+
+    scaled = arr.clone()
+    if pos_max > 0:
+        pos_mask = scaled > 0
+        scaled[pos_mask] = scaled[pos_mask] / pos_max
+    if neg_min < 0:  # remember: neg_min is ≤ 0
+        neg_mask = scaled < 0
+        scaled[neg_mask] = scaled[neg_mask] / abs(neg_min)
+    return scaled
+
+
+class SamplePlotCallback(pl.Callback):
+    """Log side‑by‑side *input | ground‑truth | prediction* panels during
+    training/validation with **independent colour scaling** for ground‑truth and
+    prediction maps.
+
+    Parameters
+    ----------
+    num_samples:
+        Maximum number of examples to visualise each epoch.
+    cmap:
+        Colormap passed to ``matplotlib.pyplot.imshow`` for signed maps
+        (default: ``"coolwarm"``).
+    """
+
+    def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
+        super().__init__()
+        self.num_samples = num_samples
+        self.cmap = cmap
+        self._reset()
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _reset(self):
+        self._images, self._gts, self._preds = [], [], []
+        self._count = 0
+
+    # epoch hooks --------------------------------------------------------
+    def on_train_epoch_start(self, *_):
+        self._reset()
+
+    def on_validation_epoch_start(self, *_):
+        self._reset()
+
+    # batch hooks --------------------------------------------------------
+    def _collect(self, batch, outputs, pl_module):
+        if self._count >= self.num_samples:
+            return
+        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
+        take = min(self.num_samples - self._count, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._count += take
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    # plotting -----------------------------------------------------------
+    def _plot_and_log(self, tag: str, trainer):
+        imgs = torch.cat(self._images, 0)   # (N, C, H, W)
+        gts  = torch.cat(self._gts, 0)      # (N, 1, H, W)
+        preds = torch.cat(self._preds, 0)   # (N, 1, H, W)
+        n = imgs.size(0)
+
+        # --- independent signed scaling for GT and prediction -------------
+        pos_max_gt,  neg_min_gt  = float(gts.max()),  float(gts.min())
+        pos_max_pr,  neg_min_pr  = float(preds.max()), float(preds.min())
+
+        gts_scaled   = _signed_scale(gts,   pos_max_gt, neg_min_gt)
+        preds_scaled = _signed_scale(preds, pos_max_pr, neg_min_pr)
+
+        # --- plotting -----------------------------------------------------
+        fig, axes = plt.subplots(n, 3, figsize=(9, n * 3), tight_layout=True)
+        if n == 1:
+            axes = axes[None, :]  # always treat as 2‑D array [row, col]
+
+        for i in range(n):
+            img = imgs[i].permute(1, 2, 0)  # CHW → HWC
+            gt  = gts_scaled[i, 0]
+            pr  = preds_scaled[i, 0]
+
+            # input
+            axes[i, 0].imshow(img, cmap="gray")
+            axes[i, 0].set_title("input")
+            axes[i, 0].axis("off")
+
+            # ground‑truth (own scale)
+            axes[i, 1].imshow(gt, cmap=self.cmap, vmin=-1, vmax=1)
+            axes[i, 1].set_title("gt (ind. scaled)")
+            axes[i, 1].axis("off")
+
+            # prediction (own scale)
+            axes[i, 2].imshow(pr, cmap=self.cmap, vmin=-1, vmax=1)
+            axes[i, 2].set_title("pred (ind. scaled)")
+            axes[i, 2].axis("off")
+
+        trainer.logger.experiment.add_figure(
+            f"{tag}_samples", fig, global_step=trainer.current_epoch
+        )
+        plt.close(fig)
+
+    # epoch completion ---------------------------------------------------
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log("train", trainer)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log("validation", trainer)
+
+class SamplePlot3DCallback(pl.Callback):
+    """
+    Callback to log sample slices from 3D volumes (Z×H×W) during training/validation.
+
+    Args:
+        num_samples (int): number of samples to log each epoch.
+        projection_view (str): one of 'XY', 'XZ', 'YZ' to project on.
+        cfg (Optional[Dict[str, Dict[str, Any]]]):
+            per-modality settings, e.g.: 
+            {
+              'input': {'cmap': 'gray', 'projection': 'max'},
+              'gt':    {'cmap': 'viridis', 'projection': 'min'},
+              'pred':  {'cmap': 'plasma', 'projection': 'min'},
+            }
+    """
+    def __init__(self, config):
+        super().__init__()
+
+        self.num_samples = config['num_samples']
+        self.projection_view = config.get('projection_view', 'YZ')
+        self.cfg = config.get('cfg')
+        # default settings per modality
+        self.default_modals = {
+            'input': {'cmap': 'gray', 'projection': 'max'},
+            'gt':    {'cmap': 'gray', 'projection': 'min'},
+            'pred':  {'cmap': 'gray', 'projection': 'min'},
+        }
+        # map view to axis: XY->Z(0), XZ->Y(1), YZ->X(2)
+        self.axis_map = {'XY': 0, 'XZ': 1, 'YZ': 2}
+
+        # **FIX**: initialize buffers immediately so _images always exists
+        self._reset()
+
+    def _reset(self):
+        self._images: List[torch.Tensor] = []
+        self._gts:    List[torch.Tensor] = []
+        self._preds:  List[torch.Tensor] = []
+        self._count:  int = 0
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._reset()
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._reset()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
+        self._collect(batch, outputs, pl_module)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log('train', trainer, pl_module)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._count > 0:
+            self._plot_and_log('val', trainer, pl_module)
+
+    def _collect(self, batch, outputs, pl_module):
+        if self._count >= self.num_samples:
+            return
+        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
+        take = min(self.num_samples - self._count, x.size(0))
+        self._images.append(x[:take])
+        self._gts.append(y[:take])
+        self._preds.append(preds[:take])
+        self._count += take
+
+    def _project(self, volume: torch.Tensor, modal: str) -> torch.Tensor:
+        """
+        Project a 3D tensor onto 2D by reducing along the chosen axis,
+        using the right projection type for this modality.
+        """
+        axis = self.axis_map[self.projection_view]
+        modal_cfg = self.cfg.get(modal, {})
+        proj_type = modal_cfg.get('projection', self.default_modals[modal]['projection'])
+        if proj_type == 'min':
+            return volume.min(dim=axis)[0]
+        else:
+            return volume.max(dim=axis)[0]
+
+    def _plot_and_log(self, tag: str, trainer, pl_module):
+        imgs  = torch.cat(self._images,  0)  # N × C × Z × H × W
+        gts   = torch.cat(self._gts,     0)
+        preds = torch.cat(self._preds,   0)
+
+        if imgs.dim() != 5:
+            # fallback to 2D callback if implemented upstream
+            super_hook = getattr(super(), f"on_{tag}_epoch_end", None)
+            if callable(super_hook):
+                super_hook(trainer, pl_module)
+            return
+
+        n = imgs.size(0)
+        fig, axes = plt.subplots(n, 3, figsize=(12, n * 4), tight_layout=True)
+        if n == 1:
+            axes = axes[None, :]  # shape (1,3) even for single sample
+
+        for i in range(n):
+            data = {
+                'input': imgs[i].squeeze(0),
+                'gt':    gts[i].squeeze(0),
+                'pred':  preds[i].squeeze(0),
+            }
+            for col, m in enumerate(['input', 'gt', 'pred']):
+                arr = self._project(data[m], m)
+                cmap = self.cfg.get(m, {}).get('cmap', self.default_modals[m]['cmap'])
+                ax = axes[i, col]
+                ax.imshow(arr.numpy(), cmap=cmap)
+                ax.set_title(f"{tag}:{m}-{self.projection_view}")
+                ax.axis('off')
+
+        trainer.logger.experiment.add_figure(
+            f"{tag}_3d_samples", fig, global_step=trainer.current_epoch
+        )
+        plt.close(fig)
+
+
+# ------------------------------------
+# core/callbacks/best_metric_ckpt.py
+# ------------------------------------
+
+import os
+import logging
+from glob import glob
+from typing import Any, Dict, List, Optional, Union
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+
+class BestMetricCheckpoint(Callback):
+    """
+    Callback to save checkpoints for the best value of each metric.
+    """
+    
+    def __init__(
+        self, 
+        dirpath: str, 
+        metric_names: List[str],
+        mode: Union[str, Dict[str, str]] = "min",
+        save_last: bool = True,
+        last_k: int = 5,  # Save last checkpoint every k epochs
+        filename_template: str = "best_{metric}"
+    ):
+        """
+        Initialize the BestMetricCheckpoint callback.
+        
+        Args:
+            dirpath: Directory to save checkpoints to
+            metric_names: List of metrics to monitor
+            mode: Either "min", "max", or a dict mapping metric names to "min"/"max"
+            save_last: Whether to save the last checkpoint
+            last_k: Save last checkpoint every k epochs (reduce I/O)
+            filename_template: Template for checkpoint filenames
+        """
+        super().__init__()
+        self.dirpath = dirpath
+        self.metric_names = metric_names
+        self.last_k = last_k
+        
+        # Setup mode for each metric (min or max)
+        self.mode = {}
+        if isinstance(mode, str):
+            for metric in metric_names:
+                self.mode[metric] = mode
+        else:
+            self.mode = mode
+            # Ensure all metrics have a mode
+            for metric in metric_names:
+                if metric not in self.mode:
+                    self.mode[metric] = "min"
+                    
+        self.save_last = save_last
+        self.filename_template = filename_template
+        self.best_values = {}
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize best values
+        for metric in metric_names:
+            if self.mode[metric] == "min":
+                self.best_values[metric] = float('inf')
+            else:
+                self.best_values[metric] = float('-inf')
+    
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """
+        Check metrics at the end of validation and save checkpoint if needed.
+        
+        Args:
+            trainer: PyTorch Lightning trainer
+            pl_module: PyTorch Lightning module
+        """
+        # Create checkpoint directory if it doesn't exist
+        os.makedirs(self.dirpath, exist_ok=True)
+
+        # print(f"Saving best metric checkpoints to {self.dirpath}")
+        # print(f"Current epoch: {trainer.current_epoch}, Max epochs: {trainer.max_epochs}")
+        # print(f"Metrics being monitored: {self.metric_names}")
+        # print(f"Mode for metrics: {self.mode}")
+        # print(f"Best values so far: {self.best_values}")
+
+        # Check each metric
+        for metric in self.metric_names:
+            metric_key = f"val_metrics/{metric}"
+            # print('trainer.callback_metrics:', trainer.callback_metrics)
+            if metric_key in trainer.callback_metrics:
+                current_value = trainer.callback_metrics[metric_key].item()
+                self.logger.info(f"Current value for {metric}: {current_value}")
+                is_better = False
+                if self.mode[metric] == "min" and current_value < self.best_values[metric]:
+                    is_better = True
+                    self.best_values[metric] = current_value
+                elif self.mode[metric] == "max" and current_value > self.best_values[metric]:
+                    is_better = True
+                    self.best_values[metric] = current_value
+                
+                if is_better:
+                    filename = f"{self.filename_template.format(metric=metric)}.ckpt"
+                    filepath = os.path.join(self.dirpath, filename)
+                    self.logger.info(f"Saving best {metric} checkpoint: {filepath}")
+                    trainer.save_checkpoint(filepath)
+        
+        # Save last checkpoint if requested (with reduced frequency)
+        if self.save_last and (
+            (trainer.current_epoch+1) % self.last_k == 0 or  # Every k epochs
+            trainer.current_epoch == trainer.max_epochs - 1  # Last epoch
+        ):
+            filename = "last.ckpt"
+            filepath = os.path.join(self.dirpath, filename)
+            trainer.save_checkpoint(filepath)
+            self.logger.info(f"Saved last checkpoint at epoch {trainer.current_epoch}")
+
+
+
+
+
+# ------------------------------------
+# core/callbacks/pred_saver.py
+# ------------------------------------
+import os
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+import pytorch_lightning as pl
+
+class PredictionSaver(pl.Callback):
+    """
+    Save model predictions and ground truths on train, validation, and test.
+    Works with Lightning 2.x using *_batch_end hooks.
+    """
+    def __init__(
+        self,
+        save_dir: str,
+        save_every_n_epochs: int = 1,
+        save_after_epoch: int = 0,
+        max_samples: Optional[int] = None,
+    ):
+        super().__init__()
+        self.save_dir = save_dir
+        self.every = save_every_n_epochs
+        self.after = save_after_epoch
+        self.max_samples = max_samples
+        self._counter = 0
+        # Per-epoch switch
+        self._save_gts_this_epoch = False
+        # Ever-saved guard to ensure GTs only once
+        self._gts_already_saved = False
+
+    def _should_save(self, epoch: int) -> bool:
+        # print('epoch, self.every', epoch, self.every)
+        return epoch >= self.after and (epoch + 1) % self.every == 0
+
+    def _save_tensor(
+        self,
+        array: np.ndarray,
+        split: str,
+        epoch: int,
+        batch_idx: int,
+        sample_idx: int,
+        which: str
+    ):
+        fname = f"{split}_e{epoch}_b{batch_idx}_i{sample_idx}_{which}.npy"
+        folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
+        os.makedirs(folder, exist_ok=True)
+        np.save(os.path.join(folder, fname), array)
+
+    # # ——— TRAINING HOOKS ———
+    # def on_train_epoch_start(self, trainer, pl_module):
+    #     self._counter = 0
+
+    # def on_train_batch_end(
+    #     self,
+    #     trainer: pl.Trainer,
+    #     pl_module: pl.LightningModule,
+    #     outputs: Dict[str, Any],
+    #     batch: Any,
+    #     batch_idx: int,
+    #     dataloader_idx: int = 0,
+    # ):
+    #     epoch = trainer.current_epoch
+    #     if not self._should_save(epoch):
+    #         return
+
+    #     preds = outputs.get("predictions")
+    #     gts   = outputs.get("gts")
+    #     if preds is None or gts is None:
+    #         return
+
+    #     preds = preds.detach().cpu().numpy()
+    #     gts   = gts.detach().cpu().numpy()
+    #     for i in range(preds.shape[0]):
+    #         if self.max_samples is not None and self._counter >= self.max_samples:
+    #             return
+    #         self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
+    #         self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
+    #         self._counter += 1
+
+    # ——— VALIDATION HOOKS ———
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+        # only enable GT saving if this is the first matching epoch
+        epoch = trainer.current_epoch
+        self._save_gts_this_epoch = self._should_save(epoch) and not self._gts_already_saved
+
+    def on_validation_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        # preds = preds.detach().cpu().numpy()
+        # gts   = gts.detach().cpu().numpy()
+        # for i in range(preds.shape[0]):
+        #     if self.max_samples is not None and self._counter >= self.max_samples:
+        #         return
+        #     self._save_tensor(preds[i], "val", epoch, batch_idx, i, "pred")
+        #     self._save_tensor(gts[i],   "val", epoch, batch_idx, i, "gt")
+        #     self._counter += 1
+
+        # always save preds as before
+        preds_np = preds.detach().cpu().numpy()
+        for i in range(preds_np.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                break
+            self._save_tensor(preds_np[i], "val", epoch, batch_idx, i, "pred")
+            self._counter += 1
+
+        # save gts for every batch—but only in that one epoch
+        # if self._save_gts_this_epoch:
+        #     gts_np = gts.detach().cpu().numpy()
+        #     for i in range(gts_np.shape[0]):
+        #         self._save_tensor(gts_np[i], "val", epoch, batch_idx, i, "gt")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # mark that we've done our one-time GT dump
+        if self._save_gts_this_epoch:
+            self._gts_already_saved = True
+
+    # ——— TEST HOOKS ———
+    def on_test_epoch_start(self, trainer, pl_module):
+        self._counter = 0
+
+    def on_test_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        epoch = trainer.current_epoch
+        if not self._should_save(epoch):
+            return
+
+        preds = outputs.get("predictions")
+        gts   = outputs.get("gts")
+        if preds is None or gts is None:
+            return
+
+        preds = preds.detach().cpu().numpy()
+        gts   = gts.detach().cpu().numpy()
+        for i in range(preds.shape[0]):
+            if self.max_samples is not None and self._counter >= self.max_samples:
+                return
+            self._save_tensor(preds[i], "test", epoch, batch_idx, i, "pred")
+            self._save_tensor(gts[i],   "test", epoch, batch_idx, i, "gt")
+            self._counter += 1
+
+
+# ------------------------------------
+# core/callbacks/__init__.py
+# ------------------------------------
+# core/callbacks/__init__.py
+
+from core.callbacks.best_metric_ckpt    import BestMetricCheckpoint
+from core.callbacks.periodic_ckpt       import PeriodicCheckpoint
+from core.callbacks.pred_saver          import PredictionSaver
+from core.callbacks.sample_plot         import SamplePlotCallback, SamplePlot3DCallback
+from core.callbacks.skip_validation     import SkipValidation
+from core.callbacks.config_archiver     import ConfigArchiver
+from core.callbacks.pred_logger   import PredictionLogger   # <<–– add this line
+
+
+# ------------------------------------
+# core/callbacks/skip_validation.py
+# ------------------------------------
+
+import logging
+from pytorch_lightning.callbacks import Callback
+
+class SkipValidation(Callback):
+    """
+    Skip the entire validation loop until a given epoch by zeroing out
+    `trainer.limit_val_batches`. Restores the original setting once the
+    epoch threshold is reached.
+    """
+    def __init__(self, skip_until_epoch: int = 0):
+        super().__init__()
+        self.skip_until_epoch = skip_until_epoch
+        self._original_limit_val_batches = None
+        self.logger = logging.getLogger(__name__)
+
+    def on_fit_start(self, trainer, pl_module):
+        # Capture the user's configured limit_val_batches
+        self._original_limit_val_batches = trainer.limit_val_batches
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.current_epoch < self.skip_until_epoch:
+            if trainer.limit_val_batches != 0:
+                self.logger.info(
+                    f"Skipping validation until epoch {self.skip_until_epoch} "
+                    f"(current: {trainer.current_epoch})"
+                )
+                trainer.limit_val_batches = 0
+        else:
+            # Restore the original setting once we've reached the target epoch
+            if trainer.limit_val_batches == 0:
+                trainer.limit_val_batches = self._original_limit_val_batches
+                self.logger.info(
+                    f"Resuming validation from epoch {trainer.current_epoch}"
+                )
+
+
+# ------------------------------------
+# losses/chamfer_class.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+# ---------------------------------------------------------------------
+# Core Functions
+# ---------------------------------------------------------------------
+def sample_pred_at_positions(pred, positions):
+    r = positions[:, 0]
+    c = positions[:, 1]
+    r0 = r.floor().long()
+    c0 = c.floor().long()
+    r1 = r0 + 1
+    c1 = c0 + 1
+    dr = (r - r0.float()).unsqueeze(1)
+    dc = (c - c0.float()).unsqueeze(1)
+    H, W = pred.shape
+    r0 = r0.clamp(0, H - 1); r1 = r1.clamp(0, H - 1)
+    c0 = c0.clamp(0, W - 1); c1 = c1.clamp(0, W - 1)
+    Ia = pred[r0, c0].unsqueeze(1)
+    Ib = pred[r0, c1].unsqueeze(1)
+    Ic = pred[r1, c0].unsqueeze(1)
+    Id = pred[r1, c1].unsqueeze(1)
+    return (Ia * (1 - dr) * (1 - dc)
+            + Ib * (1 - dr) * dc
+            + Ic * dr * (1 - dc)
+            + Id * dr * dc).squeeze(1)
+
+
+def compute_normals(sdf):
+    H, W = sdf.shape
+    grad_r = torch.zeros_like(sdf)
+    grad_c = torch.zeros_like(sdf)
+    grad_r[1:-1] = (sdf[2:] - sdf[:-2]) / 2.0
+    grad_r[0]    = sdf[1] - sdf[0]
+    grad_r[-1]   = sdf[-1] - sdf[-2]
+    grad_c[:,1:-1] = (sdf[:,2:] - sdf[:,:-2]) / 2.0
+    grad_c[:,0]    = sdf[:,1] - sdf[:,0]
+    grad_c[:,-1]   = sdf[:,-1] - sdf[:,-2]
+    return torch.stack([grad_r, grad_c], dim=2)
+
+
+def extract_zero_crossings_interpolated_positions(sdf, requires_grad=False):
+    eps = 1e-8
+    H, W = sdf.shape
+    arr = sdf.detach().cpu().numpy()
+    pts = []
+    # vertical
+    for i in range(H-1):
+        for j in range(W):
+            v1,v2 = arr[i,j], arr[i+1,j]
+            if v1==0: pts.append([i,j])
+            elif v2==0: pts.append([i+1,j])
+            elif v1*v2<0:
+                alpha = abs(v1)/(abs(v1)+abs(v2)+eps)
+                pts.append([i+alpha,j])
+    # horizontal
+    for i in range(H):
+        for j in range(W-1):
+            v1,v2 = arr[i,j], arr[i,j+1]
+            if v1==0: pts.append([i,j])
+            elif v2==0: pts.append([i,j+1])
+            elif v1*v2<0:
+                alpha = abs(v1)/(abs(v1)+abs(v2)+eps)
+                pts.append([i,j+alpha])
+    if pts:
+        return torch.tensor(pts, dtype=torch.float32, device=sdf.device, requires_grad=requires_grad)
+    return torch.empty((0,2), dtype=torch.float32, device=sdf.device, requires_grad=requires_grad)
+
+
+def manual_chamfer_grad(pred, pred_zc, gt_zc, update_scale=1.0, dist_threshold=3.0):
+    if pred_zc.numel() == 0 or gt_zc.numel() == 0:
+        return torch.zeros_like(pred)
+    
+    dSDF = torch.zeros_like(pred)
+    normals = compute_normals(pred)
+    sampled = []
+    for p in pred_zc:
+        r,c = p[0].item(), p[1].item()
+        r0,c0 = int(r), int(c)
+        r1,c1 = r0+1, c0+1
+        H,W = pred.shape
+        r0 = max(0,min(r0,H-1));   c0 = max(0,min(c0,W-1))
+        r1 = max(0,min(r1,H-1));   c1 = max(0,min(c1,W-1))
+        ar,ac = r-r0, c-c0
+        Ia = normals[r0,c0]; Ib = normals[r0,c1]
+        Ic = normals[r1,c0]; Id = normals[r1,c1]
+        n = Ia*(1-ar)*(1-ac) + Ib*(1-ar)*ac + Ic*ar*(1-ac) + Id*ar*ac
+        sampled.append(n/(n.norm()+1e-8))
+    sampled = torch.stack(sampled,0) if sampled else torch.empty((0,2),device=pred.device)
+    gt_pts=gt_zc.detach().cpu(); pr_pts=pred_zc.detach().cpu()
+    for i,p in enumerate(pr_pts):
+        # diffs = gt_pts-p; dists = torch.norm(diffs,dim=1)
+        # md,idx = torch.min(dists,0)
+        diffs = gt_pts - p
+        if diffs.shape[0] == 0:
+            continue
+        dists = torch.norm(diffs, dim=1)
+        md, idx = torch.min(dists, 0)
+        if md>dist_threshold: continue
+        dir = (gt_pts[idx]-p).to(pred.device)
+        n = sampled[i]
+        dot = torch.dot(dir,n)*update_scale
+        r,c=p[0].item(),p[1].item()
+        r0,c0=int(r),int(c); r1,c1=r0+1,c0+1; ar,ac=r-r0,c-c0
+        for rr,cc,w in [(r0,c0,(1-ar)*(1-ac)),(r0,c1,(1-ar)*ac),(r1,c0,ar*(1-ac)),(r1,c1,ar*ac)]:
+            if 0<=rr<dSDF.shape[0] and 0<=cc<dSDF.shape[1]:
+                dSDF[rr,cc]+=dot*w
+    return dSDF
+
+# ---------------------------------------------------------------------
+# Loss Class
+# ---------------------------------------------------------------------
+class ChamferBoundarySDFLoss(nn.Module):
+    def __init__(self, update_scale=1.0, dist_threshold=3.0, w_inject=1.0, w_pixel=1.0):
+        super().__init__()
+        self.update_scale, self.dist_threshold = update_scale, dist_threshold
+        self.w_inject, self.w_pixel = w_inject, w_pixel
+        self.latest = {}
+    def forward(self, pred_sdf, gt_sdf):
+        # [B,1,H,W] -> [B,H,W]
+        if pred_sdf.dim() == 4:
+            pred_sdf = pred_sdf.squeeze(1)
+        if gt_sdf.dim() == 4:
+            gt_sdf = gt_sdf.squeeze(1)
+        if pred_sdf.dim()==2:
+            pred_sdf,gt_sdf = pred_sdf.unsqueeze(0), gt_sdf.unsqueeze(0)
+        batch_inj,batch_pix=[],[]
+        for pred,gt in zip(pred_sdf,gt_sdf):
+            gt_zc = extract_zero_crossings_interpolated_positions(gt)
+            pred_zc = extract_zero_crossings_interpolated_positions(pred.detach())
+            dSDF = manual_chamfer_grad(pred,pred_zc,gt_zc,self.update_scale,self.dist_threshold)
+            inj = torch.sum(pred * dSDF.detach())
+            vals=sample_pred_at_positions(pred,pred_zc)
+            pix = vals.sum() if vals.numel() else torch.tensor(0.,device=pred.device)
+            batch_inj.append(inj); batch_pix.append(pix)
+        inject = torch.stack(batch_inj).mean()
+        pixel  = torch.stack(batch_pix).mean()
+        total  = self.w_inject*inject + self.w_pixel*pixel
+        self.latest={"inject":inject.item(),"pixel":pixel.item()}
+        return total
+
+# TODO: Making truely vectorized later
+
+
+"""
+
+### 1. **`w_inject`**
+
+This is the weight applied to the **“injection”** term:
+
+```python
+inj = torch.sum(pred * dSDF.detach())
+```
+
+* **What it measures**: how well the predicted SDF aligns its zero-level set to the ground-truth boundary **along the local normal direction**.
+* **Interpretation**: you're “injecting” boundary-normal corrections into the predicted field.
+* **Effect of a larger `w_inject`**: you force the network to pay more attention to getting the *orientation and sharpness* of the boundary right.
+
+---
+
+### 2. **`w_pixel`**
+
+This is the weight applied to the **“pixel” (point-based Chamfer) term**:
+
+```python
+vals = sample_pred_at_positions(pred, pred_zc)
+pix = vals.sum()
+```
+
+* **What it measures**: for each zero-crossing point in your prediction, you sample the SDF value *at* that exact subpixel location and sum them.
+* **Interpretation**: you're penalizing predicted boundary points that lie *far* from any true boundary—i.e. a point-to-set Chamfer distance.
+* **Effect of a larger `w_pixel`**: you encourage the network to place its zero-crossing points *exactly* on the ground-truth boundary, reducing geometric offset.
+
+---
+
+### Putting it together
+
+```python
+total_loss = w_inject * inject_term   +   w_pixel * pixel_term
+```
+
+* If you set both weights to 1.0, you give equal importance to matching boundary orientation (`inject`) and exact boundary location (`pixel`).
+* If your logs show the **pixel term** is numerically much smaller, but you still want it to matter, crank up `w_pixel`.
+* Similarly, boost `w_inject` if you need the normals-based alignment to dominate.
+
+---
+
+**In practice** you'll often sweep over a few values (e.g. `w_inject=10, 50, 100`) to see which gives the best final segmentation boundary quality.
+
+"""
+
+# ------------------------------------
+# losses/lif_weighted_mse.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class LIFWeightedMSELoss(nn.Module):
+    """
+    Log-Inverse-Frequency weighted MSE loss with optional global LUT freezing.
+
+    Each pixel weight = 1 / log(1 + eps + freq_k), where freq_k is the relative
+    frequency of the pixel's SDF bin across the current batch or a frozen dataset.
+
+    Args:
+        sdf_min (float): lower clamp for SDF values (e.g. -d_max).
+        sdf_max (float): upper clamp for SDF values (e.g. +d_max).
+        n_bins (int): number of histogram bins.
+        eps (float): small constant inside log to avoid division-by-zero.
+        freeze_after_first (bool): if True, build LUT once at first forward and reuse.
+        reduction (str): 'mean', 'sum', or 'none'.
+    """
+    def __init__(
+        self,
+        sdf_min: float = -7.0,
+        sdf_max: float = 7.0,
+        n_bins: int = 256,
+        eps: float = 0.02,
+        freeze_after_first: bool = False,
+        reduction: str = 'mean',
+    ) -> None:
+        super().__init__()
+        if sdf_max <= sdf_min:
+            raise ValueError('sdf_max must be > sdf_min')
+
+        # store range and scale as buffers
+        self.register_buffer('sdf_min', torch.tensor(float(sdf_min)))
+        self.register_buffer('sdf_max', torch.tensor(float(sdf_max)))
+        self.register_buffer('scale', 1.0 / (self.sdf_max - self.sdf_min))
+
+        self.n_bins = int(n_bins)
+        self.eps = float(eps)
+        self.freeze_after_first = bool(freeze_after_first)
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.reduction = reduction
+
+        # LUT registered as buffer, persistent to allow checkpointing
+        self.register_buffer('_lut', torch.ones(self.n_bins), persistent=True)
+        self._lut_ready = False
+
+    @torch.no_grad()
+    def freeze(self, data_loader) -> None:
+        """
+        Build a global LUT from ground-truth SDFs in data_loader and freeze it.
+        Subsequent forwards will reuse this LUT.
+        """
+        if self._lut_ready:
+            return
+        device = self.sdf_min.device
+        counts = torch.zeros(self.n_bins, device=device)
+        total = 0
+        for batch in data_loader:
+            sdf = batch.to(device)
+            idx = self._bin_indices(sdf)
+            counts += torch.bincount(idx.flatten(), minlength=self.n_bins)
+            total += idx.numel()
+        if total == 0:
+            raise RuntimeError('freeze received empty data_loader')
+        freq = counts.float() / total
+        self._lut = 1.0 / torch.log1p(self.eps + freq)
+        self._lut_ready = True
+
+    @torch.no_grad()
+    def _bin_indices(self, sdf: torch.Tensor) -> torch.LongTensor:
+        clamped = torch.clamp(sdf, self.sdf_min, self.sdf_max)
+        unit = (clamped - self.sdf_min) * self.scale
+        idx = torch.round(unit * (self.n_bins - 1)).long()
+        return idx
+
+    @torch.no_grad()
+    def _build_lut(self, sdf: torch.Tensor) -> torch.Tensor:
+        idx = self._bin_indices(sdf)
+        freq = torch.bincount(idx.flatten(), minlength=self.n_bins).float()
+        freq /= idx.numel()
+        return 1.0 / torch.log1p(self.eps + freq)
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # build or reuse LUT
+        if not self._lut_ready:
+            with torch.no_grad():
+                self._lut = self._build_lut(y_true)
+                if self.freeze_after_first:
+                    self._lut_ready = True
+
+        # gather weights
+        idx = self._bin_indices(y_true)
+        w = self._lut[idx].to(dtype=y_pred.dtype)
+
+        # weighted squared error
+        wse = w * (y_pred - y_true).pow(2)
+
+        # reduction
+        if self.reduction == 'mean':
+            return wse.sum() / y_pred.numel()
+        if self.reduction == 'sum':
+            return wse.sum()
+        return wse
+
+    def extra_repr(self) -> str:
+        return (
+            f'sdf_min={self.sdf_min.item()}, sdf_max={self.sdf_max.item()}, '
+            f'n_bins={self.n_bins}, eps={self.eps}, '
+            f'freeze_after_first={self.freeze_after_first}, reduction={self.reduction}'
+        )
+
+
+# ------------------------------------
+# losses/vectorized_chamfer.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+def _to_2d(t: torch.Tensor) -> torch.Tensor:
+    """Ensure the tensor is 2‑D (H×W). If it has a leading singleton dimension
+    – e.g. (1,H,W) or (B,1,H,W) after indexing over B – squeeze it. Raises if
+    more than one channel is present."""
+    if t.dim() == 3:
+        # (C,H,W) – expect C==1
+        if t.size(0) != 1:
+            raise ValueError("SDF tensor has more than one channel; please select the channel to use.")
+        return t.squeeze(0)
+    if t.dim() != 2:
+        raise ValueError(f"Expected a 2‑D grid; got shape {tuple(t.shape)}")
+    return t
+
+
+def bilinear_sample(img: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+    """Vectorised bilinear sampling of a single‑channel image.
+
+    Args:
+        img    (H×W)  : SDF or any 2‑D tensor.
+        coords (N×2)  : [row, col] floating‑point coordinates.
+
+    Returns:
+        (N,) tensor – sampled values.
+    """
+    H, W = img.shape
+    r, c = coords[:, 0], coords[:, 1]
+    r0 = torch.floor(r).long().clamp(0, H - 1)
+    c0 = torch.floor(c).long().clamp(0, W - 1)
+    r1 = (r0 + 1).clamp(0, H - 1)
+    c1 = (c0 + 1).clamp(0, W - 1)
+    ar = r - r0.float()
+    ac = c - c0.float()
+
+    Ia = img[r0, c0]
+    Ib = img[r0, c1]
+    Ic = img[r1, c0]
+    Id = img[r1, c1]
+    return Ia * (1 - ar) * (1 - ac) + Ib * (1 - ar) * ac + Ic * ar * (1 - ac) + Id * ar * ac
+
+
+def compute_normals(sdf: torch.Tensor) -> torch.Tensor:
+    """Central‑difference normals (H×W×2)."""
+    grad_r = torch.zeros_like(sdf)
+    grad_c = torch.zeros_like(sdf)
+    grad_r[1:-1] = 0.5 * (sdf[2:] - sdf[:-2])
+    grad_r[0] = sdf[1] - sdf[0]
+    grad_r[-1] = sdf[-1] - sdf[-2]
+    grad_c[:, 1:-1] = 0.5 * (sdf[:, 2:] - sdf[:, :-2])
+    grad_c[:, 0] = sdf[:, 1] - sdf[:, 0]
+    grad_c[:, -1] = sdf[:, -1] - sdf[:, -2]
+    return torch.stack((grad_r, grad_c), dim=-1)
+
+
+# -----------------------------------------------------------------------------
+# Zero‑crossing extraction (fully vectorised)
+# -----------------------------------------------------------------------------
+
+def extract_zero_crossings(sdf: torch.Tensor, *, eps: float = 1e-8, requires_grad: bool = False) -> torch.Tensor:
+    """Return (N×2) sub‑pixel positions of the 0‑level set using bilinear interpolation."""
+    sdf = _to_2d(sdf)
+    H, W = sdf.shape
+    device = sdf.device
+
+    # vertical edges: between rows
+    v1, v2 = sdf[:-1, :], sdf[1:, :]
+    mask_v = (v1 * v2) < 0
+    alpha_v = v1.abs() / (v1.abs() + v2.abs() + eps)
+    rs_v = torch.arange(H - 1, device=device).unsqueeze(1).expand(H - 1, W).float() + alpha_v
+    cs_v = torch.arange(W, device=device).unsqueeze(0).expand(H - 1, W).float()
+    pts_v = torch.stack((rs_v[mask_v], cs_v[mask_v]), dim=1)
+
+    # horizontal edges: between columns
+    h1, h2 = sdf[:, :-1], sdf[:, 1:]
+    mask_h = (h1 * h2) < 0
+    alpha_h = h1.abs() / (h1.abs() + h2.abs() + eps)
+    rs_h = torch.arange(H, device=device).unsqueeze(1).expand(H, W - 1).float()
+    cs_h = torch.arange(W - 1, device=device).unsqueeze(0).expand(H, W - 1).float() + alpha_h
+    pts_h = torch.stack((rs_h[mask_h], cs_h[mask_h]), dim=1)
+
+    # exact zeros
+    mask_z = (sdf == 0)
+    if mask_z.any():
+        rz, cz = torch.where(mask_z)
+        pts_z = torch.stack((rz.float(), cz.float()), dim=1)
+        pts = torch.cat((pts_z, pts_v, pts_h), dim=0)
+    else:
+        pts = torch.cat((pts_v, pts_h), dim=0)
+
+    if pts.numel() == 0:
+        return torch.empty((0, 2), dtype=torch.float32, device=device, requires_grad=requires_grad)
+    return pts.requires_grad_(requires_grad)
+
+
+# -----------------------------------------------------------------------------
+# Vectorised Chamfer gradient
+# -----------------------------------------------------------------------------
+
+def chamfer_grad_vectorised(pred: torch.Tensor, pred_zc: torch.Tensor, gt_zc: torch.Tensor,
+                            *, update_scale: float = 1.0, dist_threshold: float = 3.0) -> torch.Tensor:
+    """Vectorised replacement for manual_chamfer_grad."""
+
+    pred2d = _to_2d(pred)  # ensure (H×W)
+
+    if pred_zc.numel() == 0 or gt_zc.numel() == 0:
+        return torch.zeros_like(pred2d)
+
+    H, W = pred2d.shape
+    device = pred2d.device
+
+    # 1. normals at pred zero‑crossings (bilinear‑interpolated)
+    normals = compute_normals(pred2d)  # H×W×2
+    r, c = pred_zc[:, 0], pred_zc[:, 1]
+    r0 = torch.floor(r).long().clamp(0, H - 1)
+    c0 = torch.floor(c).long().clamp(0, W - 1)
+    r1 = (r0 + 1).clamp(0, H - 1)
+    c1 = (c0 + 1).clamp(0, W - 1)
+    ar = r - r0.float()
+    ac = c - c0.float()
+
+    n00 = normals[r0, c0]
+    n01 = normals[r0, c1]
+    n10 = normals[r1, c0]
+    n11 = normals[r1, c1]
+    n = (
+        n00 * (1 - ar).unsqueeze(1) * (1 - ac).unsqueeze(1)
+        + n01 * (1 - ar).unsqueeze(1) * ac.unsqueeze(1)
+        + n10 * ar.unsqueeze(1) * (1 - ac).unsqueeze(1)
+        + n11 * ar.unsqueeze(1) * ac.unsqueeze(1)
+    )
+    n = n / (n.norm(dim=1, keepdim=True) + 1e-8)  # N × 2 (unit vectors)
+
+    # 2. nearest GT point for each pred point
+    diff = gt_zc.unsqueeze(0) - pred_zc.unsqueeze(1)  # Np × Ng × 2 (gt − pred)
+    dist = diff.norm(dim=-1)                          # Np × Ng
+    min_dist, idx = dist.min(dim=1)                   # length Np
+    mask = min_dist <= dist_threshold                 # ignore far matches
+    dir_vec = diff[torch.arange(pred_zc.size(0), device=device), idx]  # Np × 2
+
+    dot = (dir_vec * n).sum(dim=1) * update_scale
+    dot = dot * mask.float()
+
+    # 3. accumulate into dSDF using scatter‑add (bilinear weights)
+    w00 = (1 - ar) * (1 - ac)
+    w01 = (1 - ar) * ac
+    w10 = ar * (1 - ac)
+    w11 = ar * ac
+
+    flat_index = lambda rr, cc: rr * W + cc
+    idx00 = flat_index(r0, c0)
+    idx01 = flat_index(r0, c1)
+    idx10 = flat_index(r1, c0)
+    idx11 = flat_index(r1, c1)
+
+    indices = torch.cat((idx00, idx01, idx10, idx11), dim=0)  # 4N
+    contribs = torch.cat((dot * w00, dot * w01, dot * w10, dot * w11), dim=0)
+
+    dflat = torch.zeros(H * W, device=device).index_add(0, indices, contribs)
+    return dflat.view(H, W)
+
+
+# -----------------------------------------------------------------------------
+# Vectorised loss module
+# -----------------------------------------------------------------------------
+
+class ChamferBoundarySDFLossVec(nn.Module):
+    """Drop‑in vectorised replacement for ChamferBoundarySDFLoss."""
+
+    def __init__(self, *, update_scale: float = 1.0, dist_threshold: float = 3.0,
+                 w_inject: float = 1.0, w_pixel: float = 1.0):
+        super().__init__()
+        self.update_scale = update_scale
+        self.dist_threshold = dist_threshold
+        self.w_inject = w_inject
+        self.w_pixel = w_pixel
+        self.latest: dict[str, float] = {}
+
+    def forward(self, pred_sdf: torch.Tensor, gt_sdf: torch.Tensor) -> torch.Tensor:
+        # Expect inputs (B,H,W) or (B,1,H,W) or (H,W)
+        if pred_sdf.dim() == 2:
+            pred_sdf = pred_sdf.unsqueeze(0)
+            gt_sdf = gt_sdf.unsqueeze(0)
+        if pred_sdf.dim() == 4 and pred_sdf.size(1) == 1:
+            pred_sdf = pred_sdf[:, 0]  # drop channel dim → (B,H,W)
+            gt_sdf = gt_sdf[:, 0]
+
+        inject_terms, pixel_terms = [], []
+
+        for pred, gt in zip(pred_sdf, gt_sdf):
+            pred2d = _to_2d(pred)
+            gt2d = _to_2d(gt)
+
+            gt_zc = extract_zero_crossings(gt2d)
+            pred_zc = extract_zero_crossings(pred2d.detach())  # keep graph small
+            dSDF = chamfer_grad_vectorised(pred2d, pred_zc, gt_zc,
+                                            update_scale=self.update_scale,
+                                            dist_threshold=self.dist_threshold)
+            inject_terms.append(torch.sum(pred2d * dSDF.detach()))
+            if pred_zc.numel():
+                pixel_terms.append(bilinear_sample(pred2d, pred_zc).sum())
+            else:
+                pixel_terms.append(torch.tensor(0., device=pred.device))
+
+        inject = torch.stack(inject_terms).mean()
+        pixel = torch.stack(pixel_terms).mean()
+        total = self.w_inject * inject + self.w_pixel * pixel
+
+        self.latest = {"inject": inject.item(), "pixel": pixel.item()}
+        return total
+
+
+# ------------------------------------
+# losses/fixed_lif_weighted_mse.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class FixedLUTWeightedMSELoss(nn.Module):
+    """
+    Same weighting formula as LIFWeightedMSELoss but with a *frozen* LUT that
+    is loaded from disk (or passed as a tensor).
+
+    Args
+    ----
+    lut_path (str | Tensor): 1-D tensor of length n_bins or path to .pt
+    sdf_min / sdf_max (float): clamp range used when the LUT was built
+    n_bins (int)            : number of histogram bins (must match LUT length)
+    reduction ('mean'|'sum'|'none')
+    """
+    def __init__(
+        self,
+        lut_path,
+        sdf_min: float = -7.0,
+        sdf_max: float = 7.0,
+        n_bins: int = 256,
+        reduction: str = 'mean',
+    ):
+        super().__init__()
+        # ---- common buffers -------------------------------------------------
+        self.register_buffer('sdf_min', torch.tensor(float(sdf_min)))
+        self.register_buffer('sdf_max', torch.tensor(float(sdf_max)))
+        self.register_buffer('scale', 1.0 / (self.sdf_max - self.sdf_min))
+
+        self.n_bins = int(n_bins)
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.reduction = reduction
+
+        # ---- load LUT -------------------------------------------------------
+        if isinstance(lut_path, str):
+            lut = torch.load(lut_path, map_location='cpu')
+        elif torch.is_tensor(lut_path):
+            lut = lut_path
+        else:
+            raise TypeError("lut_path must be filename or Tensor")
+
+        if lut.numel() != self.n_bins:
+            raise ValueError(
+                f"LUT length {lut.numel()} ≠ n_bins {self.n_bins}"
+            )
+
+        # *Same buffer name as dynamic class*
+        self.register_buffer('_lut', lut.to(torch.float32), persistent=True)
+        self._lut_ready = True        # already frozen
+
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _bin_indices(self, sdf: torch.Tensor) -> torch.LongTensor:
+        clamped = torch.clamp(sdf, self.sdf_min, self.sdf_max)
+        unit    = (clamped - self.sdf_min) * self.scale
+        return torch.round(unit * (self.n_bins - 1)).long()
+
+    # -------------------------------------------------------------------------
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        idx = self._bin_indices(y_true)
+        w   = self._lut[idx].to(dtype=y_pred.dtype, device=y_pred.device)
+        wse = w * (y_pred - y_true).pow(2)
+
+        if self.reduction == 'mean':
+            return wse.sum() / y_pred.numel()
+        if self.reduction == 'sum':
+            return wse.sum()
+        return wse
+
+    # -------------------------------------------------------------------------
+    def extra_repr(self) -> str:
+        return (
+            f"sdf_min={self.sdf_min.item()}, sdf_max={self.sdf_max.item()}, "
+            f"n_bins={self.n_bins}, reduction={self.reduction}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Optional: load both old ('_lut') and new ('lut') keys seamlessly
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs
+    ):
+        key = prefix + "_lut"
+        if key in state_dict and state_dict[key].numel() != self._lut.numel():
+            print(
+                f"⚠️  Replacing {key}: ckpt {tuple(state_dict[key].shape)} "
+                f"→ current {tuple(self._lut.shape)}"
+            )
+            # put *our* 15-bin LUT into the state-dict
+            state_dict[key] = self._lut.detach().cpu()
+
+        # now let the normal loader run — sizes match, no missing keys
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+
+# ------------------------------------
+# losses/simple_binary_weighted_mse.py
+# ------------------------------------
+import torch
+import torch.nn as nn
+
+class WeightedMSELoss(nn.Module):
+    """
+    Per-pixel MSE with class-dependent weights (e.g. give roads > background).
+
+    Args
+    ----
+    road_weight : float
+        Weight applied to squared errors on road pixels.
+    bg_weight   : float
+        Weight applied to squared errors on background pixels.
+    threshold   : float
+        Threshold that separates “road” from “background” in the SDF.
+    greater_is_road : bool
+        If True, pixels **>= threshold** are treated as road.
+        If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
+    reduction : {'mean', 'sum', 'none'}
+        • 'mean' – divide the *weighted* SSE by the total number of elements  
+          (so when both weights are 1 you recover standard MSE, and
+          changing the class weights doesn’t blow up the loss scale).  
+        • 'sum'  – return the weighted sum of squared errors.  
+        • 'none' – return the full per-pixel tensor.
+    """
+
+    def __init__(
+        self,
+        road_weight: float = 5.0,
+        bg_weight:   float = 1.0,
+        threshold:   float = 0.0,
+        greater_is_road: bool = False,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.road_weight   = float(road_weight)
+        self.bg_weight     = float(bg_weight)
+        self.threshold     = float(threshold)
+        self.greater_is_road = bool(greater_is_road)
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.reduction     = reduction
+
+    # ------------------------------------------------------------------ #
+    # forward                                                             #
+    # ------------------------------------------------------------------ #
+    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        y_pred      : Tensor (N, 1, H, W)  – model output SDF
+        y_true_sdf  : Tensor (N, 1, H, W)  – ground-truth signed-distance map
+
+        Returns
+        -------
+        Tensor
+            A scalar (for 'mean' / 'sum') or a tensor shaped like the input (for 'none').
+        """
+
+        # 1) build per-pixel weights
+        if self.greater_is_road:
+            is_road = (y_true_sdf > self.threshold)
+        else:
+            is_road = (y_true_sdf <=  self.threshold)
+        weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
+
+        # 2) weighted squared error
+        wse = (y_pred - y_true_sdf) ** 2 * weight
+
+        # 3) reduction
+        if self.reduction == "mean":
+            # divide by the *number of elements* so scale matches plain MSE
+            return wse.sum() / y_pred.numel()
+        elif self.reduction == "sum":
+            return wse.sum()
+        else:                       # 'none'
+            return wse
+
+
+# ------------------------------------
+# losses/custom_loss.py
+# ------------------------------------
+"""
+Example custom loss for segmentation.
+
+This module demonstrates how to create a custom loss for the seglab framework.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TopologicalLoss(nn.Module):
+    """
+    TopologicalLoss: A loss function that incorporates topological features.
+    
+    This example loss combines binary cross-entropy with a term that penalizes
+    topological errors like incorrect connectivity.
+    """
+    
+    def __init__(
+        self,
+        topo_weight: float = 0.5,
+        smoothness: float = 1.0,
+        connectivity_weight: float = 0.3
+    ):
+        """
+        Initialize the TopologicalLoss.
+        
+        Args:
+            topo_weight: Weight for the topological component
+            smoothness: Smoothness parameter for gradient computation
+            connectivity_weight: Weight for the connectivity component
+        """
+        super().__init__()
+        self.topo_weight = topo_weight
+        self.smoothness = smoothness
+        self.connectivity_weight = connectivity_weight
+        self.bce_loss = nn.BCELoss()
+    
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the topological loss.
+        
+        Args:
+            y_pred: Predicted segmentation masks
+            y_true: Ground truth segmentation masks
+            
+        Returns:
+            Tensor containing the calculated loss
+        """
+        # Binary cross-entropy component
+        bce = self.bce_loss(y_pred, y_true)
+        
+        # Compute gradients for topology
+        gradients_pred = self._compute_gradients(y_pred)
+        gradients_true = self._compute_gradients(y_true)
+        
+        # Compute gradient loss
+        gradient_loss = F.mse_loss(gradients_pred, gradients_true)
+        
+        # Compute connectivity loss (simplified example)
+        connectivity_loss = self._compute_connectivity_loss(y_pred, y_true)
+        
+        # Combine losses
+        topo_loss = gradient_loss + self.connectivity_weight * connectivity_loss
+        total_loss = (1 - self.topo_weight) * bce + self.topo_weight * topo_loss
+        
+        return total_loss
+    
+    def _compute_gradients(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute spatial gradients of the input tensor.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Tensor of spatial gradients
+        """
+        # Ensure input is at least 4D: [batch, channels, height, width]
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        
+        # Apply Sobel filters
+        sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32, device=x.device).view(1, 1, 3, 3).repeat(1, x.shape[1], 1, 1)
+        
+        sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32, device=x.device).view(1, 1, 3, 3).repeat(1, x.shape[1], 1, 1)
+        
+        grad_x = F.conv2d(x, sobel_x, padding=1, groups=x.shape[1])
+        grad_y = F.conv2d(x, sobel_y, padding=1, groups=x.shape[1])
+        
+        # Compute gradient magnitude
+        gradients = torch.sqrt(grad_x**2 + grad_y**2 + self.smoothness**2)
+        
+        return gradients
+    
+    def _compute_connectivity_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Compute connectivity loss between prediction and ground truth.
+        
+        This is a simplified example that penalizes disconnected regions.
+        
+        Args:
+            y_pred: Predicted segmentation masks
+            y_true: Ground truth segmentation masks
+            
+        Returns:
+            Tensor containing the connectivity loss
+        """
+        # Apply morphological operations to find connected components
+        # This is a simplified approximation for demonstration purposes
+        
+        # Convert to binary
+        y_pred_bin = (y_pred > 0.5).float()
+        y_true_bin = (y_true > 0.5).float()
+        
+        # Use dilated difference to approximate connectivity errors
+        kernel_size = 3
+        dilated_pred = F.max_pool2d(y_pred_bin, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+        dilated_true = F.max_pool2d(y_true_bin, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+        
+        # Connectivity error is higher when dilated regions differ
+        connectivity_error = F.mse_loss(dilated_pred, dilated_true)
+        
+        return connectivity_error
+
+# ------------------------------------
+# losses/cape/loss.py
+# ------------------------------------
+import torch
+from torch import nn
+import numpy as np
+import skimage.graph
+import random
+import cv2
+from skimage.morphology import skeletonize
+from .utils.graph_from_skeleton_3D import graph_from_skeleton as graph_from_skeleton_3D
+from .utils.graph_from_skeleton_2D import graph_from_skeleton as graph_from_skeleton_2D
+from .utils.crop_graph import crop_graph_2D, crop_graph_3D
+from skimage.draw import line_nd
+from scipy.ndimage import binary_dilation, generate_binary_structure
+import networkx as nx
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+class CAPE(nn.Module):
+    def __init__(self, window_size=128, three_dimensional=False, dilation_radius=10, shifting_radius=5, is_binary=False, distance_threshold=20, single_edge=False):
+        super().__init__()
+        """
+        Initialize the CAPE loss module.
+
+        Args:
+            window_size (int): Size of the square patch (window) to process at a time.
+            three_dimensional (bool): If True, operate in 3D mode; otherwise, operate in 2D.
+            dilation_radius (int): Radius used to dilate ground-truth paths for masking.
+            shifting_radius (int): Radius for refining start/end points to lowest-cost nearby pixels.
+            is_binary (bool): If True, treat inputs as binary maps (invert predictions/ground truth).
+            distance_threshold (float): Maximum value used for clipping ground-truth distance maps.
+            single_edge (bool): If True, sample a single edge at a time; otherwise, sample a path.
+        """
+        self.window_size = window_size
+        self.three_dimensional = three_dimensional
+        self.dilation_radius = dilation_radius
+        self.shifting_radius = shifting_radius
+        self.is_binary = is_binary
+        self.distance_threshold = distance_threshold
+        self.single_edge = single_edge
+        self.data_dim = 3 if three_dimensional else 2
+    
+    def _ensure_no_channel(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Remove a channel dimension for 2D or 3D data if it's a singleton.
+
+        For 2D:
+        (B,1,H,W) -> (B,H,W)
+        For 3D:
+        (B,1,D,H,W) -> (B,D,H,W)
+        Leaves (B,H,W) or (B,D,H,W) unchanged.
+        """
+        expected_dim = 1 + self.data_dim  # batch + spatial
+        if t.dim() != expected_dim and t.size(1) == 1:
+            return t.squeeze(1)
+        return t
+        
+
+    def _random_connected_pair(self, G):
+        """
+        Pick two distinct nodes that are in the same connected component.
+        """
+        node1 = random.choice(list(G.nodes()))
+        reachable = list(nx.node_connected_component(G, node1))
+        if len(reachable) == 1:
+            return self._random_connected_pair(G)
+        node2 = random.choice([n for n in reachable if n != node1])
+        return node1, node2
+
+
+    def _dilate_path_2D(self, shape, path_pts, radius):
+        """
+        Rasterise a poly-line into a thick 2D mask.
+        """
+        mask = np.zeros(shape, dtype=np.uint8)
+        for p, q in zip(path_pts[:-1], path_pts[1:]):
+            cv2.line(mask,
+                    (int(p[0]), int(p[1])),
+                    (int(q[0]), int(q[1])),
+                    1, int(radius))
+        return mask
+    
+    
+    def _dilate_path_3D(self, shape, path_positions, radius):
+        """
+        Rasterise a poly-line into a thick 3D mask.
+        """
+        mask = np.zeros(shape, dtype=np.uint8)
+
+        for p1, p2 in zip(path_positions[:-1], path_positions[1:]):
+            temp = np.zeros(shape, dtype=np.uint8)
+            
+            rr, cc, zz = line_nd(tuple(map(int, p1)), tuple(map(int, p2)))
+            temp[zz, cc, rr] = 1
+
+            struct = generate_binary_structure(3, 1)
+            dilated_segment = binary_dilation(temp, structure=struct, iterations=int(radius))
+
+            mask = np.logical_or(mask, dilated_segment)
+
+        return mask.astype(np.uint8)
+        
+        
+    def draw_line_with_thickness_3D(self, volume, start_point, end_point, value=1, thickness=1):
+        """
+        Draw a 3D line with specified thickness between two points in a volume using dilation.
+        """
+        rr, cc, zz = line_nd(start_point, end_point)
+        volume[zz, cc, rr] = value
+        
+        struct = generate_binary_structure(3, 1)
+        dilated_volume = binary_dilation(volume, structure=struct, iterations=thickness)
+        
+        return dilated_volume
+      
+
+    def find_min_in_radius_2D(self, array: np.ndarray, center: tuple, radius: float):
+        """
+        Finds the coordinates of the minimum value inside a given radius from a center point in a 2D array.
+        """
+        x0, y0 = center
+        height, width = array.shape
+
+        y_min, y_max = max(0, y0 - int(radius)), min(height, y0 + int(radius) + 1)
+        x_min, x_max = max(0, x0 - int(radius)), min(width, x0 + int(radius) + 1)
+
+        sub_image = array[y_min:y_max, x_min:x_max]
+        
+        min_idx = np.unravel_index(np.argmin(sub_image), sub_image.shape)
+
+        min_coords = (y_min + min_idx[0], x_min + min_idx[1])
+        return min_coords
+    
+    
+    def find_min_in_radius_3D(self, array: np.ndarray, center: tuple, radius: float):
+        """
+        Finds the coordinates of the minimum value inside a given radius from a center point in a 3D array.
+        """
+        x0, y0, z0 = center
+        depth, height, width = array.shape
+
+        z_min, z_max = max(0, z0 - int(radius)), min(depth, z0 + int(radius) + 1)
+        y_min, y_max = max(0, y0 - int(radius)), min(height, y0 + int(radius) + 1)
+        x_min, x_max = max(0, x0 - int(radius)), min(width, x0 + int(radius) + 1)
+
+        sub_volume = array[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        
+        min_idx = np.unravel_index(np.argmin(sub_volume), sub_volume.shape)
+        
+        min_coords = (z_min + min_idx[0], y_min + min_idx[1], x_min + min_idx[2])
+        return min_coords
+    
+    
+    def path_cost_2D(self, cost_tensor, pred_cost_map, start_point, end_point, dilation_radius=20, extra_path=None):  
+        """
+        Compute the shortest path cost in 2D using Dijkstra's algorithm.
+        """
+        start_point = (int(start_point[0]), int(start_point[1]))
+        end_point   = (int(end_point[0]), int(end_point[1]))
+        dilation_radius = int(dilation_radius)
+
+        if extra_path is None:                            
+            dilated_image = np.zeros_like(pred_cost_map, dtype=np.uint8)
+            cv2.line(dilated_image, start_point, end_point,
+                    color=1, thickness=int(dilation_radius))
+        else:                                             
+            dilated_image = self._dilate_path_2D(pred_cost_map.shape,
+                                                extra_path,
+                                                dilation_radius)
+
+        pred_cost_map = self.distance_threshold - pred_cost_map
+        dilated_image = dilated_image * pred_cost_map
+        dilated_image = self.distance_threshold - dilated_image
+        dilated_image = np.where(dilated_image == self.distance_threshold, float('inf'), dilated_image)
+        path_cost = torch.tensor(0.0, requires_grad=True).to(device)
+        
+        start_refined = self.find_min_in_radius_2D(dilated_image, start_point, radius=self.shifting_radius)
+        end_refined = self.find_min_in_radius_2D(dilated_image, end_point, radius=self.shifting_radius)
+
+        dilated_image = np.maximum(dilated_image, 0) + 0.00001
+        
+        try:
+
+            path_coords, _ = skimage.graph.route_through_array(
+                dilated_image, start=start_refined, end=end_refined, fully_connected=True, geometric=True)
+
+            path_coords = np.transpose(np.array(path_coords), (1, 0))
+            path_cost = torch.sum(cost_tensor[path_coords[0], path_coords[1]] ** 2).to(device)
+            
+            return path_cost
+        
+        except Exception as e:
+
+            return path_cost
+        
+        
+    def path_cost_3D(self, cost_tensor, pred_cost_map, start_point, end_point, dilation_radius=5, extra_path=None):
+        """
+        Compute the shortest path cost in 3D using Dijkstra's algorithm.
+        """
+        if extra_path is None:
+            dilated_image = self.draw_line_with_thickness_3D(
+                np.zeros_like(pred_cost_map, dtype=np.uint8),
+                start_point, end_point, value=1, thickness=dilation_radius)
+            
+        else:                                           
+            dilated_image = self._dilate_path_3D(pred_cost_map.shape,
+                                                extra_path,
+                                                dilation_radius)
+        
+        
+        dilated_image = dilated_image.astype(np.uint8)
+        dilated_image = np.where(dilated_image, 1, 0)
+        
+        pred_cost_map_temp = self.distance_threshold - pred_cost_map
+        dilated_image = dilated_image * pred_cost_map_temp
+        dilated_image = self.distance_threshold - dilated_image
+        dilated_image = np.where(dilated_image == self.distance_threshold, float('inf'), dilated_image)
+        
+        start_refined = self.find_min_in_radius_3D(dilated_image, start_point, radius=self.shifting_radius)
+        end_refined = self.find_min_in_radius_3D(dilated_image, end_point, radius=self.shifting_radius)
+        
+        dilated_image = np.maximum(dilated_image, 0) + 0.00001
+        
+        try:
+            path_coords, _ = skimage.graph.route_through_array(
+                dilated_image, start=start_refined, end=end_refined, fully_connected=True, geometric=True
+            )
+            path_coords = np.array(path_coords).T
+            path_cost = torch.sum((cost_tensor[path_coords[0], path_coords[1], path_coords[2]]) ** 2).to(device)
+            
+            return path_cost
+        
+        except Exception as e:
+            return torch.tensor(0.0, requires_grad=True).to(device)
+        
+
+    def forward(self, predictions, ground_truths):
+        """
+        Compute the average CAPE loss over a batch of predictions and ground truths.
+
+        The method splits each prediction volume/mask into patches (windows), extracts
+        or receives a graph representation of the skeletonized ground truth in each window,
+        samples paths from the graph, computes the squared-distance sum along each predicted path,
+        and accumulates these costs to return the mean loss per batch.
+
+        Args:
+            predictions (torch.Tensor): Distance maps of shape
+                - (batch, H, W) for 2D
+                - (batch, D, H, W) for 3D
+            ground_truths (Union[nx.Graph, np.ndarray, torch.Tensor]):
+                - Graph objects for direct skeleton-based sampling,
+                - Or binary masks (arrays or tensors) to skeletonize.
+
+        Returns:
+            torch.Tensor: Scalar tensor representing the mean CAPE loss over the batch.
+        """
+        predictions = self._ensure_no_channel(predictions)
+        ground_truths = self._ensure_no_channel(ground_truths)
+
+        batch_size = predictions.size(0)
+        total_loss = 0.0
+
+        if isinstance(ground_truths[0], nx.Graph):
+            gt_type = 0
+        
+        elif isinstance(ground_truths, np.ndarray):
+            gt_type = 1
+            
+        elif isinstance(ground_truths, torch.Tensor):
+            ground_truths = ground_truths.detach().cpu().numpy()
+            gt_type = 1
+        
+        
+        if self.is_binary:
+            
+            predictions = 1 - predictions
+            
+            if gt_type == 1:
+                ground_truths = 1 - ground_truths
+                
+            self.distance_threshold = 1
+        
+        
+        
+        # ── 2D MODE ───────────────────────────────────────────────────────────────
+        
+        if self.three_dimensional == False:
+
+            for b in range(batch_size):
+
+                full_prediction_map = predictions[b]
+                
+                # NO GRAPH INPUT
+                if gt_type == 1:
+                    full_ground_truth_mask = (ground_truths[b] == 0).astype(np.uint8)
+                
+                # GRAPH INPUT    
+                elif gt_type == 0:
+                    complete_graph = ground_truths[b]
+
+                assert predictions.shape[-1] % self.window_size == 0, "Width must be divisible by window size"
+                assert predictions.shape[-2] % self.window_size == 0, "Height must be divisible by window size"
+
+                num_windows_height = predictions.shape[-2] // self.window_size
+                num_windows_width = predictions.shape[-1] // self.window_size
+
+                crop_loss_sum = 0.0
+                
+
+                for i in range(num_windows_height):
+                    for j in range(num_windows_width):
+                        window_pred = full_prediction_map[i * full_prediction_map.shape[0] // num_windows_height:(i + 1) * full_prediction_map.shape[0] // num_windows_height, :]
+                        window_pred = window_pred[:, j * full_prediction_map.shape[1] // num_windows_width:(j + 1) * full_prediction_map.shape[1] // num_windows_width]
+                        
+                        # NO GRAPH INPUT
+                        if gt_type == 1:
+                            
+                            window_gt = full_ground_truth_mask[i * full_prediction_map.shape[0] // num_windows_height:(i + 1) * full_prediction_map.shape[0] // num_windows_height, :]
+                            window_gt = window_gt[:, j * full_prediction_map.shape[1] // num_windows_width:(j + 1) * full_prediction_map.shape[1] // num_windows_width]
+
+                            skeleton = skeletonize(window_gt)
+                            graph = graph_from_skeleton_2D(skeleton, angle_range=(175,185), verbose=False)
+                        
+                        # GRAPH INPUT
+                        elif gt_type == 0:
+                            graph = crop_graph_2D(complete_graph,
+                                                ymin=i * full_prediction_map.shape[0] // num_windows_height,
+                                                xmin=j * full_prediction_map.shape[1] // num_windows_width,
+                                                ymax=(i + 1) * full_prediction_map.shape[0] // num_windows_height,
+                                                xmax=(j + 1) * full_prediction_map.shape[1] // num_windows_width)
+
+                        window_loss = 0.0
+                        
+                        if self.single_edge == False:
+                        
+                            while list(graph.edges()):
+                                n1, n2 = self._random_connected_pair(graph)
+
+                                path_nodes = nx.shortest_path(graph, n1, n2)
+                                path_pos   = [graph.nodes[n]['pos'] for n in path_nodes]
+
+                                single_loss = self.path_cost_2D(
+                                    cost_tensor=window_pred,
+                                    pred_cost_map=window_pred.detach().cpu().numpy(),
+                                    start_point=path_pos[0], end_point=path_pos[-1],
+                                    dilation_radius=self.dilation_radius,
+                                    extra_path=path_pos
+                                )
+
+                                graph.remove_edges_from(zip(path_nodes[:-1], path_nodes[1:]))
+                                window_loss += single_loss                            
+                            
+                        else:
+                            
+                            edges = list(graph.edges())
+                            
+                            while list(graph.edges()):
+                                edges = list(graph.edges())
+        
+                                edge = random.choice(edges)
+                                node_1 = edge[0]
+                                node_2 = edge[1]
+                                
+                                node_idx1 = list(graph.nodes).index(node_1)
+                                node_idx2 = list(graph.nodes).index(node_2)
+
+                                node1 = list(graph.nodes)[node_idx1]
+                                node2 = list(graph.nodes)[node_idx2]
+
+                                node1_pos = graph.nodes()[node1]['pos']
+                                node2_pos = graph.nodes()[node2]['pos']
+
+                                single_loss = self.path_cost_2D(
+                                    cost_tensor=window_pred,
+                                    pred_cost_map=window_pred.detach().cpu().numpy(),
+                                    start_point=node1_pos, end_point=node2_pos,
+                                    dilation_radius=self.dilation_radius
+                                )
+                                
+                                graph.remove_edge(*edge)
+                                window_loss += single_loss
+                            
+                        crop_loss_sum += window_loss
+                        
+                total_loss += crop_loss_sum
+                
+            return total_loss / batch_size if batch_size > 0 else 0
+
+        # ── 3D MODE ───────────────────────────────────────────────────────────────
+
+        else:
+            
+            for b in range(batch_size):
+                full_prediction_map = predictions[b]
+                
+                # NO GRAPH INPUT
+                if gt_type == 1:
+                    full_ground_truth_mask = (ground_truths[b] == 0).astype(np.uint8)
+                
+                # GRAPH INPUT    
+                elif gt_type == 0:
+                    complete_graph = ground_truths[b]
+                    
+                assert predictions.shape[-3] % self.window_size == 0, "Depth must be divisible by window size"
+                assert predictions.shape[-2] % self.window_size == 0, "Height must be divisible by window size"
+                assert predictions.shape[-1] % self.window_size == 0, "Width must be divisible by window size"
+
+                num_windows_depth = predictions.shape[-3] // self.window_size
+                num_windows_height = predictions.shape[-2] // self.window_size
+                num_windows_width = predictions.shape[-1] // self.window_size
+                
+                crop_loss_sum = 0.0
+                for d in range(num_windows_depth):
+                    for i in range(num_windows_height):
+                        for j in range(num_windows_width):
+                            window_pred = full_prediction_map[
+                                d * self.window_size:(d + 1) * self.window_size,
+                                i * self.window_size:(i + 1) * self.window_size,
+                                j * self.window_size:(j + 1) * self.window_size
+                            ]
+                            
+                            # NO GRAPH INPUT
+                            if gt_type == 1:
+                                
+                                window_gt = full_ground_truth_mask[
+                                    d * self.window_size:(d + 1) * self.window_size,
+                                    i * self.window_size:(i + 1) * self.window_size,
+                                    j * self.window_size:(j + 1) * self.window_size
+                                ]
+                                skeleton = skeletonize(window_gt)
+                                graph = graph_from_skeleton_3D(skeleton, angle_range=(175,185), verbose=False)
+                            
+                            # GRAPH INPUT
+                            elif gt_type == 0:
+                                graph = crop_graph_3D(       
+                                        complete_graph,
+                                        xmin=j * self.window_size,
+                                        ymin=i * self.window_size,
+                                        zmin=d * self.window_size,
+                                        xmax=j * self.window_size + self.window_size,
+                                        ymax=i * self.window_size + self.window_size,
+                                        zmax=d * self.window_size + self.window_size)
+                            
+                            window_loss = 0.0
+                            
+                            if self.single_edge == False:
+                            
+                                while list(graph.edges()):
+                                    n1, n2 = self._random_connected_pair(graph)
+
+                                    path_nodes = nx.shortest_path(graph, n1, n2)
+                                    path_pos   = [graph.nodes[n]['pos'] for n in path_nodes]
+
+                                    single_loss = self.path_cost_3D(
+                                        cost_tensor=window_pred,
+                                        pred_cost_map=window_pred.detach().cpu().numpy(),
+                                        start_point=path_pos[0], end_point=path_pos[-1],
+                                        dilation_radius=self.dilation_radius,
+                                        extra_path=path_pos
+                                    )
+                                    
+                                    graph.remove_edges_from(zip(path_nodes[:-1], path_nodes[1:]))
+                                    window_loss += single_loss
+                               
+                            else: 
+                                
+                                while list(graph.edges()):
+                                    edge = random.choice(list(graph.edges()))
+                                    node1, node2 = edge
+                                    node1_pos = graph.nodes[node1]['pos']
+                                    node2_pos = graph.nodes[node2]['pos']
+
+                                    single_loss = self.path_cost_3D(
+                                        cost_tensor=window_pred,
+                                        pred_cost_map=window_pred.detach().cpu().numpy(),
+                                        start_point=node1_pos, end_point=node2_pos,
+                                        dilation_radius=self.dilation_radius
+                                    )
+                                    
+                                    graph.remove_edge(*edge)
+                                    window_loss += single_loss
+                            
+                            crop_loss_sum += window_loss
+                            
+                total_loss += crop_loss_sum
+                
+            return total_loss / batch_size if batch_size > 0 else 0
+
+
+
+# ------------------------------------
+# losses/cape/__init__.py
+# ------------------------------------
+
+
+# ------------------------------------
+# losses/cape/utils/graph_from_skeleton_2D.py
+# ------------------------------------
+import numpy as np
+import networkx as nx
+import time
+import copy
+
+def pixel_graph(skeleton):
+
+    _skeleton = copy.deepcopy(np.uint8(skeleton))
+    _skeleton[0,:] = 0
+    _skeleton[:,0] = 0
+    _skeleton[-1,:] = 0
+    _skeleton[:,-1] = 0
+    G = nx.Graph()
+
+    # add one node for each active pixel
+    xs,ys = np.where(_skeleton>0)
+    G.add_nodes_from([(int(x),int(y)) for i,(x,y) in enumerate(zip(xs,ys))])
+
+    # add one edge between each adjacent active pixels
+    for (x,y) in G.nodes():
+        patch = _skeleton[x-1:x+2, y-1:y+2]
+        patch[1,1] = 0
+        for _x,_y in zip(*np.where(patch>0)):
+            if not G.has_edge((x,y),(x+_x-1,y+_y-1)):
+                G.add_edge((x,y),(x+_x-1,y+_y-1))
+
+    for n,data in G.nodes(data=True):
+        data['pos'] = np.array(n)[::-1]
+
+    return G
+
+def compute_angle_degree(c, p0, p1):
+    p0c = np.sqrt((c[0] - p0[0]) ** 2 + (c[1] - p0[1]) ** 2)
+    p1c = np.sqrt((c[0] - p1[0]) ** 2 + (c[1] - p1[1]) ** 2)
+    p0p1 = np.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2)
+
+    # Prevent division by zero
+    denominator = 2 * p1c * p0c
+    if denominator == 0:
+        return 0  # or some default value like 180
+
+    cos_value = (p1c**2 + p0c**2 - p0p1**2) / denominator
+
+    # Clip values to prevent NaN issues
+    cos_value = np.clip(cos_value, -1.0, 1.0)
+
+    return np.arccos(cos_value) * 180 / np.pi
+
+
+def distance_point_line(c,p0,p1):
+    return np.linalg.norm(np.cross(p0-c, c-p1))/np.linalg.norm(p1-p0)
+
+def decimate_nodes_angle_distance(G, angle_range=(110,240), dist=0.3, verbose=True):
+
+    H = copy.deepcopy(G)
+
+    def f():
+        start = time.time()
+        nodes = list(H.nodes())
+        np.random.shuffle(nodes)
+        changed = False
+        for n in nodes:
+
+            ajacent_nodes = list(nx.neighbors(H, n))
+            if n in ajacent_nodes:
+                ajacent_nodes.remove(n)
+            if len(ajacent_nodes)==2:
+                angle = compute_angle_degree(n, *ajacent_nodes)
+                d = distance_point_line(np.array(n), np.array(ajacent_nodes[0]), np.array(ajacent_nodes[1]))
+                if d<dist or (angle>angle_range[0] and angle<angle_range[1]):
+                    H.remove_node(n)
+                    H.add_edge(*ajacent_nodes)
+                    changed = True
+        return changed
+
+    while True:
+        if verbose:
+            print("Remaining nodes:", len(H.nodes()))
+        if not f():
+            break
+
+    if verbose:
+        print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def remove_close_nodes(G, dist=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    def _remove_close_nodes():
+        edges = list(H.edges())
+        changed = False
+        for (s,t) in edges:
+            if H.has_node(s) and H.has_node(t):
+                d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
+                if d<dist:
+                    if len(H.edges(s))==2:
+                        ajacent_nodes = list(nx.neighbors(H, s))
+                        if s in ajacent_nodes:
+                            ajacent_nodes.remove(s)
+                        if t in ajacent_nodes:
+                            ajacent_nodes.remove(t)
+                        if len(ajacent_nodes)==1:
+                            d = np.sqrt((s[0]-ajacent_nodes[0][0])**2+(s[1]-ajacent_nodes[0][1])**2)
+                            if d<dist:
+                                H.remove_node(s)
+                                H.add_edge(ajacent_nodes[0], t)
+                                changed = True
+                    elif len(H.edges(t))==2:
+                        ajacent_nodes = list(nx.neighbors(H, t))
+                        if s in ajacent_nodes:
+                            ajacent_nodes.remove(s)
+                        if t in ajacent_nodes:
+                            ajacent_nodes.remove(t)
+                        if len(ajacent_nodes)==1:
+                            d = np.sqrt((t[0]-ajacent_nodes[0][0])**2+(t[1]-ajacent_nodes[0][1])**2)
+                            if d<dist:
+                                H.remove_node(t)
+                                H.add_edge(ajacent_nodes[0], s)
+                                changed = True
+        return changed
+
+    while True:
+        if verbose:
+            print("Remaining nodes:", len(H.nodes()))
+        if not _remove_close_nodes():
+            break
+
+    if verbose:
+        print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def remove_small_dangling(G, length=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    edges = list(H.edges())
+    for (s,t) in edges:
+        d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
+        if d<length:
+            edge_count_s = len(H.edges(s))
+            edge_count_t = len(H.edges(t))
+            if edge_count_s==1:
+                H.remove_node(s)
+            if edge_count_t==1:
+                H.remove_node(t)
+
+    return H
+
+def merge_close_intersections(G, dist=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    def _merge_close_intersections():
+        edges = list(H.edges())
+        changed = False
+        for (s,t) in edges:
+            d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
+            if d<dist:
+                if len(H.edges(s))>2 and len(H.edges(t))>2:
+                    ajacent_nodes = list(nx.neighbors(H, s))
+                    if t in ajacent_nodes:
+                        ajacent_nodes.remove(t)
+                    H.remove_node(s)
+                    for n in ajacent_nodes:
+                        H.add_edge(n, t)
+                    changed = True
+                else:
+                    pass
+        return changed
+
+    while True:
+        if verbose:
+            print("Remaining nodes:", len(H.nodes()))
+        if not _merge_close_intersections():
+            break
+
+    if verbose:
+        print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def graph_from_skeleton(skeleton, angle_range=(135,225), dist_line=3,
+                        dist_node=10, verbose=True, max_passes=20, relabel=True):
+    """
+    Parameters
+    ----------
+    skeleton : numpy.ndarray
+        binary skeleton
+    angle_range : (min,max) in degree
+        two connected edges are merged into one if the angle between them
+        is in this range
+    dist_line : pixels
+        two connected edges are merged into one if the distance between
+        the central node to the line connecting the external nodes is
+        lower then this value.
+    dist_node : pixels
+        two nodes that are connected by an edge are "merged" if their distance is
+        lower than this value.
+    """
+    if verbose: print("Creation of densly connected graph.")
+    G = pixel_graph(skeleton)
+
+    for i in range(max_passes):
+
+        if verbose: print("Pass {}:".format(i))
+
+        n = len(G.nodes())
+
+        if verbose: print("\tFirst decimation of nodes.")
+        G = decimate_nodes_angle_distance(G, angle_range, dist_line, verbose)
+
+        if verbose: print("\tFirst removing close nodes.")
+        G = remove_close_nodes(G, dist_node, verbose)
+
+
+        if verbose: print("\tRemoving short danglings.")
+        G = remove_small_dangling(G, length=dist_node)
+
+        if verbose: print("\tMerging close intersections.")
+        G = merge_close_intersections(G, dist_node, verbose)
+
+        if n==len(G.nodes()):
+            break
+
+    if relabel:
+        mapping = dict(zip(G.nodes(), range(len(G.nodes()))))
+        G = nx.relabel_nodes(G, mapping)
+
+    return G
+
+
+# ------------------------------------
+# losses/cape/utils/graph_from_skeleton_3D.py
+# ------------------------------------
+import numpy as np
+import networkx as nx
+import time
+import copy
+
+def pixel_graph(skeleton):
+
+    _skeleton = copy.deepcopy(np.uint8(skeleton))
+    _skeleton[0,:,:] = 0
+    _skeleton[:,0,:] = 0
+    _skeleton[:,:,0] = 0
+    _skeleton[-1,:,:] = 0
+    _skeleton[:,-1,:] = 0
+    _skeleton[:,:,-1] = 0
+    G = nx.Graph()
+
+    # add one node for each active pixel
+    xs,ys,zs = np.where(_skeleton>0)
+    G.add_nodes_from([(int(x),int(y),int(z)) for i,(x,y,z) in enumerate(zip(xs,ys,zs))])
+
+    # add one edge between each adjacent active pixels
+    for (x,y,z) in G.nodes():
+        patch = _skeleton[x-1:x+2, y-1:y+2, z-1:z+2]
+        patch[1,1,1] = 0
+        for _x,_y,_z in zip(*np.where(patch>0)):
+            if not G.has_edge((x,y,z),(x+_x-1,y+_y-1,z+_z-1)):
+                G.add_edge((x,y,z),(x+_x-1,y+_y-1,z+_z-1))
+
+    for n,data in G.nodes(data=True):
+        data['pos'] = np.array(n)[::-1]
+
+    return G
+
+def compute_angle_degree(c, p0, p1):
+    p0c = np.sqrt((c[0]-p0[0])**2+(c[1]-p0[1])**2+(c[2]-p0[2])**2)
+    p1c = np.sqrt((c[0]-p1[0])**2+(c[1]-p1[1])**2+(c[2]-p1[2])**2)
+    p0p1 = np.sqrt((p1[0]-p0[0])**2+(p1[1]-p0[1])**2+(p1[2]-p0[2])**2)
+    return np.arccos((p1c*p1c+p0c*p0c-p0p1*p0p1)/(2*p1c*p0c))*180/np.pi
+    # cos_val = (p1c*p1c + p0c*p0c - p0p1*p0p1) / (2 * p1c * p0c)
+    ## clamp to [-1, 1] to guard against floating-point drift
+    # cos_val = np.clip(cos_val, -1.0, 1.0)
+    # angle_rad = np.arccos(cos_val)
+    # return angle_rad * 180.0 / np.pi
+
+def distance_point_line(c,p0,p1):
+    return np.linalg.norm(np.cross(p0-c, c-p1))/np.linalg.norm(p1-p0)
+
+def decimate_nodes_angle_distance(G, angle_range=(110,240), dist=0.3, verbose=True):
+
+    H = copy.deepcopy(G)
+
+    def f():
+        start = time.time()
+        nodes = list(H.nodes())
+        np.random.shuffle(nodes)
+        changed = False
+        for n in nodes:
+
+            ajacent_nodes = list(nx.neighbors(H, n))
+            if n in ajacent_nodes:
+                ajacent_nodes.remove(n)
+            if len(ajacent_nodes)==2:
+                angle = compute_angle_degree(n, *ajacent_nodes)
+                d = distance_point_line(np.array(n), np.array(ajacent_nodes[0]), np.array(ajacent_nodes[1]))
+                if d<dist or (angle>angle_range[0] and angle<angle_range[1]):
+                    H.remove_node(n)
+                    H.add_edge(*ajacent_nodes)
+                    changed = True
+        return changed
+
+    while True:
+        if verbose:
+            print("Remaining nodes:", len(H.nodes()))
+        if not f():
+            break
+
+    if verbose:
+        print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def remove_close_nodes(G, dist=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    def _remove_close_nodes():
+        edges = list(H.edges())
+        changed = False
+        for (s,t) in edges:
+            if H.has_node(s) and H.has_node(t):
+                d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2+(s[2]-t[2])**2)
+                if d<dist:
+                    if len(H.edges(s))==2:
+                        ajacent_nodes = list(nx.neighbors(H, s))
+                        if s in ajacent_nodes:
+                            ajacent_nodes.remove(s)
+                        if t in ajacent_nodes:
+                            ajacent_nodes.remove(t)
+                        if len(ajacent_nodes)==1:
+                            d = np.sqrt((s[0]-ajacent_nodes[0][0])**2+(s[1]-ajacent_nodes[0][1])**2+(s[2]-ajacent_nodes[0][2])**2)
+                            if d<dist:
+                                H.remove_node(s)
+                                H.add_edge(ajacent_nodes[0], t)
+                                changed = True
+                    elif len(H.edges(t))==2:
+                        ajacent_nodes = list(nx.neighbors(H, t))
+                        if s in ajacent_nodes:
+                            ajacent_nodes.remove(s)
+                        if t in ajacent_nodes:
+                            ajacent_nodes.remove(t)
+                        if len(ajacent_nodes)==1:
+                            d = np.sqrt((t[0]-ajacent_nodes[0][0])**2+(t[1]-ajacent_nodes[0][1])**2+(t[2]-ajacent_nodes[0][2])**2)
+                            if d<dist:
+                                H.remove_node(t)
+                                H.add_edge(ajacent_nodes[0], s)
+                                changed = True
+        return changed
+
+    while True:
+        if verbose:
+            print("Remaining nodes:", len(H.nodes()))
+        if not _remove_close_nodes():
+            break
+
+    if verbose:
+        print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def remove_small_dangling(G, length=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    edges = list(H.edges())
+    for (s,t) in edges:
+        d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2+(s[2]-t[2])**2)
+        if d<length:
+            edge_count_s = len(H.edges(s))
+            edge_count_t = len(H.edges(t))
+            if edge_count_s==1:
+                H.remove_node(s)
+            if edge_count_t==1:
+                H.remove_node(t)
+
+    return H
+
+def merge_close_intersections(G, dist=10, verbose=True):
+
+    H = copy.deepcopy(G)
+    def _merge_close_intersections():
+        edges = list(H.edges())
+        changed = False
+        for (s,t) in edges:
+            d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2+(s[2]-t[2])**2)
+            if d<dist:
+                if len(H.edges(s))>2 and len(H.edges(t))>2:
+                    ajacent_nodes = list(nx.neighbors(H, s))
+                    if t in ajacent_nodes:
+                        ajacent_nodes.remove(t)
+                    H.remove_node(s)
+                    for n in ajacent_nodes:
+                        H.add_edge(n, t)
+                    changed = True
+                else:
+                    pass
+        return changed
+
+    while True:
+        if verbose:
+            print("Remaining nodes:", len(H.nodes()))
+        if not _merge_close_intersections():
+            break
+
+    if verbose:
+        print("Finished. Remaining nodes:", len(H.nodes()))
+
+    return H
+
+def graph_from_skeleton(skeleton, angle_range=(135,225), dist_line=3,
+                        dist_node=10, verbose=True, max_passes=20, relabel=True):
+    """
+    Parameters
+    ----------
+    skeleton : numpy.ndarray
+        binary skeleton
+    angle_range : (min,max) in degree
+        two connected edges are merged into one if the angle between them
+        is in this range
+    dist_line : pixels
+        two connected edges are merged into one if the distance between
+        the central node to the line connecting the external nodes is
+        lower then this value.
+    dist_node : pixels
+        two nodes that are connected by an edge are "merged" if their distance is
+        lower than this value.
+    """
+    if verbose: print("Creation of densly connected graph.")
+    G = pixel_graph(skeleton)
+
+    for i in range(max_passes):
+
+        if verbose: print("Pass {}:".format(i))
+
+        n = len(G.nodes())
+
+        if verbose: print("\tFirst decimation of nodes.")
+        G = decimate_nodes_angle_distance(G, angle_range, dist_line, verbose)
+
+        if verbose: print("\tFirst removing close nodes.")
+        G = remove_close_nodes(G, dist_node, verbose)
+
+
+        if verbose: print("\tRemoving short danglings.")
+        G = remove_small_dangling(G, length=dist_node)
+
+        if verbose: print("\tMerging close intersections.")
+        G = merge_close_intersections(G, dist_node, verbose)
+
+        if n==len(G.nodes()):
+            break
+
+    if relabel:
+        mapping = dict(zip(G.nodes(), range(len(G.nodes()))))
+        G = nx.relabel_nodes(G, mapping)
+
+    return G
+
+
+# ------------------------------------
+# losses/cape/utils/crop_graph.py
+# ------------------------------------
+import numpy as np
+from shapely.geometry import box, LineString, Point
+import networkx as nx
+
+def crop_graph_2D(graph, xmin, ymin, xmax, ymax, precision=8):
+    
+    bounding_box = box(xmin, ymin, xmax, ymax)
+    
+    cropped_graph = nx.Graph()
+    node_positions = {}      
+    inside_nodes = {}        
+    coord_to_node = {}      
+    
+    for n, data in graph.nodes(data=True):
+        pos = data['pos']
+        node_positions[n] = pos
+        x, y = pos
+        if xmin <= x <= xmax and ymin <= y <= ymax:
+            new_pos = (x - xmin, y - ymin)
+            inside_nodes[n] = new_pos
+            cropped_graph.add_node(n, pos=new_pos)
+    
+            key = (round(new_pos[0], precision), round(new_pos[1], precision))
+            coord_to_node[key] = n
+    
+    max_node_index = max(graph.nodes()) if graph.nodes else 0
+
+    for u, v, data in graph.edges(data=True):
+        u_pos = node_positions[u]
+        v_pos = node_positions[v]
+        line = LineString([u_pos, v_pos])
+        
+        if u in inside_nodes and v in inside_nodes:
+            if u != v:
+                cropped_graph.add_edge(u, v, **data)
+            continue
+        
+        if not bounding_box.intersects(line):
+            continue
+
+        intersection = bounding_box.intersection(line)
+        if intersection.is_empty:
+            continue
+
+        if intersection.geom_type == 'Point':
+            pts = [(intersection.x, intersection.y)]
+        elif intersection.geom_type == 'MultiPoint':
+            pts = [(pt.x, pt.y) for pt in intersection.geoms]
+        elif intersection.geom_type == 'LineString':
+            pts = list(intersection.coords)
+        else:
+            continue
+
+        pts.sort(key=lambda pt: line.project(Point(pt)))
+        
+        new_nodes = []
+        for pt in pts:
+            new_pos = (pt[0] - xmin, pt[1] - ymin)
+            key = (round(new_pos[0], precision), round(new_pos[1], precision))
+            if key in coord_to_node:
+                node_id = coord_to_node[key]
+            else:
+                max_node_index += 1
+                node_id = max_node_index
+                cropped_graph.add_node(node_id, pos=new_pos)
+                coord_to_node[key] = node_id
+            new_nodes.append(node_id)
+        
+        endpoints = []
+        if u in inside_nodes:
+            endpoints.append(u)
+        endpoints.extend(new_nodes)
+        if v in inside_nodes:
+            endpoints.append(v)
+
+        for i in range(len(endpoints) - 1):
+            if endpoints[i] != endpoints[i+1]:
+                cropped_graph.add_edge(endpoints[i], endpoints[i+1], **data)
+    
+    return cropped_graph
+
+
+def crop_graph_3D(graph, xmin, ymin, zmin, xmax, ymax, zmax, precision=8):
+    
+    def _to_voxel(u, lo, hi):
+        v = int(np.floor(u - lo))          
+        return max(0, min(v, hi - lo - 1)) 
+
+    def _segment_box_intersections(p0, p1):
+
+        pts = []
+        (x0, y0, z0), (x1, y1, z1) = p0, p1
+        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+
+        for plane, (k0, k1, p) in (
+            ("x", (x0, dx, xmin)), ("x", (x0, dx, xmax)),
+            ("y", (y0, dy, ymin)), ("y", (y0, dy, ymax)),
+            ("z", (z0, dz, zmin)), ("z", (z0, dz, zmax)),
+        ):
+            k0, dk, plane_val = k0, k1, p
+            if dk == 0:                        
+                continue
+            t = (plane_val - k0) / dk
+            if 0 < t < 1:                      
+                x = x0 + t * dx
+                y = y0 + t * dy
+                z = z0 + t * dz
+                if xmin - 1e-6 <= x <= xmax + 1e-6 and \
+                ymin - 1e-6 <= y <= ymax + 1e-6 and \
+                zmin - 1e-6 <= z <= zmax + 1e-6:
+                    pts.append((x, y, z))
+
+        pts.sort(key=lambda pt: (pt[0]-x0)**2 + (pt[1]-y0)**2 + (pt[2]-z0)**2)
+        return pts
+
+    cropped = nx.Graph()
+    inside_nodes, pos_cache, coord2id = {}, {}, {}
+
+    for n, d in graph.nodes(data=True):
+        x, y, z = d["pos"]
+        pos_cache[n] = (x, y, z)
+        if xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax:
+            vx, vy, vz = (_to_voxel(x, xmin, xmax),
+                        _to_voxel(y, ymin, ymax),
+                        _to_voxel(z, zmin, zmax))
+            
+            inside_nodes[n] = (vx, vy, vz)
+            cropped.add_node(n, pos=inside_nodes[n])
+            coord2id[(vx, vy, vz)] = n
+
+    next_id = (max(graph.nodes()) if graph.nodes else 0) + 1
+
+    for u, v, edata in graph.edges(data=True):
+        p0, p1 = pos_cache[u], pos_cache[v]
+
+        if (u not in inside_nodes) and (v not in inside_nodes):
+
+            if (p0[0] < xmin and p1[0] < xmin) or (p0[0] > xmax and p1[0] > xmax) \
+            or (p0[1] < ymin and p1[1] < ymin) or (p0[1] > ymax and p1[1] > ymax) \
+            or (p0[2] < zmin and p1[2] < zmin) or (p0[2] > zmax and p1[2] > zmax):
+                continue
+
+        split_pts = _segment_box_intersections(p0, p1)
+
+        node_chain = []
+        if u in inside_nodes:
+            node_chain.append(u)
+
+        for pt in split_pts:
+            
+            vz = _to_voxel(pt[2], zmin, zmax)
+            vy = _to_voxel(pt[1], ymin, ymax)
+            vx = _to_voxel(pt[0], xmin, xmax)
+        
+            key = (vx, vy, vz)
+            if key in coord2id:
+                node_id = coord2id[key]
+            else:
+                node_id = next_id
+                next_id += 1
+                cropped.add_node(node_id, pos=(vx, vy, vz))
+                coord2id[key] = node_id
+            node_chain.append(node_id)
+
+        if v in inside_nodes:
+            node_chain.append(v)
+
+        for a, b in zip(node_chain[:-1], node_chain[1:]):
+            if a != b:
+                cropped.add_edge(a, b, **edata)
+
+    return cropped
+
+
+
+# ------------------------------------
 # models/base_models.py
 # ------------------------------------
 import numpy as np

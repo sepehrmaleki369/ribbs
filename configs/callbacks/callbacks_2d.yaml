@@ -1,4 +1,10 @@
 callbacks:
+  - name: GradPlotCallback
+    params:
+      every_n_epochs: 1
+      max_samples: 2
+      cmap: turbo
+
   # Save best checkpoints per metric
   - name: BestMetricCheckpoint
     params:

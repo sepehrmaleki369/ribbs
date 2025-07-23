@@ -14,6 +14,7 @@ from core.callbacks import (
     PredictionLogger,
     ConfigArchiver,
     SkipValidation,
+    GradPlotCallback
 )
 
 __all__ = ["load_callbacks"]
@@ -88,6 +89,16 @@ def load_callbacks(
             callbacks.append(
                 SamplePlot3DCallback(
                     params
+                )
+            )
+
+        elif name == "GradPlotCallback":
+            callbacks.append(
+                GradPlotCallback(
+                    input_key=params.get("input_key", "image_patch"),
+                    every_n_epochs=params.get("every_n_epochs", 5),
+                    max_samples=params.get("max_samples", 4),
+                    cmap=params.get("cmap", "turbo"),
                 )
             )
 

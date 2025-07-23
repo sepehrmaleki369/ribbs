@@ -6,4 +6,5 @@ from core.callbacks.pred_saver          import PredictionSaver
 from core.callbacks.sample_plot         import SamplePlotCallback, SamplePlot3DCallback
 from core.callbacks.skip_validation     import SkipValidation
 from core.callbacks.config_archiver     import ConfigArchiver
-from core.callbacks.pred_logger   import PredictionLogger   # <<–– add this line
+from core.callbacks.pred_logger         import PredictionLogger   # <<–– add this line
+from core.callbacks.grad_plot           import GradPlotCallback
