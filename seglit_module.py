@@ -26,7 +26,8 @@ class SegLitModule(pl.LightningModule):
         val_metrics_every_n_epochs: int = 1,
         train_metric_frequencies: Dict[str, int] = None,
         val_metric_frequencies: Dict[str, int] = None,
-        divisible_by: int = 16
+        divisible_by: int = 16,
+        compute_val_loss=False
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
@@ -45,6 +46,8 @@ class SegLitModule(pl.LightningModule):
         self.val_metric_frequencies = val_metric_frequencies or {}
 
         self.divisible_by = divisible_by
+
+        self.compute_val_loss = compute_val_loss
 
         self.py_logger = logging.getLogger(__name__)
     
@@ -180,7 +183,8 @@ class SegLitModule(pl.LightningModule):
             y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
-        loss_dict = self.loss_fn(y_hat, y)
+        # loss_dict = self.loss_fn(y_hat, y)
+        loss_dict = self._safe_loss(y_hat, y)
         # combined
         self.log("val_loss", loss_dict["mixed"],
                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
@@ -209,11 +213,11 @@ class SegLitModule(pl.LightningModule):
                     for subname, value in result.items():
                         if isinstance(value, torch.Tensor):
                             value = value.item()
-                        self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                        self.log(f"val_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
                 else:
                     if isinstance(result, torch.Tensor):
                         result = result.item()
-                    self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                    self.log(f"val_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
 
         # ——— Log GT / Pred stats for TensorBoard ———
         # flatten tensors
@@ -247,7 +251,8 @@ class SegLitModule(pl.LightningModule):
             y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
-        loss_dict = self.loss_fn(y_hat, y)
+        # loss_dict = self.loss_fn(y_hat, y)
+        loss_dict = self._safe_loss(y_hat, y)
         # combined
         self.log("test_loss", loss_dict["mixed"],
                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
@@ -264,11 +269,11 @@ class SegLitModule(pl.LightningModule):
                 for subname, value in result.items():
                     if isinstance(value, torch.Tensor):
                         value = value.item()
-                    self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                    self.log(f"test_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
             else:
                 if isinstance(result, torch.Tensor):
                     result = result.item()
-                self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                self.log(f"test_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
 
         return {"predictions": y_hat, "test_loss": loss_dict["mixed"], "gts": y}
 
@@ -308,3 +313,31 @@ class SegLitModule(pl.LightningModule):
         scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """
+        Try a strict load first; if it fails because of unexpected or
+        missing keys, fall back to strict=False so training can resume
+        without losing optimizer / scheduler / epoch states.
+        """
+        try:
+            return super().load_state_dict(state_dict, strict=strict)
+        except RuntimeError as err:
+            self.py_logger.warning(f"Strict load failed: {err}\nRetrying with strict=False.")
+            return super().load_state_dict(state_dict, strict=False)
+    
+        # ──────────────────────────────────────────────────────────────
+    def _safe_loss(self, y_hat: torch.Tensor, y: torch.Tensor):
+        """
+        Try to compute the configured loss; if it fails (e.g. because no
+        grad info is available during val/test), return zeros so the run
+        keeps going and log a warning.
+        """
+        if not self.compute_val_loss:
+            z = torch.tensor(0.0, device=y_hat.device)
+            return {"mixed": z, "primary": z, "secondary": z}
+        try:
+            return self.loss_fn(y_hat, y)
+        except RuntimeError as err:
+            self.py_logger.warning(f"Loss calculation skipped: {err}")
+            z = torch.tensor(0.0, device=y_hat.device)
+            return {"mixed": z, "primary": z, "secondary": z}

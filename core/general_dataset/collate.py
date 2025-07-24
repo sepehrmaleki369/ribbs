@@ -47,11 +47,14 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             collated[key] = items                  # e.g. metadata strings
     return collated
 
+_worker_rngs = {}
 def worker_init_fn(worker_id):
-    """
-    DataLoader worker initialization to ensure different random seeds for each worker.
-    """
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
+    info = torch.utils.data.get_worker_info()
+    base_seed = info.seed  # unique per worker
+    # Seed all libs for completeness
+    np.random.seed(base_seed % 2**32)
+    random.seed(base_seed)
+    torch.manual_seed(base_seed)
+
+    # Make & store a dedicated numpy Generator for this worker
+    _worker_rngs[worker_id] = np.random.default_rng(base_seed)

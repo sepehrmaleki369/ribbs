@@ -3,7 +3,8 @@
 # Patch size for inference [height, width]
 # Patches of this size will be processed independently 
 # and then reassembled to form the full output
-patch_size: [512, 512]
+# patch_size: [512, 512]
+patch_size: [256, 256]
 # patch_size: [90, 90, 90]
 
 # Patch margin [height, width]

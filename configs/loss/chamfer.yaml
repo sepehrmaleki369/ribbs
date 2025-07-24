@@ -1,0 +1,46 @@
+# Mixed Topological Loss Configuration
+
+# Primary loss (used from the beginning)
+primary_loss:
+  path: "losses.chamfer_class"
+  class: "ChamferBoundarySDFLoss"
+  params:
+    pixel_weight:      1.0      # weight of the L1 term
+    chamfer_weight:    1.0      # overall scale of the injected gradient
+    update_scale:      10.0     # multiplier inside make_dSDF
+    dist_threshold:    2.0      # max pairing distance in pixels
+    max_points:        2048     # subsample number of zero‐crossings
+    normalize_normals: false    # whether to re‐normalize normals in dSDF
+    use_hook:          true     # register the backward hook
+    clip_sdf_to:       null     # no clipping of raw SDF values
+    clip_dSDF:         null     # no clipping of the injected gradient
+
+  # path: "losses.weighted_mse"
+  # class: "WeightedMSELoss"
+  # params:
+  #   road_weight: 4
+  #   bg_weight: 1
+  #   threshold: 0
+  #   greater_is_road: False
+  #   reduction: mean
+
+  # class: "MSELoss"  # Built-in PyTorch loss
+  # params: {}
+
+# # Secondary loss (activated after start_epoch)
+# secondary_loss:
+#   path: "losses.chamfer_class"  # Path to the module containing the loss
+#   class: "ChamferBoundarySDFLoss"  # Name of the loss class
+#   params:
+#     update_scale: 1.0     # scale applied to the gradient projection
+#     dist_threshold: 3.0   # max distance (in pixels) to consider a match
+#     chamfer_weight: 1.0         # weight for the “inject” term
+#     pixel_weight: 1.0          # weight for the “pixel” term
+
+## Mixing parameters
+alpha: 0.1  # Weight for the secondary loss 
+start_epoch: 0  # Epoch to start using the secondary loss
+
+
+
+ 

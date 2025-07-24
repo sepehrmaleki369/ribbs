@@ -19,6 +19,8 @@ from core.general_dataset.visualizations import visualize_batch_2d, visualize_ba
 from core.general_dataset.splits import Split
 from core.general_dataset.logger import logger
 from core.general_dataset.io import to_tensor as _to_tensor
+from core.general_dataset.collate import _worker_rngs
+
 import torch
 
 # --------------- helpers ----------------
@@ -202,17 +204,17 @@ class GeneralizedDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         worker_info = torch.utils.data.get_worker_info()
-        worker_seed = worker_info.id if worker_info else 0
-        # add epoch so the same idx gets a fresh seed each epoch
-        seed = self.seed ^ idx ^ (self._epoch * 0x9E3779B97F4A7C15) ^ worker_seed
-        rng  = np.random.default_rng(seed)
+        if worker_info is None:
+            # single-process fallback
+            rng = np.random.default_rng()        # or keep one in self.__init__
+        else:
+            rng = _worker_rngs[worker_info.id]   # <- persistent per worker
 
         imgs = self._load_datapoint(idx)
         if imgs is None:
             return self.__getitem__((idx + 1) % len(self))
 
         data = self._postprocess_patch(imgs, rng)
-        
         return data
 
     def log_stats(self, stage: str, step: str, label: np.ndarray) -> None:

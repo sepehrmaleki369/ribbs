@@ -32,7 +32,8 @@ base_modalities: ["label", "image"]
 # -----------------------------------------------------------------------------
 data_dim: 2                # 2 = 2D patches, 3 = 3D volumes
 patch_size: [512, 512]            
-max_images: 10           # limit number of loaded images (null = no limit)
+# patch_size: [256, 256]            
+max_images: 2           # limit number of loaded images (null = no limit)
 # max_images: null           # limit number of loaded images (null = no limit)
 # max_attempts: 10           # retries to find a valid patch
 
@@ -47,7 +48,7 @@ sdf_iterations: 3                 # dilation iterations before SDF
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 2
+train_batch_size: 1
 val_batch_size: 1
 test_batch_size: 1
 num_workers: 4

@@ -6,18 +6,19 @@
 dataset_config: "mass_test.yaml"
 model_config: "baseline.yaml"
 loss_config: "fixed_lif_mse_chamfer.yaml"
+# loss_config: "chamfer.yaml"
 metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 callbacks_config: "callbacks_2d.yaml"
 
 # Output directory
-output_dir: "outputs/base_sdf_mass_lif_640dp"
+output_dir: "runs/base_sdf_lif_mse_chamfer_smoke_test"
 
 # Trainer configuration
 trainer:
   num_sanity_val_steps: 0
   max_epochs: 6000
-  check_val_every_n_epoch: 10      # Validate every N epochs (this is redundant with val_check_interval=1.0)
+  check_val_every_n_epoch: 1      # Validate every N epochs (this is redundant with val_check_interval=1.0)
   skip_validation_until_epoch: 0  # Skip validation until this epoch
   log_every_n_steps: 1            # log metrics every step
   train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
@@ -25,10 +26,11 @@ trainer:
   save_gt_pred_val_test_every_n_epochs: 1  # Save GT+pred every 10 epochs
   save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
   # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
-
+  compute_val_loss: false
+  
   extra_args:
     accelerator: "auto" 
-    precision: 32  
+    precision: 16-mixed  
     deterministic: false
     # gradient_clip_val: 1.0
     # accumulate_grad_batches: 1

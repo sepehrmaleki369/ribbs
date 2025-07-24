@@ -1,7 +1,6 @@
 # ------------------------------------
 # train.py
 # ------------------------------------
-# train.py
 """
 Training script for segmentation experiments.
 
@@ -12,11 +11,9 @@ setting up models, losses, metrics, and dataloaders, and running training.
 import os
 import argparse
 import logging
-from typing import Any, Dict, List
-
+from typing import Any, Dict
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import LearningRateMonitor
 
 from core.loaders.callback_loader import load_callbacks
 from core.loaders.model_loader import load_model
@@ -24,7 +21,6 @@ from core.loaders.loss_loader import load_loss
 from core.loaders.metric_loader import load_metrics
 from core.loaders.dataloader import SegmentationDataModule
 from core.mix_loss import MixedLoss
-
 from core.logger import setup_logger
 from core.checkpoint import CheckpointManager
 from core.utils import yaml_read, mkdir
@@ -32,77 +28,33 @@ from core.utils import yaml_read, mkdir
 from seglit_module import SegLitModule
 
 # Silence noisy loggers
-for lib in ('rasterio', 'matplotlib', 'PIL', 'tensorboard', 'urllib3'):
+for lib in ("rasterio", "matplotlib", "PIL", "tensorboard", "urllib3"):
     logging.getLogger(lib).setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO)
-logging.getLogger('core').setLevel(logging.INFO)
-logging.getLogger('__main__').setLevel(logging.INFO)
-logging.getLogger('seglit_module').setLevel(logging.INFO)
+logging.getLogger("core").setLevel(logging.INFO)
+logging.getLogger("__main__").setLevel(logging.INFO)
+logging.getLogger("seglit_module").setLevel(logging.INFO)
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    return yaml_read(config_path)
+def load_config(path: str) -> Dict[str, Any]:
+    return yaml_read(path)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train segmentation model")
-    parser.add_argument("--config", type=str, default="configs/main.yaml",
-                        help="Path to main configuration file")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume training from")
-    parser.add_argument("--test", action="store_true",
-                        help="Run testing instead of training")
-    args = parser.parse_args()
-
-    # --- load configs ---
-    main_cfg      = load_config(args.config)
-    dataset_cfg   = load_config(os.path.join("configs", "dataset",   main_cfg["dataset_config"]))
-    model_cfg     = load_config(os.path.join("configs", "model",     main_cfg["model_config"]))
-    loss_cfg      = load_config(os.path.join("configs", "loss",      main_cfg["loss_config"]))
-    metrics_cfg   = load_config(os.path.join("configs", "metrics",   main_cfg["metrics_config"]))
-    inference_cfg = load_config(os.path.join("configs", "inference", main_cfg["inference_config"]))
-    callbacks_cfg = load_config(os.path.join("configs", "callbacks", main_cfg["callbacks_config"]))
-
-    # --- prepare output & logger ---
-    output_dir = main_cfg.get("output_dir", "outputs")
-    mkdir(output_dir)
-    logger = setup_logger(os.path.join(output_dir, "training.log"))
-    logger.info(f"Output dir: {output_dir}")
-
-    # --- trainer params from YAML ---
-    trainer_cfg                = main_cfg.get("trainer", {})
-
-    train_metrics_every_n      = trainer_cfg["train_metrics_every_n_epochs"]
-    val_metrics_every_n        = trainer_cfg["val_metrics_every_n_epochs"]
-
-    # --- model, loss, metrics ---
-    logger.info("Loading model...")
-    model = load_model(model_cfg)
-
-    logger.info("Loading losses...")
-    prim = load_loss(loss_cfg["primary_loss"])
-    sec  = load_loss(loss_cfg["secondary_loss"]) if loss_cfg.get("secondary_loss") else None
-    mixed_loss = MixedLoss(
-        prim, sec,
-        alpha=loss_cfg.get("alpha", 0.5),
-        start_epoch=loss_cfg.get("start_epoch", 0),
-    )
-
-    logger.info("Loading metrics...")
-    metric_list = load_metrics(metrics_cfg["metrics"])
-
-    # --- data module ---
-    logger.info("Setting up data module...")
-    dm = SegmentationDataModule(dataset_cfg)
-    dm.setup()
-    logger.info(f"Train set size:      {len(dm.train_dataset)} samples")
-    logger.info(f"Validation set size: {len(dm.val_dataset)} samples")
-    logger.info(f"Test set size:       {len(dm.test_dataset)} samples")
-
-    # --- lightning module ---
-    input_key  = main_cfg.get("target_x", "image_patch")
-    target_key = main_cfg.get("target_y", "label_patch")
-    lit = SegLitModule(
+def build_lit(
+    model,
+    mixed_loss,
+    metric_list,
+    main_cfg,
+    inference_cfg,
+    input_key,
+    target_key,
+    train_metrics_every_n,
+    val_metrics_every_n,
+    metrics_cfg,
+    *, compute_val_loss=True
+):
+    """Always create a *fresh* LightningModule – Trainer will load the checkpoint later."""
+    return SegLitModule(
         model=model,
         loss_fn=mixed_loss,
         metrics=metric_list,
@@ -114,10 +66,82 @@ def main():
         val_metrics_every_n_epochs=val_metrics_every_n,
         train_metric_frequencies=metrics_cfg.get("train_frequencies", {}),
         val_metric_frequencies=metrics_cfg.get("val_frequencies", {}),
-        divisible_by=inference_cfg.get('chunk_divisible_by', 16)
+        divisible_by=inference_cfg.get("chunk_divisible_by", 16),
+        compute_val_loss=compute_val_loss, 
     )
 
-    # --- callbacks ---
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train segmentation model")
+    parser.add_argument("--config", type=str, default="configs/main.yaml")
+    parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument("--test", action="store_true", help="Run testing instead of training")
+    args = parser.parse_args()
+
+    # --- load configs -------------------------------------------------------
+    main_cfg = load_config(args.config)
+    dataset_cfg = load_config(os.path.join("configs", "dataset", main_cfg["dataset_config"]))
+    model_cfg = load_config(os.path.join("configs", "model", main_cfg["model_config"]))
+    loss_cfg = load_config(os.path.join("configs", "loss", main_cfg["loss_config"]))
+    metrics_cfg = load_config(os.path.join("configs", "metrics", main_cfg["metrics_config"]))
+    inference_cfg = load_config(os.path.join("configs", "inference", main_cfg["inference_config"]))
+    callbacks_cfg = load_config(os.path.join("configs", "callbacks", main_cfg["callbacks_config"]))
+
+    # --- output & logger ----------------------------------------------------
+    output_dir = main_cfg.get("output_dir", "outputs")
+    mkdir(output_dir)
+    logger = setup_logger(os.path.join(output_dir, "training.log"))
+    logger.info(f"Output dir: {output_dir}")
+
+    # --- trainer params -----------------------------------------------------
+    trainer_cfg = main_cfg.get("trainer", {})
+    train_metrics_every_n = trainer_cfg["train_metrics_every_n_epochs"]
+    val_metrics_every_n = trainer_cfg["val_metrics_every_n_epochs"]
+    compute_val_loss        = trainer_cfg.get("compute_val_loss", True)
+
+    # --- model / loss / metrics --------------------------------------------
+    logger.info("Loading model…")
+    model = load_model(model_cfg)
+
+    logger.info("Loading losses…")
+    prim = load_loss(loss_cfg["primary_loss"])
+    sec = load_loss(loss_cfg["secondary_loss"]) if loss_cfg.get("secondary_loss") else None
+    mixed_loss = MixedLoss(
+        prim,
+        sec,
+        alpha=loss_cfg.get("alpha", 0.5),
+        start_epoch=loss_cfg.get("start_epoch", 0),
+    )
+
+    logger.info("Loading metrics…")
+    metric_list = load_metrics(metrics_cfg["metrics"])
+
+    # --- data module --------------------------------------------------------
+    logger.info("Setting up data module…")
+    dm = SegmentationDataModule(dataset_cfg)
+    dm.setup()
+    logger.info(f"Train set size:      {len(dm.train_dataset)} samples")
+    logger.info(f"Validation set size: {len(dm.val_dataset)} samples")
+    logger.info(f"Test set size:       {len(dm.test_dataset)} samples")
+
+    # --- lightning module ---------------------------------------------------
+    input_key = main_cfg.get("target_x", "image_patch")
+    target_key = main_cfg.get("target_y", "label_patch")
+    lit = build_lit(
+        model,
+        mixed_loss,
+        metric_list,
+        main_cfg,
+        inference_cfg,
+        input_key,
+        target_key,
+        train_metrics_every_n,
+        val_metrics_every_n,
+        metrics_cfg,
+        compute_val_loss = compute_val_loss
+    )
+
+    # --- callbacks ----------------------------------------------------------
     callbacks = load_callbacks(
         callbacks_cfg["callbacks"],
         output_dir=output_dir,
@@ -125,54 +149,45 @@ def main():
         skip_valid_until_epoch=trainer_cfg["skip_validation_until_epoch"],
         save_gt_pred_val_test_every_n_epochs=trainer_cfg.get("save_gt_pred_val_test_every_n_epochs", 5),
         save_gt_pred_val_test_after_epoch=trainer_cfg.get("save_gt_pred_val_test_after_epoch", 0),
-        save_gt_pred_max_samples=trainer_cfg.get("save_gt_pred_max_samples", None),
+        save_gt_pred_max_samples=trainer_cfg.get("save_gt_pred_max_samples"),
         project_root=os.path.dirname(os.path.abspath(__file__)),
     )
-    
-    # --- trainer & logger setup ---
-    tb_logger     = TensorBoardLogger(save_dir=output_dir, name="logs")
+
+    # --- trainer ------------------------------------------------------------
+    tb_logger = TensorBoardLogger(save_dir=output_dir, name="logs")
     trainer_kwargs = dict(trainer_cfg.get("extra_args", {}))
-
-    # apply only those keys you defined in YAML
-    trainer_kwargs.update({
-        "max_epochs":                trainer_cfg["max_epochs"],
-        "num_sanity_val_steps":      trainer_cfg["num_sanity_val_steps"],
-        "check_val_every_n_epoch":   trainer_cfg["check_val_every_n_epoch"],
-        "log_every_n_steps":         trainer_cfg["log_every_n_steps"],
-    })
-
-    trainer_kwargs["callbacks"]         = callbacks
-    trainer_kwargs["logger"]            = tb_logger
-    trainer_kwargs.setdefault("default_root_dir", output_dir)
-
+    trainer_kwargs.update(
+        {
+            "max_epochs": trainer_cfg["max_epochs"],
+            "num_sanity_val_steps": trainer_cfg["num_sanity_val_steps"],
+            "check_val_every_n_epoch": trainer_cfg["check_val_every_n_epoch"],
+            "log_every_n_steps": trainer_cfg["log_every_n_steps"],
+            "callbacks": callbacks,
+            "logger": tb_logger,
+            "default_root_dir": output_dir,
+        }
+    )
     trainer = pl.Trainer(**trainer_kwargs)
 
+    # quick sanity print
     batch = next(iter(dm.train_dataloader()))
-    logger.info("image_patch shape:", batch["image_patch"].shape)   # (B, C, H, W)
-    logger.debug("UNet expects    :", lit.model.in_channels)
+    logger.info(f"image_patch shape: {batch['image_patch'].shape}")
+    logger.debug(f"UNet expects: {lit.model.in_channels}")
 
-
-    # --- run ---
+    # --- run ----------------------------------------------------------------
+    ckpt = args.resume or None
     if args.test:
-        logger.info("Running test...")
-        if args.resume:
-            logger.info(f"Loading checkpoint for testing: {args.resume}")
-            trainer.test(lit, datamodule=dm, ckpt_path=args.resume)
-        else:
-            trainer.test(lit, datamodule=dm)
+        logger.info("Running test…")
+        trainer.test(lit, datamodule=dm, ckpt_path=ckpt)
     else:
-        logger.info("Running training...")
-        if args.resume:
-            logger.info(f"Resuming training from checkpoint: {args.resume}")
-            trainer.fit(lit, datamodule=dm, ckpt_path=args.resume)
-        else:
-            logger.info("Starting training from scratch...")
-            trainer.fit(lit, datamodule=dm)
+        logger.info("Running training…")
+        trainer.fit(lit, datamodule=dm, ckpt_path=ckpt)
 
+        # evaluate best checkpoint after training
         mgr = CheckpointManager(
             checkpoint_dir=os.path.join(output_dir, "checkpoints"),
             metrics=list(metric_list.keys()),
-            default_mode="max"
+            default_mode="max",
         )
         best_metric, best_ckpt, best_val = mgr.get_best_checkpoint()
         logger.info(f"Best ckpt: {best_ckpt} ({best_metric}={best_val:.4f})")
@@ -214,7 +229,8 @@ class SegLitModule(pl.LightningModule):
         val_metrics_every_n_epochs: int = 1,
         train_metric_frequencies: Dict[str, int] = None,
         val_metric_frequencies: Dict[str, int] = None,
-        divisible_by: int = 16
+        divisible_by: int = 16,
+        compute_val_loss=False
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model', 'loss_fn', 'metrics'])
@@ -233,6 +249,8 @@ class SegLitModule(pl.LightningModule):
         self.val_metric_frequencies = val_metric_frequencies or {}
 
         self.divisible_by = divisible_by
+
+        self.compute_val_loss = compute_val_loss
 
         self.py_logger = logging.getLogger(__name__)
     
@@ -368,7 +386,8 @@ class SegLitModule(pl.LightningModule):
             y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
-        loss_dict = self.loss_fn(y_hat, y)
+        # loss_dict = self.loss_fn(y_hat, y)
+        loss_dict = self._safe_loss(y_hat, y)
         # combined
         self.log("val_loss", loss_dict["mixed"],
                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
@@ -397,11 +416,11 @@ class SegLitModule(pl.LightningModule):
                     for subname, value in result.items():
                         if isinstance(value, torch.Tensor):
                             value = value.item()
-                        self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                        self.log(f"val_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
                 else:
                     if isinstance(result, torch.Tensor):
                         result = result.item()
-                    self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                    self.log(f"val_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
 
         # ——— Log GT / Pred stats for TensorBoard ———
         # flatten tensors
@@ -435,7 +454,8 @@ class SegLitModule(pl.LightningModule):
             y_hat = self.validator.run_chunked_inference(self.model, x, self.divisible_by)
 
         # loss = self.loss_fn(y_hat, y)
-        loss_dict = self.loss_fn(y_hat, y)
+        # loss_dict = self.loss_fn(y_hat, y)
+        loss_dict = self._safe_loss(y_hat, y)
         # combined
         self.log("test_loss", loss_dict["mixed"],
                 prog_bar=True, on_step=False, on_epoch=True, batch_size=x.size(0))
@@ -452,11 +472,11 @@ class SegLitModule(pl.LightningModule):
                 for subname, value in result.items():
                     if isinstance(value, torch.Tensor):
                         value = value.item()
-                    self.log(f"train_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                    self.log(f"test_metrics/{name}_{subname}", value, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
             else:
                 if isinstance(result, torch.Tensor):
                     result = result.item()
-                self.log(f"train_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
+                self.log(f"test_metrics/{name}", result, prog_bar=False, on_step=False, on_epoch=True, batch_size=x.size(0),)
 
         return {"predictions": y_hat, "test_loss": loss_dict["mixed"], "gts": y}
 
@@ -496,6 +516,34 @@ class SegLitModule(pl.LightningModule):
         scheduler = Scheduler(optimizer, **params)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """
+        Try a strict load first; if it fails because of unexpected or
+        missing keys, fall back to strict=False so training can resume
+        without losing optimizer / scheduler / epoch states.
+        """
+        try:
+            return super().load_state_dict(state_dict, strict=strict)
+        except RuntimeError as err:
+            self.py_logger.warning(f"Strict load failed: {err}\nRetrying with strict=False.")
+            return super().load_state_dict(state_dict, strict=False)
+    
+        # ──────────────────────────────────────────────────────────────
+    def _safe_loss(self, y_hat: torch.Tensor, y: torch.Tensor):
+        """
+        Try to compute the configured loss; if it fails (e.g. because no
+        grad info is available during val/test), return zeros so the run
+        keeps going and log a warning.
+        """
+        if not self.compute_val_loss:
+            z = torch.tensor(0.0, device=y_hat.device)
+            return {"mixed": z, "primary": z, "secondary": z}
+        try:
+            return self.loss_fn(y_hat, y)
+        except RuntimeError as err:
+            self.py_logger.warning(f"Loss calculation skipped: {err}")
+            z = torch.tensor(0.0, device=y_hat.device)
+            return {"mixed": z, "primary": z, "secondary": z}
 
 
 # ------------------------------------
@@ -1793,6 +1841,7 @@ from core.callbacks import (
     PredictionLogger,
     ConfigArchiver,
     SkipValidation,
+    GradPlotCallback
 )
 
 __all__ = ["load_callbacks"]
@@ -1870,6 +1919,16 @@ def load_callbacks(
                 )
             )
 
+        elif name == "GradPlotCallback":
+            callbacks.append(
+                GradPlotCallback(
+                    input_key=params.get("input_key", "image_patch"),
+                    every_n_epochs=params.get("every_n_epochs", 5),
+                    max_samples=params.get("max_samples", 4),
+                    cmap=params.get("cmap", "turbo"),
+                )
+            )
+
         elif name == "PredictionSaver":
             save_dir = os.path.join(output_dir, params.get("save_dir", "saved_predictions"))
             callbacks.append(
@@ -1924,2864 +1983,2094 @@ def load_callbacks(
 
 
 # ------------------------------------
-# core/callbacks/periodic_ckpt.py
+# core/general_dataset/logger.py
 # ------------------------------------
-import os
-import pytorch_lightning as pl
-
-class PeriodicCheckpoint(pl.Callback):
-    """
-    Save the trainer / model state every `every_n_epochs` epochs.
-
-    Args
-    ----
-    dirpath : str
-        Where the *.ckpt* files will be written.
-    every_n_epochs : int
-        Save interval.
-    prefix : str
-        Filename prefix (default: "epoch").
-    """
-
-    def __init__(self, dirpath: str, every_n_epochs: int = 5, prefix: str = "epoch"):
-        super().__init__()
-        self.dirpath = dirpath
-        self.every_n_epochs = every_n_epochs
-        self.prefix = prefix
-        os.makedirs(self.dirpath, exist_ok=True)
-
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        epoch = trainer.current_epoch + 1  # epochs are 0-indexed internally
-        if epoch % self.every_n_epochs == 0:
-            filename = f"{self.prefix}{epoch:06d}.ckpt"
-            ckpt_path = os.path.join(self.dirpath, filename)
-            trainer.save_checkpoint(ckpt_path)
-            # optional: log the path so you can grep it later
-            pl_module.logger.experiment.add_text("checkpoints/saved", ckpt_path, epoch)
-
-
-# ------------------------------------
-# core/callbacks/config_archiver.py
-# ------------------------------------
-import os
-import shutil
 import logging
-import zipfile
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
+import sys
 
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.ERROR)
 
-class ConfigArchiver(Callback):
-    """
-    Callback to archive configuration files and source code at the start of training.
+fmt = logging.Formatter(
+    "%(asctime)s — %(name)s — %(levelname)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+handler.setFormatter(fmt)
 
-    This callback creates:
-      - A ZIP archive of config and source
-      - A parallel folder copy of the same files (optional)
-    """
-
-    def __init__(
-        self,
-        output_dir: str,
-        project_root: str,
-        copy_folder: bool = True
-    ):
-        """
-        Initialize the ConfigArchiver callback.
-
-        Args:
-            output_dir: Directory to save archives and/or copies
-            project_root: Root directory of the project containing the code to archive
-            copy_folder: Whether to also copy files into a folder alongside the ZIP
-        """
-        super().__init__()
-        self.output_dir = output_dir
-        self.project_root = project_root
-        self.copy_folder = copy_folder
-        self.logger = logging.getLogger(__name__)
-
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """
-        Archive configuration and source code at the start of training.
-
-        Creates a ZIP archive and, if enabled, copies the files to a folder.
-
-        Args:
-            trainer: PyTorch Lightning trainer
-            pl_module: PyTorch Lightning module
-        """
-        os.makedirs(self.output_dir, exist_ok=True)
-        # Use epoch and timestamp for uniqueness
-        timestamp = trainer.logger.experiment.current_epoch if hasattr(trainer.logger.experiment, 'current_epoch') else pl_module.current_epoch
-        base_name = f"code_snapshot_{timestamp}"
-
-        # Create ZIP archive
-        zip_path = os.path.join(self.output_dir, f"{base_name}.zip")
-        version = 1
-        while os.path.exists(zip_path):
-            zip_path = os.path.join(self.output_dir, f"{base_name}_v{version}.zip")
-            version += 1
-
-        self.logger.info(f"Creating ZIP archive at {zip_path}")
-        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
-            # Archive directories
-            for folder in ['configs', 'core', 'models', 'losses', 'metrics', 'scripts', 'callbacks']:
-                src_dir = os.path.join(self.project_root, folder)
-                if os.path.isdir(src_dir):
-                    for root, _, files in os.walk(src_dir):
-                        for fname in files:
-                            if fname.endswith(('.py', '.yaml', '.yml')):
-                                full_path = os.path.join(root, fname)
-                                arcname = os.path.relpath(full_path, self.project_root)
-                                zipf.write(full_path, arcname)
-            # train.py
-            train_py = os.path.join(self.project_root, 'train.py')
-            if os.path.exists(train_py):
-                zipf.write(train_py, 'train.py')
-            # seglit_module.py
-            seglit_py = os.path.join(self.project_root, 'seglit_module.py')
-            if os.path.exists(seglit_py):
-                zipf.write(seglit_py, 'seglit_module.py')
-        self.logger.info(f"ZIP archive created: {zip_path}")
-
-        # Optionally create a folder copy
-        if self.copy_folder:
-            copy_path = os.path.join(self.output_dir, base_name)
-            if os.path.exists(copy_path):
-                copy_path = f"{copy_path}_v{version - 1}"  # same version count
-            self.logger.info(f"Copying files to folder {copy_path}")
-            os.makedirs(copy_path, exist_ok=True)
-            for folder in ['configs', 'core', 'models', 'losses', 'metrics']:
-                src_dir = os.path.join(self.project_root, folder)
-                dst_dir = os.path.join(copy_path, folder)
-                if os.path.isdir(src_dir):
-                    shutil.copytree(src_dir, dst_dir)
-            # train.py
-            if os.path.exists(train_py):
-                shutil.copy2(train_py, copy_path)
-            # seglit_module.py
-            if os.path.exists(seglit_py):
-                shutil.copy2(seglit_py, copy_path)
-            self.logger.info(f"Folder copy created at: {copy_path}")
-
+# (re)attach handler
+if not logger.handlers:
+    logger.addHandler(handler)
 
 # ------------------------------------
-# core/callbacks/pred_logger.py
+# core/general_dataset/collate.py
 # ------------------------------------
-
-import os
 import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
-import matplotlib.pyplot as plt
-
-class PredictionLogger(Callback):
-    """
-    Validation-only: accumulates up to `max_samples` and writes one PNG per epoch.
-    Now uses *separate* vmin/vmax for GT vs. prediction.
-    """
-    def __init__(self,
-                 log_dir: str,
-                 log_every_n_epochs: int = 1,
-                 max_samples: int = 4,
-                 cmap: str = "coolwarm"):
-        super().__init__()
-        self.log_dir = log_dir
-        self.log_every_n_epochs = log_every_n_epochs
-        self.max_samples = max_samples
-        self.cmap = cmap
-        self.logger = pl.utilities.logger.get_logs_dir_logger()
-        self._reset_buffers()
-
-    def _reset_buffers(self):
-        self._images = []
-        self._gts = []
-        self._preds = []
-        self._collected = 0
-        self._logged_this_epoch = False
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        if (trainer.current_epoch+1) % self.log_every_n_epochs == 0:
-            self._reset_buffers()
-        else:
-            self._logged_this_epoch = True
-
-    def on_validation_batch_end(self,
-                                trainer,
-                                pl_module,
-                                outputs,
-                                batch,
-                                batch_idx,
-                                dataloader_idx=0):
-        if self._logged_this_epoch \
-           or ((trainer.current_epoch+1) % self.log_every_n_epochs != 0):
-            return
-
-        x       = batch[pl_module.input_key].detach().cpu()
-        y_true  = batch[pl_module.target_key].detach().cpu()
-        y_pred  = outputs["predictions"].detach().cpu()
-
-        take = min(self.max_samples - self._collected, x.shape[0])
-        self._images.append(x[:take])
-        self._gts   .append(y_true[:take])
-        self._preds .append(y_pred[:take])
-        self._collected += take
-
-        if self._collected < self.max_samples:
-            return
-
-        imgs  = torch.cat(self._images, dim=0)
-        gts   = torch.cat(self._gts,    dim=0)
-        preds = torch.cat(self._preds,  dim=0)
-
-        # separate signed limits
-        vlim_gt   = float(gts.abs().max())
-        vlim_pred = float(preds.abs().max())
-
-        os.makedirs(self.log_dir, exist_ok=True)
-        filename = os.path.join(
-            self.log_dir,
-            f"pred_epoch_{trainer.current_epoch:06d}.png"
-        )
-
-        fig, axes = plt.subplots(self.max_samples, 3,
-                                 figsize=(12, 4 * self.max_samples),
-                                 tight_layout=True)
-
-        for i in range(self.max_samples):
-            # Input
-            ax = axes[i, 0]
-            if imgs.shape[1] == 1:
-                ax.imshow(imgs[i, 0], cmap='gray')
-            else:
-                im = torch.clamp(imgs[i].permute(1,2,0), 0, 1)
-                ax.imshow(im)
-            ax.set_title('Input')
-            ax.axis('off')
-
-            # Ground truth
-            ax = axes[i, 1]
-            ax.imshow(gts[i, 0],
-                      cmap=self.cmap,
-                      vmin=-vlim_gt,
-                      vmax=vlim_gt)
-            ax.set_title('Ground Truth')
-            ax.axis('off')
-
-            # Prediction
-            ax = axes[i, 2]
-            ax.imshow(preds[i, 0],
-                      cmap=self.cmap,
-                      vmin=-vlim_pred,
-                      vmax=vlim_pred)
-            ax.set_title('Prediction')
-            ax.axis('off')
-
-        plt.savefig(filename, dpi=150)
-        plt.close(fig)
-
-        self.logger.info(f"Saved prediction visualization: {filename}")
-        self._logged_this_epoch = True
-
-
-# ------------------------------------
-# core/callbacks/sample_plot.py
-# ------------------------------------
-from typing import Any, Dict, List, Optional, Union
-
-import torch
-import pytorch_lightning as pl
-import matplotlib.pyplot as plt
-
-
-def _gather_from_outputs(batch, outputs, pl_module):
-    """
-    Extract input, ground‑truth and prediction tensors from ``batch`` and
-    ``outputs`` without re‑running the model.
-    """
-    x = batch[pl_module.input_key].float()
-    y = batch[pl_module.target_key].float()
-    if y.dim() == 3:
-        y = y.unsqueeze(1)  # (B, 1, H, W)
-    preds = outputs.get("predictions").float()
-    return x.cpu(), y.cpu(), preds.detach().cpu()
-
-
-def _signed_scale(arr: torch.Tensor, pos_max: float, neg_min: float) -> torch.Tensor:
-    """Scale *signed* ``arr`` so that
-
-    * 0 → 0
-    * (arr > 0) are mapped linearly onto ``(0,  +1]`` where the *largest* value
-      becomes +1.
-    * (arr < 0) are mapped linearly onto ``[−1, 0)`` where the *most‑negative*
-      value becomes −1.
-
-    Positive and negative parts are treated independently so that sign symmetry
-    is preserved.
-    """
-    if pos_max <= 0 and neg_min >= 0:  # all‑zero tensor
-        return torch.zeros_like(arr)
-
-    scaled = arr.clone()
-    if pos_max > 0:
-        pos_mask = scaled > 0
-        scaled[pos_mask] = scaled[pos_mask] / pos_max
-    if neg_min < 0:  # remember: neg_min is ≤ 0
-        neg_mask = scaled < 0
-        scaled[neg_mask] = scaled[neg_mask] / abs(neg_min)
-    return scaled
-
-
-class SamplePlotCallback(pl.Callback):
-    """Log side‑by‑side *input | ground‑truth | prediction* panels during
-    training/validation with **independent colour scaling** for ground‑truth and
-    prediction maps.
-
-    Parameters
-    ----------
-    num_samples:
-        Maximum number of examples to visualise each epoch.
-    cmap:
-        Colormap passed to ``matplotlib.pyplot.imshow`` for signed maps
-        (default: ``"coolwarm"``).
-    """
-
-    def __init__(self, num_samples: int = 5, cmap: str = "coolwarm"):
-        super().__init__()
-        self.num_samples = num_samples
-        self.cmap = cmap
-        self._reset()
-
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-    def _reset(self):
-        self._images, self._gts, self._preds = [], [], []
-        self._count = 0
-
-    # epoch hooks --------------------------------------------------------
-    def on_train_epoch_start(self, *_):
-        self._reset()
-
-    def on_validation_epoch_start(self, *_):
-        self._reset()
-
-    # batch hooks --------------------------------------------------------
-    def _collect(self, batch, outputs, pl_module):
-        if self._count >= self.num_samples:
-            return
-        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
-        take = min(self.num_samples - self._count, x.size(0))
-        self._images.append(x[:take])
-        self._gts.append(y[:take])
-        self._preds.append(preds[:take])
-        self._count += take
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
-        self._collect(batch, outputs, pl_module)
-
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
-        self._collect(batch, outputs, pl_module)
-
-    # plotting -----------------------------------------------------------
-    def _plot_and_log(self, tag: str, trainer):
-        imgs = torch.cat(self._images, 0)   # (N, C, H, W)
-        gts  = torch.cat(self._gts, 0)      # (N, 1, H, W)
-        preds = torch.cat(self._preds, 0)   # (N, 1, H, W)
-        n = imgs.size(0)
-
-        # --- independent signed scaling for GT and prediction -------------
-        pos_max_gt,  neg_min_gt  = float(gts.max()),  float(gts.min())
-        pos_max_pr,  neg_min_pr  = float(preds.max()), float(preds.min())
-
-        gts_scaled   = _signed_scale(gts,   pos_max_gt, neg_min_gt)
-        preds_scaled = _signed_scale(preds, pos_max_pr, neg_min_pr)
-
-        # --- plotting -----------------------------------------------------
-        fig, axes = plt.subplots(n, 3, figsize=(9, n * 3), tight_layout=True)
-        if n == 1:
-            axes = axes[None, :]  # always treat as 2‑D array [row, col]
-
-        for i in range(n):
-            img = imgs[i].permute(1, 2, 0)  # CHW → HWC
-            gt  = gts_scaled[i, 0]
-            pr  = preds_scaled[i, 0]
-
-            # input
-            axes[i, 0].imshow(img, cmap="gray")
-            axes[i, 0].set_title("input")
-            axes[i, 0].axis("off")
-
-            # ground‑truth (own scale)
-            axes[i, 1].imshow(gt, cmap=self.cmap, vmin=-1, vmax=1)
-            axes[i, 1].set_title("gt (ind. scaled)")
-            axes[i, 1].axis("off")
-
-            # prediction (own scale)
-            axes[i, 2].imshow(pr, cmap=self.cmap, vmin=-1, vmax=1)
-            axes[i, 2].set_title("pred (ind. scaled)")
-            axes[i, 2].axis("off")
-
-        trainer.logger.experiment.add_figure(
-            f"{tag}_samples", fig, global_step=trainer.current_epoch
-        )
-        plt.close(fig)
-
-    # epoch completion ---------------------------------------------------
-    def on_train_epoch_end(self, trainer, pl_module):
-        if self._count > 0:
-            self._plot_and_log("train", trainer)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if self._count > 0:
-            self._plot_and_log("validation", trainer)
-
-class SamplePlot3DCallback(pl.Callback):
-    """
-    Callback to log sample slices from 3D volumes (Z×H×W) during training/validation.
-
-    Args:
-        num_samples (int): number of samples to log each epoch.
-        projection_view (str): one of 'XY', 'XZ', 'YZ' to project on.
-        cfg (Optional[Dict[str, Dict[str, Any]]]):
-            per-modality settings, e.g.: 
-            {
-              'input': {'cmap': 'gray', 'projection': 'max'},
-              'gt':    {'cmap': 'viridis', 'projection': 'min'},
-              'pred':  {'cmap': 'plasma', 'projection': 'min'},
-            }
-    """
-    def __init__(self, config):
-        super().__init__()
-
-        self.num_samples = config['num_samples']
-        self.projection_view = config.get('projection_view', 'YZ')
-        self.cfg = config.get('cfg')
-        # default settings per modality
-        self.default_modals = {
-            'input': {'cmap': 'gray', 'projection': 'max'},
-            'gt':    {'cmap': 'gray', 'projection': 'min'},
-            'pred':  {'cmap': 'gray', 'projection': 'min'},
-        }
-        # map view to axis: XY->Z(0), XZ->Y(1), YZ->X(2)
-        self.axis_map = {'XY': 0, 'XZ': 1, 'YZ': 2}
-
-        # **FIX**: initialize buffers immediately so _images always exists
-        self._reset()
-
-    def _reset(self):
-        self._images: List[torch.Tensor] = []
-        self._gts:    List[torch.Tensor] = []
-        self._preds:  List[torch.Tensor] = []
-        self._count:  int = 0
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        self._reset()
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        self._reset()
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
-        self._collect(batch, outputs, pl_module)
-
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, *args, **kwargs):
-        self._collect(batch, outputs, pl_module)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        if self._count > 0:
-            self._plot_and_log('train', trainer, pl_module)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if self._count > 0:
-            self._plot_and_log('val', trainer, pl_module)
-
-    def _collect(self, batch, outputs, pl_module):
-        if self._count >= self.num_samples:
-            return
-        x, y, preds = _gather_from_outputs(batch, outputs, pl_module)
-        take = min(self.num_samples - self._count, x.size(0))
-        self._images.append(x[:take])
-        self._gts.append(y[:take])
-        self._preds.append(preds[:take])
-        self._count += take
-
-    def _project(self, volume: torch.Tensor, modal: str) -> torch.Tensor:
-        """
-        Project a 3D tensor onto 2D by reducing along the chosen axis,
-        using the right projection type for this modality.
-        """
-        axis = self.axis_map[self.projection_view]
-        modal_cfg = self.cfg.get(modal, {})
-        proj_type = modal_cfg.get('projection', self.default_modals[modal]['projection'])
-        if proj_type == 'min':
-            return volume.min(dim=axis)[0]
-        else:
-            return volume.max(dim=axis)[0]
-
-    def _plot_and_log(self, tag: str, trainer, pl_module):
-        imgs  = torch.cat(self._images,  0)  # N × C × Z × H × W
-        gts   = torch.cat(self._gts,     0)
-        preds = torch.cat(self._preds,   0)
-
-        if imgs.dim() != 5:
-            # fallback to 2D callback if implemented upstream
-            super_hook = getattr(super(), f"on_{tag}_epoch_end", None)
-            if callable(super_hook):
-                super_hook(trainer, pl_module)
-            return
-
-        n = imgs.size(0)
-        fig, axes = plt.subplots(n, 3, figsize=(12, n * 4), tight_layout=True)
-        if n == 1:
-            axes = axes[None, :]  # shape (1,3) even for single sample
-
-        for i in range(n):
-            data = {
-                'input': imgs[i].squeeze(0),
-                'gt':    gts[i].squeeze(0),
-                'pred':  preds[i].squeeze(0),
-            }
-            for col, m in enumerate(['input', 'gt', 'pred']):
-                arr = self._project(data[m], m)
-                cmap = self.cfg.get(m, {}).get('cmap', self.default_modals[m]['cmap'])
-                ax = axes[i, col]
-                ax.imshow(arr.numpy(), cmap=cmap)
-                ax.set_title(f"{tag}:{m}-{self.projection_view}")
-                ax.axis('off')
-
-        trainer.logger.experiment.add_figure(
-            f"{tag}_3d_samples", fig, global_step=trainer.current_epoch
-        )
-        plt.close(fig)
-
-
-# ------------------------------------
-# core/callbacks/best_metric_ckpt.py
-# ------------------------------------
-
-import os
-import logging
-from glob import glob
-from typing import Any, Dict, List, Optional, Union
-
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
-
-class BestMetricCheckpoint(Callback):
-    """
-    Callback to save checkpoints for the best value of each metric.
-    """
-    
-    def __init__(
-        self, 
-        dirpath: str, 
-        metric_names: List[str],
-        mode: Union[str, Dict[str, str]] = "min",
-        save_last: bool = True,
-        last_k: int = 5,  # Save last checkpoint every k epochs
-        filename_template: str = "best_{metric}"
-    ):
-        """
-        Initialize the BestMetricCheckpoint callback.
-        
-        Args:
-            dirpath: Directory to save checkpoints to
-            metric_names: List of metrics to monitor
-            mode: Either "min", "max", or a dict mapping metric names to "min"/"max"
-            save_last: Whether to save the last checkpoint
-            last_k: Save last checkpoint every k epochs (reduce I/O)
-            filename_template: Template for checkpoint filenames
-        """
-        super().__init__()
-        self.dirpath = dirpath
-        self.metric_names = metric_names
-        self.last_k = last_k
-        
-        # Setup mode for each metric (min or max)
-        self.mode = {}
-        if isinstance(mode, str):
-            for metric in metric_names:
-                self.mode[metric] = mode
-        else:
-            self.mode = mode
-            # Ensure all metrics have a mode
-            for metric in metric_names:
-                if metric not in self.mode:
-                    self.mode[metric] = "min"
-                    
-        self.save_last = save_last
-        self.filename_template = filename_template
-        self.best_values = {}
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize best values
-        for metric in metric_names:
-            if self.mode[metric] == "min":
-                self.best_values[metric] = float('inf')
-            else:
-                self.best_values[metric] = float('-inf')
-    
-    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """
-        Check metrics at the end of validation and save checkpoint if needed.
-        
-        Args:
-            trainer: PyTorch Lightning trainer
-            pl_module: PyTorch Lightning module
-        """
-        # Create checkpoint directory if it doesn't exist
-        os.makedirs(self.dirpath, exist_ok=True)
-
-        # print(f"Saving best metric checkpoints to {self.dirpath}")
-        # print(f"Current epoch: {trainer.current_epoch}, Max epochs: {trainer.max_epochs}")
-        # print(f"Metrics being monitored: {self.metric_names}")
-        # print(f"Mode for metrics: {self.mode}")
-        # print(f"Best values so far: {self.best_values}")
-
-        # Check each metric
-        for metric in self.metric_names:
-            metric_key = f"val_metrics/{metric}"
-            # print('trainer.callback_metrics:', trainer.callback_metrics)
-            if metric_key in trainer.callback_metrics:
-                current_value = trainer.callback_metrics[metric_key].item()
-                self.logger.info(f"Current value for {metric}: {current_value}")
-                is_better = False
-                if self.mode[metric] == "min" and current_value < self.best_values[metric]:
-                    is_better = True
-                    self.best_values[metric] = current_value
-                elif self.mode[metric] == "max" and current_value > self.best_values[metric]:
-                    is_better = True
-                    self.best_values[metric] = current_value
-                
-                if is_better:
-                    filename = f"{self.filename_template.format(metric=metric)}.ckpt"
-                    filepath = os.path.join(self.dirpath, filename)
-                    self.logger.info(f"Saving best {metric} checkpoint: {filepath}")
-                    trainer.save_checkpoint(filepath)
-        
-        # Save last checkpoint if requested (with reduced frequency)
-        if self.save_last and (
-            (trainer.current_epoch+1) % self.last_k == 0 or  # Every k epochs
-            trainer.current_epoch == trainer.max_epochs - 1  # Last epoch
-        ):
-            filename = "last.ckpt"
-            filepath = os.path.join(self.dirpath, filename)
-            trainer.save_checkpoint(filepath)
-            self.logger.info(f"Saved last checkpoint at epoch {trainer.current_epoch}")
-
-
-
-
-
-# ------------------------------------
-# core/callbacks/pred_saver.py
-# ------------------------------------
-import os
-from typing import Any, Dict, List, Optional, Union
-
+from typing import Any, Dict, List, Optional
+import random
 import numpy as np
-import pytorch_lightning as pl
-
-class PredictionSaver(pl.Callback):
-    """
-    Save model predictions and ground truths on train, validation, and test.
-    Works with Lightning 2.x using *_batch_end hooks.
-    """
-    def __init__(
-        self,
-        save_dir: str,
-        save_every_n_epochs: int = 1,
-        save_after_epoch: int = 0,
-        max_samples: Optional[int] = None,
-    ):
-        super().__init__()
-        self.save_dir = save_dir
-        self.every = save_every_n_epochs
-        self.after = save_after_epoch
-        self.max_samples = max_samples
-        self._counter = 0
-        # Per-epoch switch
-        self._save_gts_this_epoch = False
-        # Ever-saved guard to ensure GTs only once
-        self._gts_already_saved = False
-
-    def _should_save(self, epoch: int) -> bool:
-        # print('epoch, self.every', epoch, self.every)
-        return epoch >= self.after and (epoch + 1) % self.every == 0
-
-    def _save_tensor(
-        self,
-        array: np.ndarray,
-        split: str,
-        epoch: int,
-        batch_idx: int,
-        sample_idx: int,
-        which: str
-    ):
-        fname = f"{split}_e{epoch}_b{batch_idx}_i{sample_idx}_{which}.npy"
-        folder = os.path.join(self.save_dir, split, f"epoch={epoch}")
-        os.makedirs(folder, exist_ok=True)
-        np.save(os.path.join(folder, fname), array)
-
-    # # ——— TRAINING HOOKS ———
-    # def on_train_epoch_start(self, trainer, pl_module):
-    #     self._counter = 0
-
-    # def on_train_batch_end(
-    #     self,
-    #     trainer: pl.Trainer,
-    #     pl_module: pl.LightningModule,
-    #     outputs: Dict[str, Any],
-    #     batch: Any,
-    #     batch_idx: int,
-    #     dataloader_idx: int = 0,
-    # ):
-    #     epoch = trainer.current_epoch
-    #     if not self._should_save(epoch):
-    #         return
-
-    #     preds = outputs.get("predictions")
-    #     gts   = outputs.get("gts")
-    #     if preds is None or gts is None:
-    #         return
-
-    #     preds = preds.detach().cpu().numpy()
-    #     gts   = gts.detach().cpu().numpy()
-    #     for i in range(preds.shape[0]):
-    #         if self.max_samples is not None and self._counter >= self.max_samples:
-    #             return
-    #         self._save_tensor(preds[i], "train", epoch, batch_idx, i, "pred")
-    #         self._save_tensor(gts[i],   "train", epoch, batch_idx, i, "gt")
-    #         self._counter += 1
-
-    # ——— VALIDATION HOOKS ———
-    def on_validation_epoch_start(self, trainer, pl_module):
-        self._counter = 0
-        # only enable GT saving if this is the first matching epoch
-        epoch = trainer.current_epoch
-        self._save_gts_this_epoch = self._should_save(epoch) and not self._gts_already_saved
-
-    def on_validation_batch_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs: Dict[str, Any],
-        batch: Any,
-        batch_idx: int,
-        dataloader_idx: int = 0,
-    ):
-        epoch = trainer.current_epoch
-        if not self._should_save(epoch):
-            return
-
-        preds = outputs.get("predictions")
-        gts   = outputs.get("gts")
-        if preds is None or gts is None:
-            return
-
-        # preds = preds.detach().cpu().numpy()
-        # gts   = gts.detach().cpu().numpy()
-        # for i in range(preds.shape[0]):
-        #     if self.max_samples is not None and self._counter >= self.max_samples:
-        #         return
-        #     self._save_tensor(preds[i], "val", epoch, batch_idx, i, "pred")
-        #     self._save_tensor(gts[i],   "val", epoch, batch_idx, i, "gt")
-        #     self._counter += 1
-
-        # always save preds as before
-        preds_np = preds.detach().cpu().numpy()
-        for i in range(preds_np.shape[0]):
-            if self.max_samples is not None and self._counter >= self.max_samples:
-                break
-            self._save_tensor(preds_np[i], "val", epoch, batch_idx, i, "pred")
-            self._counter += 1
-
-        # save gts for every batch—but only in that one epoch
-        # if self._save_gts_this_epoch:
-        #     gts_np = gts.detach().cpu().numpy()
-        #     for i in range(gts_np.shape[0]):
-        #         self._save_tensor(gts_np[i], "val", epoch, batch_idx, i, "gt")
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        # mark that we've done our one-time GT dump
-        if self._save_gts_this_epoch:
-            self._gts_already_saved = True
-
-    # ——— TEST HOOKS ———
-    def on_test_epoch_start(self, trainer, pl_module):
-        self._counter = 0
-
-    def on_test_batch_end(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        outputs: Dict[str, Any],
-        batch: Any,
-        batch_idx: int,
-        dataloader_idx: int = 0,
-    ):
-        epoch = trainer.current_epoch
-        if not self._should_save(epoch):
-            return
-
-        preds = outputs.get("predictions")
-        gts   = outputs.get("gts")
-        if preds is None or gts is None:
-            return
-
-        preds = preds.detach().cpu().numpy()
-        gts   = gts.detach().cpu().numpy()
-        for i in range(preds.shape[0]):
-            if self.max_samples is not None and self._counter >= self.max_samples:
-                return
-            self._save_tensor(preds[i], "test", epoch, batch_idx, i, "pred")
-            self._save_tensor(gts[i],   "test", epoch, batch_idx, i, "gt")
-            self._counter += 1
+from core.general_dataset.logger import logger
 
 
-# ------------------------------------
-# core/callbacks/__init__.py
-# ------------------------------------
-# core/callbacks/__init__.py
-
-from core.callbacks.best_metric_ckpt    import BestMetricCheckpoint
-from core.callbacks.periodic_ckpt       import PeriodicCheckpoint
-from core.callbacks.pred_saver          import PredictionSaver
-from core.callbacks.sample_plot         import SamplePlotCallback, SamplePlot3DCallback
-from core.callbacks.skip_validation     import SkipValidation
-from core.callbacks.config_archiver     import ConfigArchiver
-from core.callbacks.pred_logger   import PredictionLogger   # <<–– add this line
-
-
-# ------------------------------------
-# core/callbacks/skip_validation.py
-# ------------------------------------
-
-import logging
-from pytorch_lightning.callbacks import Callback
-
-class SkipValidation(Callback):
-    """
-    Skip the entire validation loop until a given epoch by zeroing out
-    `trainer.limit_val_batches`. Restores the original setting once the
-    epoch threshold is reached.
-    """
-    def __init__(self, skip_until_epoch: int = 0):
-        super().__init__()
-        self.skip_until_epoch = skip_until_epoch
-        self._original_limit_val_batches = None
-        self.logger = logging.getLogger(__name__)
-
-    def on_fit_start(self, trainer, pl_module):
-        # Capture the user's configured limit_val_batches
-        self._original_limit_val_batches = trainer.limit_val_batches
-
-    def on_validation_epoch_start(self, trainer, pl_module):
-        if trainer.current_epoch < self.skip_until_epoch:
-            if trainer.limit_val_batches != 0:
-                self.logger.info(
-                    f"Skipping validation until epoch {self.skip_until_epoch} "
-                    f"(current: {trainer.current_epoch})"
-                )
-                trainer.limit_val_batches = 0
-        else:
-            # Restore the original setting once we've reached the target epoch
-            if trainer.limit_val_batches == 0:
-                trainer.limit_val_batches = self._original_limit_val_batches
-                self.logger.info(
-                    f"Resuming validation from epoch {trainer.current_epoch}"
-                )
-
-
-# ------------------------------------
-# losses/chamfer_class.py
-# ------------------------------------
-import torch
-import torch.nn as nn
-
-# ---------------------------------------------------------------------
-# Core Functions
-# ---------------------------------------------------------------------
-def sample_pred_at_positions(pred, positions):
-    r = positions[:, 0]
-    c = positions[:, 1]
-    r0 = r.floor().long()
-    c0 = c.floor().long()
-    r1 = r0 + 1
-    c1 = c0 + 1
-    dr = (r - r0.float()).unsqueeze(1)
-    dc = (c - c0.float()).unsqueeze(1)
-    H, W = pred.shape
-    r0 = r0.clamp(0, H - 1); r1 = r1.clamp(0, H - 1)
-    c0 = c0.clamp(0, W - 1); c1 = c1.clamp(0, W - 1)
-    Ia = pred[r0, c0].unsqueeze(1)
-    Ib = pred[r0, c1].unsqueeze(1)
-    Ic = pred[r1, c0].unsqueeze(1)
-    Id = pred[r1, c1].unsqueeze(1)
-    return (Ia * (1 - dr) * (1 - dc)
-            + Ib * (1 - dr) * dc
-            + Ic * dr * (1 - dc)
-            + Id * dr * dc).squeeze(1)
-
-
-def compute_normals(sdf):
-    H, W = sdf.shape
-    grad_r = torch.zeros_like(sdf)
-    grad_c = torch.zeros_like(sdf)
-    grad_r[1:-1] = (sdf[2:] - sdf[:-2]) / 2.0
-    grad_r[0]    = sdf[1] - sdf[0]
-    grad_r[-1]   = sdf[-1] - sdf[-2]
-    grad_c[:,1:-1] = (sdf[:,2:] - sdf[:,:-2]) / 2.0
-    grad_c[:,0]    = sdf[:,1] - sdf[:,0]
-    grad_c[:,-1]   = sdf[:,-1] - sdf[:,-2]
-    return torch.stack([grad_r, grad_c], dim=2)
-
-
-def extract_zero_crossings_interpolated_positions(sdf, requires_grad=False):
-    eps = 1e-8
-    H, W = sdf.shape
-    arr = sdf.detach().cpu().numpy()
-    pts = []
-    # vertical
-    for i in range(H-1):
-        for j in range(W):
-            v1,v2 = arr[i,j], arr[i+1,j]
-            if v1==0: pts.append([i,j])
-            elif v2==0: pts.append([i+1,j])
-            elif v1*v2<0:
-                alpha = abs(v1)/(abs(v1)+abs(v2)+eps)
-                pts.append([i+alpha,j])
-    # horizontal
-    for i in range(H):
-        for j in range(W-1):
-            v1,v2 = arr[i,j], arr[i,j+1]
-            if v1==0: pts.append([i,j])
-            elif v2==0: pts.append([i,j+1])
-            elif v1*v2<0:
-                alpha = abs(v1)/(abs(v1)+abs(v2)+eps)
-                pts.append([i,j+alpha])
-    if pts:
-        return torch.tensor(pts, dtype=torch.float32, device=sdf.device, requires_grad=requires_grad)
-    return torch.empty((0,2), dtype=torch.float32, device=sdf.device, requires_grad=requires_grad)
-
-
-def manual_chamfer_grad(pred, pred_zc, gt_zc, update_scale=1.0, dist_threshold=3.0):
-    if pred_zc.numel() == 0 or gt_zc.numel() == 0:
-        return torch.zeros_like(pred)
+# def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+#     """
+#     Custom collate function with None filtering.
+#     """
+#     # Filter out None samples
+#     batch = [sample for sample in batch if sample is not None]
     
-    dSDF = torch.zeros_like(pred)
-    normals = compute_normals(pred)
-    sampled = []
-    for p in pred_zc:
-        r,c = p[0].item(), p[1].item()
-        r0,c0 = int(r), int(c)
-        r1,c1 = r0+1, c0+1
-        H,W = pred.shape
-        r0 = max(0,min(r0,H-1));   c0 = max(0,min(c0,W-1))
-        r1 = max(0,min(r1,H-1));   c1 = max(0,min(c1,W-1))
-        ar,ac = r-r0, c-c0
-        Ia = normals[r0,c0]; Ib = normals[r0,c1]
-        Ic = normals[r1,c0]; Id = normals[r1,c1]
-        n = Ia*(1-ar)*(1-ac) + Ib*(1-ar)*ac + Ic*ar*(1-ac) + Id*ar*ac
-        sampled.append(n/(n.norm()+1e-8))
-    sampled = torch.stack(sampled,0) if sampled else torch.empty((0,2),device=pred.device)
-    gt_pts=gt_zc.detach().cpu(); pr_pts=pred_zc.detach().cpu()
-    for i,p in enumerate(pr_pts):
-        # diffs = gt_pts-p; dists = torch.norm(diffs,dim=1)
-        # md,idx = torch.min(dists,0)
-        diffs = gt_pts - p
-        if diffs.shape[0] == 0:
-            continue
-        dists = torch.norm(diffs, dim=1)
-        md, idx = torch.min(dists, 0)
-        if md>dist_threshold: continue
-        dir = (gt_pts[idx]-p).to(pred.device)
-        n = sampled[i]
-        dot = torch.dot(dir,n)*update_scale
-        r,c=p[0].item(),p[1].item()
-        r0,c0=int(r),int(c); r1,c1=r0+1,c0+1; ar,ac=r-r0,c-c0
-        for rr,cc,w in [(r0,c0,(1-ar)*(1-ac)),(r0,c1,(1-ar)*ac),(r1,c0,ar*(1-ac)),(r1,c1,ar*ac)]:
-            if 0<=rr<dSDF.shape[0] and 0<=cc<dSDF.shape[1]:
-                dSDF[rr,cc]+=dot*w
-    return dSDF
-
-# ---------------------------------------------------------------------
-# Loss Class
-# ---------------------------------------------------------------------
-class ChamferBoundarySDFLoss(nn.Module):
-    def __init__(self, update_scale=1.0, dist_threshold=3.0, w_inject=1.0, w_pixel=1.0):
-        super().__init__()
-        self.update_scale, self.dist_threshold = update_scale, dist_threshold
-        self.w_inject, self.w_pixel = w_inject, w_pixel
-        self.latest = {}
-    def forward(self, pred_sdf, gt_sdf):
-        # [B,1,H,W] -> [B,H,W]
-        if pred_sdf.dim() == 4:
-            pred_sdf = pred_sdf.squeeze(1)
-        if gt_sdf.dim() == 4:
-            gt_sdf = gt_sdf.squeeze(1)
-        if pred_sdf.dim()==2:
-            pred_sdf,gt_sdf = pred_sdf.unsqueeze(0), gt_sdf.unsqueeze(0)
-        batch_inj,batch_pix=[],[]
-        for pred,gt in zip(pred_sdf,gt_sdf):
-            gt_zc = extract_zero_crossings_interpolated_positions(gt)
-            pred_zc = extract_zero_crossings_interpolated_positions(pred.detach())
-            dSDF = manual_chamfer_grad(pred,pred_zc,gt_zc,self.update_scale,self.dist_threshold)
-            inj = torch.sum(pred * dSDF.detach())
-            vals=sample_pred_at_positions(pred,pred_zc)
-            pix = vals.sum() if vals.numel() else torch.tensor(0.,device=pred.device)
-            batch_inj.append(inj); batch_pix.append(pix)
-        inject = torch.stack(batch_inj).mean()
-        pixel  = torch.stack(batch_pix).mean()
-        total  = self.w_inject*inject + self.w_pixel*pixel
-        self.latest={"inject":inject.item(),"pixel":pixel.item()}
-        return total
-
-# TODO: Making truely vectorized later
-
-
-"""
-
-### 1. **`w_inject`**
-
-This is the weight applied to the **“injection”** term:
-
-```python
-inj = torch.sum(pred * dSDF.detach())
-```
-
-* **What it measures**: how well the predicted SDF aligns its zero-level set to the ground-truth boundary **along the local normal direction**.
-* **Interpretation**: you're “injecting” boundary-normal corrections into the predicted field.
-* **Effect of a larger `w_inject`**: you force the network to pay more attention to getting the *orientation and sharpness* of the boundary right.
-
----
-
-### 2. **`w_pixel`**
-
-This is the weight applied to the **“pixel” (point-based Chamfer) term**:
-
-```python
-vals = sample_pred_at_positions(pred, pred_zc)
-pix = vals.sum()
-```
-
-* **What it measures**: for each zero-crossing point in your prediction, you sample the SDF value *at* that exact subpixel location and sum them.
-* **Interpretation**: you're penalizing predicted boundary points that lie *far* from any true boundary—i.e. a point-to-set Chamfer distance.
-* **Effect of a larger `w_pixel`**: you encourage the network to place its zero-crossing points *exactly* on the ground-truth boundary, reducing geometric offset.
-
----
-
-### Putting it together
-
-```python
-total_loss = w_inject * inject_term   +   w_pixel * pixel_term
-```
-
-* If you set both weights to 1.0, you give equal importance to matching boundary orientation (`inject`) and exact boundary location (`pixel`).
-* If your logs show the **pixel term** is numerically much smaller, but you still want it to matter, crank up `w_pixel`.
-* Similarly, boost `w_inject` if you need the normals-based alignment to dominate.
-
----
-
-**In practice** you'll often sweep over a few values (e.g. `w_inject=10, 50, 100`) to see which gives the best final segmentation boundary quality.
-
-"""
-
-# ------------------------------------
-# losses/lif_weighted_mse.py
-# ------------------------------------
-import torch
-import torch.nn as nn
-
-class LIFWeightedMSELoss(nn.Module):
-    """
-    Log-Inverse-Frequency weighted MSE loss with optional global LUT freezing.
-
-    Each pixel weight = 1 / log(1 + eps + freq_k), where freq_k is the relative
-    frequency of the pixel's SDF bin across the current batch or a frozen dataset.
-
-    Args:
-        sdf_min (float): lower clamp for SDF values (e.g. -d_max).
-        sdf_max (float): upper clamp for SDF values (e.g. +d_max).
-        n_bins (int): number of histogram bins.
-        eps (float): small constant inside log to avoid division-by-zero.
-        freeze_after_first (bool): if True, build LUT once at first forward and reuse.
-        reduction (str): 'mean', 'sum', or 'none'.
-    """
-    def __init__(
-        self,
-        sdf_min: float = -7.0,
-        sdf_max: float = 7.0,
-        n_bins: int = 256,
-        eps: float = 0.02,
-        freeze_after_first: bool = False,
-        reduction: str = 'mean',
-    ) -> None:
-        super().__init__()
-        if sdf_max <= sdf_min:
-            raise ValueError('sdf_max must be > sdf_min')
-
-        # store range and scale as buffers
-        self.register_buffer('sdf_min', torch.tensor(float(sdf_min)))
-        self.register_buffer('sdf_max', torch.tensor(float(sdf_max)))
-        self.register_buffer('scale', 1.0 / (self.sdf_max - self.sdf_min))
-
-        self.n_bins = int(n_bins)
-        self.eps = float(eps)
-        self.freeze_after_first = bool(freeze_after_first)
-        if reduction not in ('mean', 'sum', 'none'):
-            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
-        self.reduction = reduction
-
-        # LUT registered as buffer, persistent to allow checkpointing
-        self.register_buffer('_lut', torch.ones(self.n_bins), persistent=True)
-        self._lut_ready = False
-
-    @torch.no_grad()
-    def freeze(self, data_loader) -> None:
-        """
-        Build a global LUT from ground-truth SDFs in data_loader and freeze it.
-        Subsequent forwards will reuse this LUT.
-        """
-        if self._lut_ready:
-            return
-        device = self.sdf_min.device
-        counts = torch.zeros(self.n_bins, device=device)
-        total = 0
-        for batch in data_loader:
-            sdf = batch.to(device)
-            idx = self._bin_indices(sdf)
-            counts += torch.bincount(idx.flatten(), minlength=self.n_bins)
-            total += idx.numel()
-        if total == 0:
-            raise RuntimeError('freeze received empty data_loader')
-        freq = counts.float() / total
-        self._lut = 1.0 / torch.log1p(self.eps + freq)
-        self._lut_ready = True
-
-    @torch.no_grad()
-    def _bin_indices(self, sdf: torch.Tensor) -> torch.LongTensor:
-        clamped = torch.clamp(sdf, self.sdf_min, self.sdf_max)
-        unit = (clamped - self.sdf_min) * self.scale
-        idx = torch.round(unit * (self.n_bins - 1)).long()
-        return idx
-
-    @torch.no_grad()
-    def _build_lut(self, sdf: torch.Tensor) -> torch.Tensor:
-        idx = self._bin_indices(sdf)
-        freq = torch.bincount(idx.flatten(), minlength=self.n_bins).float()
-        freq /= idx.numel()
-        return 1.0 / torch.log1p(self.eps + freq)
-
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # build or reuse LUT
-        if not self._lut_ready:
-            with torch.no_grad():
-                self._lut = self._build_lut(y_true)
-                if self.freeze_after_first:
-                    self._lut_ready = True
-
-        # gather weights
-        idx = self._bin_indices(y_true)
-        w = self._lut[idx].to(dtype=y_pred.dtype)
-
-        # weighted squared error
-        wse = w * (y_pred - y_true).pow(2)
-
-        # reduction
-        if self.reduction == 'mean':
-            return wse.sum() / y_pred.numel()
-        if self.reduction == 'sum':
-            return wse.sum()
-        return wse
-
-    def extra_repr(self) -> str:
-        return (
-            f'sdf_min={self.sdf_min.item()}, sdf_max={self.sdf_max.item()}, '
-            f'n_bins={self.n_bins}, eps={self.eps}, '
-            f'freeze_after_first={self.freeze_after_first}, reduction={self.reduction}'
-        )
-
-
-# ------------------------------------
-# losses/vectorized_chamfer.py
-# ------------------------------------
-import torch
-import torch.nn as nn
-
-# -----------------------------------------------------------------------------
-# Utility helpers
-# -----------------------------------------------------------------------------
-
-def _to_2d(t: torch.Tensor) -> torch.Tensor:
-    """Ensure the tensor is 2‑D (H×W). If it has a leading singleton dimension
-    – e.g. (1,H,W) or (B,1,H,W) after indexing over B – squeeze it. Raises if
-    more than one channel is present."""
-    if t.dim() == 3:
-        # (C,H,W) – expect C==1
-        if t.size(0) != 1:
-            raise ValueError("SDF tensor has more than one channel; please select the channel to use.")
-        return t.squeeze(0)
-    if t.dim() != 2:
-        raise ValueError(f"Expected a 2‑D grid; got shape {tuple(t.shape)}")
-    return t
-
-
-def bilinear_sample(img: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-    """Vectorised bilinear sampling of a single‑channel image.
-
-    Args:
-        img    (H×W)  : SDF or any 2‑D tensor.
-        coords (N×2)  : [row, col] floating‑point coordinates.
-
-    Returns:
-        (N,) tensor – sampled values.
-    """
-    H, W = img.shape
-    r, c = coords[:, 0], coords[:, 1]
-    r0 = torch.floor(r).long().clamp(0, H - 1)
-    c0 = torch.floor(c).long().clamp(0, W - 1)
-    r1 = (r0 + 1).clamp(0, H - 1)
-    c1 = (c0 + 1).clamp(0, W - 1)
-    ar = r - r0.float()
-    ac = c - c0.float()
-
-    Ia = img[r0, c0]
-    Ib = img[r0, c1]
-    Ic = img[r1, c0]
-    Id = img[r1, c1]
-    return Ia * (1 - ar) * (1 - ac) + Ib * (1 - ar) * ac + Ic * ar * (1 - ac) + Id * ar * ac
-
-
-def compute_normals(sdf: torch.Tensor) -> torch.Tensor:
-    """Central‑difference normals (H×W×2)."""
-    grad_r = torch.zeros_like(sdf)
-    grad_c = torch.zeros_like(sdf)
-    grad_r[1:-1] = 0.5 * (sdf[2:] - sdf[:-2])
-    grad_r[0] = sdf[1] - sdf[0]
-    grad_r[-1] = sdf[-1] - sdf[-2]
-    grad_c[:, 1:-1] = 0.5 * (sdf[:, 2:] - sdf[:, :-2])
-    grad_c[:, 0] = sdf[:, 1] - sdf[:, 0]
-    grad_c[:, -1] = sdf[:, -1] - sdf[:, -2]
-    return torch.stack((grad_r, grad_c), dim=-1)
-
-
-# -----------------------------------------------------------------------------
-# Zero‑crossing extraction (fully vectorised)
-# -----------------------------------------------------------------------------
-
-def extract_zero_crossings(sdf: torch.Tensor, *, eps: float = 1e-8, requires_grad: bool = False) -> torch.Tensor:
-    """Return (N×2) sub‑pixel positions of the 0‑level set using bilinear interpolation."""
-    sdf = _to_2d(sdf)
-    H, W = sdf.shape
-    device = sdf.device
-
-    # vertical edges: between rows
-    v1, v2 = sdf[:-1, :], sdf[1:, :]
-    mask_v = (v1 * v2) < 0
-    alpha_v = v1.abs() / (v1.abs() + v2.abs() + eps)
-    rs_v = torch.arange(H - 1, device=device).unsqueeze(1).expand(H - 1, W).float() + alpha_v
-    cs_v = torch.arange(W, device=device).unsqueeze(0).expand(H - 1, W).float()
-    pts_v = torch.stack((rs_v[mask_v], cs_v[mask_v]), dim=1)
-
-    # horizontal edges: between columns
-    h1, h2 = sdf[:, :-1], sdf[:, 1:]
-    mask_h = (h1 * h2) < 0
-    alpha_h = h1.abs() / (h1.abs() + h2.abs() + eps)
-    rs_h = torch.arange(H, device=device).unsqueeze(1).expand(H, W - 1).float()
-    cs_h = torch.arange(W - 1, device=device).unsqueeze(0).expand(H, W - 1).float() + alpha_h
-    pts_h = torch.stack((rs_h[mask_h], cs_h[mask_h]), dim=1)
-
-    # exact zeros
-    mask_z = (sdf == 0)
-    if mask_z.any():
-        rz, cz = torch.where(mask_z)
-        pts_z = torch.stack((rz.float(), cz.float()), dim=1)
-        pts = torch.cat((pts_z, pts_v, pts_h), dim=0)
-    else:
-        pts = torch.cat((pts_v, pts_h), dim=0)
-
-    if pts.numel() == 0:
-        return torch.empty((0, 2), dtype=torch.float32, device=device, requires_grad=requires_grad)
-    return pts.requires_grad_(requires_grad)
-
-
-# -----------------------------------------------------------------------------
-# Vectorised Chamfer gradient
-# -----------------------------------------------------------------------------
-
-def chamfer_grad_vectorised(pred: torch.Tensor, pred_zc: torch.Tensor, gt_zc: torch.Tensor,
-                            *, update_scale: float = 1.0, dist_threshold: float = 3.0) -> torch.Tensor:
-    """Vectorised replacement for manual_chamfer_grad."""
-
-    pred2d = _to_2d(pred)  # ensure (H×W)
-
-    if pred_zc.numel() == 0 or gt_zc.numel() == 0:
-        return torch.zeros_like(pred2d)
-
-    H, W = pred2d.shape
-    device = pred2d.device
-
-    # 1. normals at pred zero‑crossings (bilinear‑interpolated)
-    normals = compute_normals(pred2d)  # H×W×2
-    r, c = pred_zc[:, 0], pred_zc[:, 1]
-    r0 = torch.floor(r).long().clamp(0, H - 1)
-    c0 = torch.floor(c).long().clamp(0, W - 1)
-    r1 = (r0 + 1).clamp(0, H - 1)
-    c1 = (c0 + 1).clamp(0, W - 1)
-    ar = r - r0.float()
-    ac = c - c0.float()
-
-    n00 = normals[r0, c0]
-    n01 = normals[r0, c1]
-    n10 = normals[r1, c0]
-    n11 = normals[r1, c1]
-    n = (
-        n00 * (1 - ar).unsqueeze(1) * (1 - ac).unsqueeze(1)
-        + n01 * (1 - ar).unsqueeze(1) * ac.unsqueeze(1)
-        + n10 * ar.unsqueeze(1) * (1 - ac).unsqueeze(1)
-        + n11 * ar.unsqueeze(1) * ac.unsqueeze(1)
-    )
-    n = n / (n.norm(dim=1, keepdim=True) + 1e-8)  # N × 2 (unit vectors)
-
-    # 2. nearest GT point for each pred point
-    diff = gt_zc.unsqueeze(0) - pred_zc.unsqueeze(1)  # Np × Ng × 2 (gt − pred)
-    dist = diff.norm(dim=-1)                          # Np × Ng
-    min_dist, idx = dist.min(dim=1)                   # length Np
-    mask = min_dist <= dist_threshold                 # ignore far matches
-    dir_vec = diff[torch.arange(pred_zc.size(0), device=device), idx]  # Np × 2
-
-    dot = (dir_vec * n).sum(dim=1) * update_scale
-    dot = dot * mask.float()
-
-    # 3. accumulate into dSDF using scatter‑add (bilinear weights)
-    w00 = (1 - ar) * (1 - ac)
-    w01 = (1 - ar) * ac
-    w10 = ar * (1 - ac)
-    w11 = ar * ac
-
-    flat_index = lambda rr, cc: rr * W + cc
-    idx00 = flat_index(r0, c0)
-    idx01 = flat_index(r0, c1)
-    idx10 = flat_index(r1, c0)
-    idx11 = flat_index(r1, c1)
-
-    indices = torch.cat((idx00, idx01, idx10, idx11), dim=0)  # 4N
-    contribs = torch.cat((dot * w00, dot * w01, dot * w10, dot * w11), dim=0)
-
-    dflat = torch.zeros(H * W, device=device).index_add(0, indices, contribs)
-    return dflat.view(H, W)
-
-
-# -----------------------------------------------------------------------------
-# Vectorised loss module
-# -----------------------------------------------------------------------------
-
-class ChamferBoundarySDFLossVec(nn.Module):
-    """Drop‑in vectorised replacement for ChamferBoundarySDFLoss."""
-
-    def __init__(self, *, update_scale: float = 1.0, dist_threshold: float = 3.0,
-                 w_inject: float = 1.0, w_pixel: float = 1.0):
-        super().__init__()
-        self.update_scale = update_scale
-        self.dist_threshold = dist_threshold
-        self.w_inject = w_inject
-        self.w_pixel = w_pixel
-        self.latest: dict[str, float] = {}
-
-    def forward(self, pred_sdf: torch.Tensor, gt_sdf: torch.Tensor) -> torch.Tensor:
-        # Expect inputs (B,H,W) or (B,1,H,W) or (H,W)
-        if pred_sdf.dim() == 2:
-            pred_sdf = pred_sdf.unsqueeze(0)
-            gt_sdf = gt_sdf.unsqueeze(0)
-        if pred_sdf.dim() == 4 and pred_sdf.size(1) == 1:
-            pred_sdf = pred_sdf[:, 0]  # drop channel dim → (B,H,W)
-            gt_sdf = gt_sdf[:, 0]
-
-        inject_terms, pixel_terms = [], []
-
-        for pred, gt in zip(pred_sdf, gt_sdf):
-            pred2d = _to_2d(pred)
-            gt2d = _to_2d(gt)
-
-            gt_zc = extract_zero_crossings(gt2d)
-            pred_zc = extract_zero_crossings(pred2d.detach())  # keep graph small
-            dSDF = chamfer_grad_vectorised(pred2d, pred_zc, gt_zc,
-                                            update_scale=self.update_scale,
-                                            dist_threshold=self.dist_threshold)
-            inject_terms.append(torch.sum(pred2d * dSDF.detach()))
-            if pred_zc.numel():
-                pixel_terms.append(bilinear_sample(pred2d, pred_zc).sum())
-            else:
-                pixel_terms.append(torch.tensor(0., device=pred.device))
-
-        inject = torch.stack(inject_terms).mean()
-        pixel = torch.stack(pixel_terms).mean()
-        total = self.w_inject * inject + self.w_pixel * pixel
-
-        self.latest = {"inject": inject.item(), "pixel": pixel.item()}
-        return total
-
-
-# ------------------------------------
-# losses/fixed_lif_weighted_mse.py
-# ------------------------------------
-import torch
-import torch.nn as nn
-
-class FixedLUTWeightedMSELoss(nn.Module):
-    """
-    Same weighting formula as LIFWeightedMSELoss but with a *frozen* LUT that
-    is loaded from disk (or passed as a tensor).
-
-    Args
-    ----
-    lut_path (str | Tensor): 1-D tensor of length n_bins or path to .pt
-    sdf_min / sdf_max (float): clamp range used when the LUT was built
-    n_bins (int)            : number of histogram bins (must match LUT length)
-    reduction ('mean'|'sum'|'none')
-    """
-    def __init__(
-        self,
-        lut_path,
-        sdf_min: float = -7.0,
-        sdf_max: float = 7.0,
-        n_bins: int = 256,
-        reduction: str = 'mean',
-    ):
-        super().__init__()
-        # ---- common buffers -------------------------------------------------
-        self.register_buffer('sdf_min', torch.tensor(float(sdf_min)))
-        self.register_buffer('sdf_max', torch.tensor(float(sdf_max)))
-        self.register_buffer('scale', 1.0 / (self.sdf_max - self.sdf_min))
-
-        self.n_bins = int(n_bins)
-        if reduction not in ('mean', 'sum', 'none'):
-            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
-        self.reduction = reduction
-
-        # ---- load LUT -------------------------------------------------------
-        if isinstance(lut_path, str):
-            lut = torch.load(lut_path, map_location='cpu')
-        elif torch.is_tensor(lut_path):
-            lut = lut_path
+#     # Handle empty batch case
+#     if not batch:
+#         logger.warning("Empty batch after filtering None values")
+#         return {}  # Or return a default empty batch structure
+    
+#     # Original collation logic
+#     collated: Dict[str, Any] = {}
+#     for key in batch[0]:
+#         items = []
+#         for sample in batch:
+#             value = sample[key]
+#             if isinstance(value, np.ndarray):
+#                 value = torch.from_numpy(value)
+#             items.append(value)
+#         if isinstance(items[0], torch.Tensor):
+#             collated[key] = torch.stack(items)
+#         else:
+#             collated[key] = items
+#     return collated
+
+def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        logger.warning("Empty batch after filtering None values")
+        return {}
+
+    collated: Dict[str, Any] = {}
+    for key in batch[0]:
+        items = [sample[key] for sample in batch]  # tensors already
+        if torch.is_tensor(items[0]):              # stack on new batch dim
+            collated[key] = torch.stack(items, dim=0)
         else:
-            raise TypeError("lut_path must be filename or Tensor")
+            collated[key] = items                  # e.g. metadata strings
+    return collated
 
-        if lut.numel() != self.n_bins:
-            raise ValueError(
-                f"LUT length {lut.numel()} ≠ n_bins {self.n_bins}"
-            )
-
-        # *Same buffer name as dynamic class*
-        self.register_buffer('_lut', lut.to(torch.float32), persistent=True)
-        self._lut_ready = True        # already frozen
-
-    # -------------------------------------------------------------------------
-    @torch.no_grad()
-    def _bin_indices(self, sdf: torch.Tensor) -> torch.LongTensor:
-        clamped = torch.clamp(sdf, self.sdf_min, self.sdf_max)
-        unit    = (clamped - self.sdf_min) * self.scale
-        return torch.round(unit * (self.n_bins - 1)).long()
-
-    # -------------------------------------------------------------------------
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        idx = self._bin_indices(y_true)
-        w   = self._lut[idx].to(dtype=y_pred.dtype, device=y_pred.device)
-        wse = w * (y_pred - y_true).pow(2)
-
-        if self.reduction == 'mean':
-            return wse.sum() / y_pred.numel()
-        if self.reduction == 'sum':
-            return wse.sum()
-        return wse
-
-    # -------------------------------------------------------------------------
-    def extra_repr(self) -> str:
-        return (
-            f"sdf_min={self.sdf_min.item()}, sdf_max={self.sdf_max.item()}, "
-            f"n_bins={self.n_bins}, reduction={self.reduction}"
-        )
-
-    # -------------------------------------------------------------------------
-    # Optional: load both old ('_lut') and new ('lut') keys seamlessly
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict,
-        missing_keys, unexpected_keys, error_msgs
-    ):
-        key = prefix + "_lut"
-        if key in state_dict and state_dict[key].numel() != self._lut.numel():
-            print(
-                f"⚠️  Replacing {key}: ckpt {tuple(state_dict[key].shape)} "
-                f"→ current {tuple(self._lut.shape)}"
-            )
-            # put *our* 15-bin LUT into the state-dict
-            state_dict[key] = self._lut.detach().cpu()
-
-        # now let the normal loader run — sizes match, no missing keys
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs
-        )
+def worker_init_fn(worker_id):
+    worker_info = torch.utils.data.get_worker_info()
+    base_seed = worker_info.seed  # unique per worker *and epoch*
+    np.random.seed(base_seed % 2**32)
+    random.seed(base_seed)
+    torch.manual_seed(base_seed)
 
 # ------------------------------------
-# losses/simple_binary_weighted_mse.py
+# core/general_dataset/modalities.py
 # ------------------------------------
+import numpy as np
+from scipy.ndimage import distance_transform_edt, binary_dilation
+from typing import Any, Dict, List, Optional
+from core.general_dataset.logger import logger
+
+
+
+
+def compute_distance_map(lbl: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
+    """
+    Compute a distance map from a label image.
+
+    Args:
+        lbl (np.ndarray): Input label image.
+        distance_threshold (Optional[float]): Maximum distance value.
+    
+    Returns:
+        np.ndarray: Distance map.
+    """
+    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
+    distance_map = distance_transform_edt(lbl_bin == 0)
+    if distance_threshold is not None:
+        np.minimum(distance_map, distance_threshold, out=distance_map)
+    return distance_map
+
+def compute_sdf(lbl: np.ndarray, sdf_iterations: int, sdf_thresholds: List[float]) -> np.ndarray:
+    """
+    Compute the signed distance function (SDF) for a label image.
+
+    Args:
+        lbl (np.ndarray): Input label image.
+        sdf_iterations (int): Number of iterations for dilation.
+        sdf_thresholds (List[float]): [min, max] thresholds for the SDF.
+    
+    Returns:
+        np.ndarray: The SDF computed.
+    """
+    lbl_bin = (lbl > 127).astype(np.uint8) if lbl.max() > 1 else (lbl > 0).astype(np.uint8)
+    dilated = binary_dilation(lbl_bin, iterations=sdf_iterations)
+    dist_out = distance_transform_edt(1 - dilated)
+    dist_in  = distance_transform_edt(lbl_bin)
+    sdf = dist_out - dist_in
+    if sdf_thresholds is not None:
+        sdf = np.clip(sdf, sdf_thresholds[0], sdf_thresholds[1])
+    return sdf
+
+# ------------------------------------
+# core/general_dataset/base.py
+# ------------------------------------
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import json
+import random
+import numpy as np
+from tqdm import tqdm
+from sklearn.model_selection import KFold
+from torch.utils.data import Dataset, DataLoader
+
+from core.general_dataset.io          import load_array_from_file
+from core.general_dataset.modalities  import compute_distance_map, compute_sdf
+from core.general_dataset.patch_validity       import check_min_thrsh_road
+from core.general_dataset.collate     import custom_collate_fn, worker_init_fn
+from core.general_dataset.normalizations import normalize_image
+from core.general_dataset.augmentations import augment_images
+from core.general_dataset.crop import bigger_crop, center_crop
+from core.general_dataset.visualizations import visualize_batch_2d, visualize_batch_3d
+from core.general_dataset.splits import Split
+from core.general_dataset.logger import logger
+from core.general_dataset.io import to_tensor as _to_tensor
 import torch
-import torch.nn as nn
 
-class WeightedMSELoss(nn.Module):
+# --------------- helpers ----------------
+def _merge_default(op: Dict[str, Any], default: Dict[str, Any]) -> Dict[str, Any]:
+    """Return op with default values filled in (shallow merge)."""
+    merged = {**default, **op}            # op wins on conflict
+    # modalities / interpolation need nested merge:
+    for key in ("modalities", "interpolation"):
+        if key not in merged and key in default:
+            merged[key] = default[key]
+    return merged
+
+
+def _expand_aug_list(raw_list: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Consume the first element if it’s a `defaults:` block, clone merged ops."""
+    if not raw_list or "defaults" not in raw_list[0]:
+        return raw_list                    # nothing special
+    defaults = raw_list[0]["defaults"]
+    return [_merge_default(op, defaults) for op in raw_list[1:]]
+
+
+class GeneralizedDataset(Dataset):
     """
-    Per-pixel MSE with class-dependent weights (e.g. give roads > background).
-
-    Args
-    ----
-    road_weight : float
-        Weight applied to squared errors on road pixels.
-    bg_weight   : float
-        Weight applied to squared errors on background pixels.
-    threshold   : float
-        Threshold that separates “road” from “background” in the SDF.
-    greater_is_road : bool
-        If True, pixels **>= threshold** are treated as road.
-        If False, pixels **<  threshold** are treated as road (default for SDF where roads are negative).
-    reduction : {'mean', 'sum', 'none'}
-        • 'mean' – divide the *weighted* SSE by the total number of elements  
-          (so when both weights are 1 you recover standard MSE, and
-          changing the class weights doesn’t blow up the loss scale).  
-        • 'sum'  – return the weighted sum of squared errors.  
-        • 'none' – return the full per-pixel tensor.
+    PyTorch Dataset for generalized remote sensing or segmentation datasets.
     """
-
-    def __init__(
-        self,
-        road_weight: float = 5.0,
-        bg_weight:   float = 1.0,
-        threshold:   float = 0.0,
-        greater_is_road: bool = False,
-        reduction: str = "mean",
-    ):
+    def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__()
-        self.road_weight   = float(road_weight)
-        self.bg_weight     = float(bg_weight)
-        self.threshold     = float(threshold)
-        self.greater_is_road = bool(greater_is_road)
-        if reduction not in ("mean", "sum", "none"):
-            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
-        self.reduction     = reduction
+        self._epoch = 0
+        self.config = config
+        self.split: str = config.get("split", "train")
+        self.patch_size: List[int] = config.get("patch_size", [128,128])
+        self.max_images: Optional[int] = config.get("max_images")
+        self.seed: int = config.get("seed", 42)
+        self.fold = config.get("fold")
+        self.num_folds = config.get("num_folds")
+        self.verbose: bool = config.get("verbose", False)
+        self.sdf_iterations: int = config.get("sdf_iterations")
+        self.num_workers: int = config.get("num_workers", 4)
+        self.split_ratios: Dict[str, float] = config.get("split_ratios", {"train":0.7,"valid":0.15,"test":0.15})
+        self.source_folder: str = config.get("source_folder", "")
+        self.save_computed: bool = config.get("save_computed", False)
+        self.base_modalities = config.get('base_modalities')
+        self.compute_again_modalities = config.get('compute_again_modalities', False)
+        self.data_dim    = config.get("data_dim", 2)
+        self.split_cfg = config["split_cfg"]
+        self.split_cfg['seed'] = self.seed
+        self.order_ops: List[str] = config.get("order_ops", ["crop", "aug", "norm"])
+        self.norm_cfg: Dict[str, Optional[Dict[str, Any]]] = config.get("normalization", {})
+        self.aug_cfg = _expand_aug_list(config.get("augmentation", []))
+
+        if self.data_dim not in (2, 3):
+            raise ValueError(f"data_dim must be 2 or 3, got {self.data_dim}")
+
+        splitter = Split(self.split_cfg, self.base_modalities)
+        self.modality_files: Dict[str, List[str]] = splitter.get_split(self.split)
+        self.modalities = list(self.modality_files.keys())
+        if 'image' not in self.modality_files or 'label' not in self.modality_files:
+            raise ValueError("Split must define both 'image' and 'label' modalities in split_cfg.")
+        assert len(self.modality_files['image']) == len(self.modality_files['label']), (
+            f"len(images): {len(self.modality_files['image'])}, len(labels): {len(self.modality_files['label'])}")
+
+        if self.max_images is not None:
+            for key in self.modality_files:
+                self.modality_files[key] = self.modality_files[key][:self.max_images]
+                # print(key, 'Max Data Point:', len(self.modality_files[key]))
+        # Precompute additional modalities if requested
+        if self.save_computed:
+            for key in [m for m in self.modalities if m not in ['image', 'label']]:
+                logger.info(f"Generating {key} modality maps...")
+                for file_idx, _ in tqdm(list(enumerate(self.modality_files['label'])),
+                                        total=len(self.modality_files['label']),
+                                        desc=f"Processing {key} maps"):
+                    lbl = load_array_from_file(self.modality_files['label'][file_idx])
+                    modality_path = self.modality_files[key][file_idx]
+                    os.makedirs(os.path.dirname(modality_path), exist_ok=True)
+                    if key == 'distance':
+                        if not os.path.exists(modality_path) or self.compute_again_modalities:
+                            processed = compute_distance_map(lbl, None)
+                            np.save(modality_path, processed)
+                    elif key == 'sdf':
+                        if not os.path.exists(modality_path) or self.compute_again_modalities:
+                            processed = compute_sdf(lbl, self.sdf_iterations, None)
+                            np.save(modality_path, processed)
+                    else:
+                        raise ValueError(f"Unsupported modality {key}")
+
+    # Lightning/your trainer should call this at the start of every epoch
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+
+    def _load_datapoint(self, file_idx: int) -> Optional[Dict[str, np.ndarray]]:
+        imgs: Dict[str, np.ndarray] = {}
+        for key in self.modalities:
+            path = self.modality_files[key][file_idx]
+            if os.path.exists(path):
+                arr = load_array_from_file(path)
+                if arr is None:
+                    return None
+            else:
+                lbl = load_array_from_file(self.modality_files['label'][file_idx])
+                if key == 'distance':
+                    arr = compute_distance_map(lbl, None)
+                elif key == 'sdf':
+                    arr = compute_sdf(lbl, self.sdf_iterations, None)
+                else:
+                    raise ValueError(f"Unsupported modality {key}")
+            imgs[key] = arr
+        if self.verbose:
+            print(f'{key} shape:', imgs[key].shape)
+        return imgs
+
+    def normalize_data(self, data):
+        normalized_image = {}
+        for key, arr in list(data.items()):
+            cfg = self.norm_cfg.get(key, None)
+            if cfg:
+                method = cfg.get('method', None)
+                params = {k: v for k, v in cfg.items() if k != 'method'}
+                # print(method, params)
+                normalized_image[key] = normalize_image(arr, method=method, **params)
+            else:
+                normalized_image[key] = arr.copy()
+        return normalized_image
+    
+    def augment_data(self, normalized_image, sample_rng):
+        if self.aug_cfg is None:
+            return normalized_image
+        augmented_images = {}
+        for aug in self.aug_cfg:
+            modalities = aug.get('modalities', None)
+            if modalities is None:
+                raise ValueError(f"Augmentation config for {aug} is missing 'modalities'")
+            selected = {k: _to_tensor(normalized_image[k]) for k in modalities if k in normalized_image}
+            augmented, meta = augment_images(selected, aug, self.data_dim, rng=sample_rng, verbose=self.verbose)
+            for k_aug, v_aug in augmented.items():
+                augmented_images[k_aug] = v_aug
+        for key, arr in list(normalized_image.items()):
+            if key not in augmented_images:
+                augmented_images[key] = arr.copy()
+        return augmented_images
+
+
+    def _postprocess_patch(self, data: Dict[str, np.ndarray], sample_rng: np.random.Generator) -> Dict[str, np.ndarray]:
+        # channel axis handling
+        # 2d:(C, H, W) - 3d:(C, D, H, W)
+        for k, arr in list(data.items()):
+            # print('_postprocess_patch beginning0', k, data[k].ndim, data[k].shape)
+            if arr.ndim == 2:
+                data[k] = arr[None, ...]             # (1, H, W)
+            elif arr.ndim == 3 and self.data_dim == 3:
+                data[k] = arr[None, ...]             # (1, D, H, W)
+            # print('_postprocess_patch beginning', k, data[k].ndim, data[k].shape)
+
+        augment = True if self.split =='train' else False
+        op = {
+            "aug":  lambda d: self.augment_data(d, sample_rng) if augment else d,
+            "norm": lambda d: self.normalize_data(d),
+        }
+
+        if augment:
+            data = bigger_crop(data, self.patch_size, pad_mode='edge', rng=sample_rng)
+
+        self.log_stats('before', 'step', data['label'])
+        for step in self.order_ops:
+            self.log_stats('before', step, data['label'])
+            data = op[step](data)
+            self.log_stats('after', step, data['label'])
+        if self.verbose:
+            print('='*50)
+
+        if augment:
+            data = center_crop(data, self.patch_size)
+
+        data = {f"{k}_patch": _to_tensor(v) for k, v in data.items()}
+
+        return data
+
+
+    def __len__(self) -> int:
+        return len(self.modality_files['image'])
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        worker_info = torch.utils.data.get_worker_info()
+        base_seed = (
+            worker_info.seed if worker_info is not None
+            else torch.initial_seed()
+        )
+        # Mix in idx for per-sample variation
+        ss = np.random.SeedSequence([self.seed, base_seed, idx])
+        rng = np.random.default_rng(ss)
+
+        imgs = self._load_datapoint(idx)
+        if imgs is None:
+            return self.__getitem__((idx + 1) % len(self))
+
+        data = self._postprocess_patch(imgs, rng)
+        return data
+
+    def log_stats(self, stage: str, step: str, label: np.ndarray) -> None:
+        """
+        Print shape, min, and max of the label array.
+        """
+        if not self.verbose:
+            return
+        shape = label.shape
+        min_val, max_val = label.min(), label.max()
+        print(f"{stage:<6} | Step: {step:<10} | Shape: {shape!s:<15} | Min: {min_val:.4f} | Max: {max_val:.4f}")
+
+if __name__ == "__main__":
+    split_cfg = {
+        "seed": 42,
+        "sources": [
+            {
+                "type": "folder",
+                "path": "/home/ri/Desktop/Projects/Datasets/RRRR/dataset",
+                "layout": "folders",
+                "modalities": {
+                    "image":    {"folder": "sat"},
+                    "label":    {"folder": "label"},
+                    "distance": {"folder": "distance"},
+                    "sdf":      {"folder": "sdf"},
+                },
+                "splits": {
+                    "train": "train",
+                    "valid": "valid",
+                    "test":  "test",
+                }
+            }
+        ]
+    }
+
+    import yaml
+    # with open('/home/ri/Desktop/Projects/Codebase/configs/dataset/main.yaml', 'w') as f_out:
+        # yaml.dump(config, f_out)
+    with open('./configs/dataset/AL175.yaml', 'r') as f:
+    # with open('./configs/dataset/mass.yaml', 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Create dataset and dataloader.
+    dataset = GeneralizedDataset(config)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=True,
+        collate_fn=custom_collate_fn,
+        num_workers=4,
+        worker_init_fn=worker_init_fn
+    )
+    logger.info('len(dataloader): %d', len(dataloader))
+    for epoch in range(10): 
+        dataset.set_epoch(epoch)  
+        for i, batch in enumerate(dataloader):
+            if batch is None:
+                continue
+            logger.info("Batch keys: %s", batch.keys())
+            logger.info("Image shape: %s", batch["image_patch"].shape)
+            logger.info("Label shape: %s", batch["label_patch"].shape)
+            if config["data_dim"] == 2:
+                visualize_batch_2d(batch, num_per_batch=2)
+            else:
+                visualize_batch_3d(batch, 2)
+
+            # break  # Uncomment to visualize only one batch.
+
+
+# ------------------------------------
+# core/general_dataset/splits.py
+# ------------------------------------
+import os
+import re
+import random
+from collections import defaultdict
+from typing import Dict, List, Any, Tuple
+import numpy as np
+from sklearn.model_selection import KFold
+
+def _is_junk(fname: str) -> bool:
+    """Ignore index.html or config.json files (case insensitive)."""
+    return fname.lower() in ("index.html", "config.json")
+
+
+def _listdir_safe(folder: str) -> List[str]:
+    """Safely list directory contents; return empty list if path doesn't exist."""
+    try:
+        return os.listdir(folder)
+    except Exception:
+        return []
+
+def filename_from_pattern(pattern: str, stem: str) -> str:
+    # 1) strip regex anchors
+    if pattern.startswith("^"):
+        pattern = pattern[1:]
+    if pattern.endswith("$"):
+        pattern = pattern[:-1]
+
+    # 2) split on the literal "(.*)"
+    parts = pattern.split("(.*)")
+    if len(parts) != 2:
+        raise ValueError(f"Pattern must contain exactly one '(.*)' slot: {pattern!r}")
+    prefix, suffix = parts
+
+    # 3) un-escape any escaped chars (e.g. "\." → ".", "\(" → "(", etc.)
+    unescape = lambda s: re.sub(r"\\(.)", r"\1", s)
+    prefix = unescape(prefix)
+    suffix = unescape(suffix)
+
+    # 4) re-join
+    return f"{prefix}{stem}{suffix}"
+
+def _filter_complete(records, required_modalities):
+    by_group = defaultdict(list)
+    for rec in records:
+        key = (rec["split"], rec["stem"])
+        by_group[key].append(rec)
+
+    complete = []
+    for (split, stem), recs in by_group.items():
+        mods = {r["modality"] for r in recs}
+        if mods >= set(required_modalities):
+            complete.extend(recs)
+    return complete
+
+def _filter_complete_no_split(records: List[Dict[str, str]], required_modalities: List[str]) -> List[Dict[str, str]]:
+    """
+    Given a flat list of records without split information,
+    drop any stems missing one of the required_modalities.
+    """
+    # Group records by stem
+    by_stem: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for rec in records:
+        stem = rec["stem"]
+        by_stem[stem].append(rec)
+
+    # Keep only those groups whose modalities cover the required set
+    req_set = set(required_modalities)
+    complete: List[Dict[str, str]] = []
+    for stem, recs in by_stem.items():
+        mods = {r["modality"] for r in recs}
+        if mods >= req_set:
+            complete.extend(recs)
+
+    return complete
+
+def _pivot_views(records):
+    st_md_sp = defaultdict(lambda: defaultdict(dict))
+    md_st_sp = defaultdict(lambda: defaultdict(dict))
+    st_sp_md = defaultdict(lambda: defaultdict(dict))
+    sp_st_md = defaultdict(lambda: defaultdict(dict))
+
+    for r in records:
+        s, m, t, p = r["split"], r["modality"], r["stem"], r["path"]
+        st_md_sp[t][m][s] = p
+        md_st_sp[m][t][s] = p
+        st_sp_md[t][s][m] = p
+        sp_st_md[s][t][m] = p
+
+    return [st_md_sp, md_st_sp, st_sp_md, sp_st_md]
+
+def _pivot_views_no_split(records):
+    st_md = defaultdict(lambda: defaultdict(dict))
+    md_st = defaultdict(lambda: defaultdict(dict))
+
+    for r in records:
+        m, t, p = r["modality"], r["stem"], r["path"]
+        st_md[t][m] = p
+        md_st[m][t] = p
+
+    return [st_md, md_st]
+
+def _collect_datapoints_from_source(src: Dict[str, Any], base_modalities, rng):
+    root       = src["path"]
+    layout     = src.get("layout", "flat")
+    modalities = src.get("modalities", {})
+    splits     = src.get("splits", {})
+
+    base_records = []
+    if layout == "folders":
+        for split, subfolder in splits.items():
+            split_dir = os.path.join(root, subfolder)
+            for mod, meta in modalities.items():
+                if mod not in base_modalities:
+                    continue
+                subfolder = meta.get("folder")
+                if not subfolder:
+                    continue
+                folder = os.path.join(split_dir, subfolder)
+                for fname in _listdir_safe(folder):
+                    if _is_junk(fname):
+                        continue
+                    stem = os.path.splitext(fname)[0]
+                    path = os.path.join(folder, fname)
+                    base_records.append({
+                        "split":    split,
+                        "modality": mod,
+                        "stem":     stem,
+                        "path":     path,
+                    })
+
+        # 2) drop any (split,stem) groups missing a base modality
+        base_records = _filter_complete(base_records, base_modalities)
+        # extract all the valid stems per split
+        stems_by_split = defaultdict(set)
+        for rec in base_records:
+            stems_by_split[rec["split"]].add(rec["stem"])
+
+        # 3) start your final list with the complete base records
+        records = list(base_records)
+
+        # 4) now add any non-base modalities, if the file exists  
+        for split, valid_stems in stems_by_split.items():
+            split_dir = os.path.join(root, split)
+            for mod, meta in modalities.items():
+                if mod in base_modalities:
+                    continue
+                subfolder = meta.get("folder")
+                if not subfolder:
+                    continue
+                folder = os.path.join(split_dir, subfolder)
+                for stem in valid_stems:
+                    fname = f"{stem}_{mod}.npy"
+                    records.append({
+                        "split":    split,
+                        "modality": mod,
+                        "stem":     stem,
+                        "path":     os.path.join(folder, fname),
+                    })
+
+        # print(_pivot_views(records)[-1])
+        
+    else:
+        base_records = []
+        for fname in _listdir_safe(root):
+            if _is_junk(fname):
+                continue
+            for mod, meta in modalities.items():
+                if mod not in base_modalities:
+                    continue
+                pat = meta.get("pattern")
+                if not pat:
+                    continue
+                m = re.fullmatch(pat, fname)
+                if not m:
+                    continue
+
+                # extract stem
+                if m.groups():
+                    stem = m.group(1)
+                else:
+                    grp_pat = pat.replace(".*", "(.*)")
+                    m2 = re.fullmatch(grp_pat, fname)
+                    if m2:
+                        stem = m2.group(1)
+                    else:
+                        stem = os.path.splitext(fname)[0]
+                
+                base_records.append({
+                        "modality": mod,
+                        "stem":     stem,
+                        "path":     os.path.join(root, fname),
+                    })
+        
+
+        # Filter out incomplete groups
+        complete_base = _filter_complete_no_split(base_records, base_modalities)
+        valid_stems = {rec["stem"] for rec in complete_base}
+
+        # Add complete base records
+        records = list(complete_base)
+        # print(_pivot_views_no_split(records)[0])
+        # raise
+
+        # Now append non-base modalities
+        for mod, meta in modalities.items():
+            if mod in base_modalities:
+                continue
+            pat = meta.get("pattern")
+            if not pat:
+                continue
+            for stem in valid_stems:
+                escaped_stem = re.escape(stem)
+                full_pat = pat.replace("(.*)", f"({escaped_stem})")
+                fname   = filename_from_pattern(pat, stem)
+                # print(mod, stem)
+                # print(fname)
+                records.append({
+                    "modality": mod,
+                    "stem":     stem,
+                    "path":     os.path.join(root, fname),
+                })
+        # print(_pivot_views_no_split(records)[0])
+        records = split_records(src, records, rng)
+    
+    return records
+
+def split_records(src, records, rng):
+    """
+    Assigns a 'split' field to each record in `records` based on the split strategy in `src`.
+
+    - For 'ratio': groups by stem, shuffles, and slices by the provided ratios.
+    - For 'kfold': performs K-fold cross-validation on stems, using fold_idx as the held-out fold.
+    """
+    split_type = src.get('type')
+    if split_type == 'folder':  
+        return records
+    
+    # RATIO-BASED SPLIT
+    if split_type == 'ratio':
+        # Collect unique stems
+        stems = sorted({r['stem'] for r in records})
+        # Shuffle with seed if provided
+        # seed = src.get('seed', None)
+        # if seed is not None:
+        #     random.Random(seed).shuffle(stems)
+        # else:
+        #     random.shuffle(stems)
+        rng.shuffle(stems)
+
+        ratios = src.get('ratios', {})
+        train_ratio = ratios.get('train', 0)
+        valid_ratio = ratios.get('valid', 0)
+        # test_ratio implied
+        n = len(stems)
+        n_train = int(n * train_ratio)
+        n_valid = int(n * valid_ratio)
+        # Ensure all accounted for
+        n_test = n - n_train - n_valid
+
+        train_stems = set(stems[:n_train])
+        valid_stems = set(stems[n_train:n_train + n_valid])
+        test_stems  = set(stems[n_train + n_valid:])
+
+        # Assign splits
+        for rec in records:
+            s = rec['stem']
+            if s in train_stems:
+                rec['split'] = 'train'
+            elif s in valid_stems:
+                rec['split'] = 'valid'
+            else:
+                rec['split'] = 'test'
+        return records
+
+    # K-FOLD SPLIT
+    elif split_type == 'kfold':
+        num_folds = src.get('num_folds')
+        fold_idx  = src.get('fold_idx', 0)
+        # Collect unique stems
+        stems = sorted({r['stem'] for r in records})
+        # Prepare KFold
+        kf = KFold(n_splits=num_folds,
+                   shuffle=True,
+                   random_state=src.get('seed', None))
+        # Find the train/valid split for the requested fold
+        for idx, (train_idx, valid_idx) in enumerate(kf.split(stems)):
+            if idx == fold_idx:
+                train_stems = {stems[i] for i in train_idx}
+                valid_stems = {stems[i] for i in valid_idx}
+                break
+
+        # Assign splits
+        for rec in records:
+            if rec['stem'] in train_stems:
+                rec['split'] = 'train'
+            elif rec['stem'] in valid_stems:
+                rec['split'] = 'valid'
+                
+        return records
+
+    else:
+        raise ValueError(f"Unsupported split type: {split_type}")
+
+class Split:
+    """
+    Unified splitter with support for 'folder', 'ratio', and 'kfold' sources.
+    Adds base_modalities intersection and path validation.
+    """
+    def __init__(self, cfg: Dict[str, Any], base_modalities: List[str]) -> None:
+        self.cfg = cfg
+        self.seed = cfg.get("seed", 0)
+        self.index_save_pth = cfg.get("index_save_pth", None)
+
+        if self.index_save_pth:
+            os.makedirs(self.index_save_pth, exist_ok=True)
+            
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+
+        self.base_modalities = base_modalities
+        # Make the RNG deterministic but *local* to this instance
+        self._rng = random.Random(self.seed)
+        np.random.seed(self.seed)
+
+        # Filled lazily by _build_splits()
+        self._splits_built = False
+        self._split2mod2files: Dict[str, Dict[str, List[str]]] = {}
 
     # ------------------------------------------------------------------ #
-    # forward                                                             #
+    # public API
     # ------------------------------------------------------------------ #
-    def forward(self, y_pred: torch.Tensor, y_true_sdf: torch.Tensor) -> torch.Tensor:
+    def get_split(self, split: str) -> Dict[str, List[str]]:
         """
-        Parameters
-        ----------
-        y_pred      : Tensor (N, 1, H, W)  – model output SDF
-        y_true_sdf  : Tensor (N, 1, H, W)  – ground-truth signed-distance map
+        Args
+        ----
+        split : str
+            One of "train", "valid", "test".
 
         Returns
         -------
-        Tensor
-            A scalar (for 'mean' / 'sum') or a tensor shaped like the input (for 'none').
+        Dict[str, List[str]]
+            { modality : [file paths] }  (lists are *already sorted*).
         """
+        if split not in ("train", "valid", "test"):
+            raise ValueError("split must be 'train', 'valid' or 'test'")
 
-        # 1) build per-pixel weights
-        if self.greater_is_road:
-            is_road = (y_true_sdf > self.threshold)
-        else:
-            is_road = (y_true_sdf <=  self.threshold)
-        weight = torch.where(is_road, self.road_weight, self.bg_weight).to(y_pred.dtype)
+        if not self._splits_built:
+            self._build_splits()
 
-        # 2) weighted squared error
-        wse = (y_pred - y_true_sdf) ** 2 * weight
+        # `.get` so an empty dict is returned if this split doesn't exist
+        return self._split2mod2files.get(split, {})
 
-        # 3) reduction
-        if self.reduction == "mean":
-            # divide by the *number of elements* so scale matches plain MSE
-            return wse.sum() / y_pred.numel()
-        elif self.reduction == "sum":
-            return wse.sum()
-        else:                       # 'none'
-            return wse
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    def _build_splits(self) -> None:
+        """
+        One-shot scan of every source in the config → populate
+        self._split2mod2files.
+        """
+        all_records: List[Dict[str, str]] = []
+
+        # 1) collect and (if needed) split each source
+        for src in self.cfg.get("sources", []):
+            # recs = _collect_datapoints_from_source(src, self.base_modalities)
+            recs = self._collect_datapoints_for(src)
+            all_records.extend(recs)
+
+        # 2) bucket by split / modality
+        split2mod2files = defaultdict(lambda: defaultdict(list))
+        for rec in all_records:
+            sp, mod, path = rec["split"], rec["modality"], rec["path"]
+            split2mod2files[sp][mod].append(path)
+
+        # 3) deterministic order: sort the lists so paired modalities stay aligned
+        for sp in split2mod2files:
+            for mod in split2mod2files[sp]:
+                split2mod2files[sp][mod].sort()
+
+        # ---- print a summary of each split ----
+        for sp, mod2files in split2mod2files.items():
+            # count “stems” via the first base modality
+            if self.base_modalities:
+                base = self.base_modalities[0]
+                stem_count = len(mod2files.get(base, []))
+            else:
+                stem_count = sum(len(v) for v in mod2files.values()) // max(1, len(mod2files))
+            print(f"→ Split '{sp}': {stem_count} stems")
+            for mod, files in mod2files.items():
+                print(f"     {mod:8s}: {len(files)} files")
+        # ---- end summary ----
+
+        self._split2mod2files = split2mod2files
+        self._splits_built    = True
+
+        if self.index_save_pth:
+            self._save_indices()
+
+    def _save_indices(self) -> None:
+        """
+        Save the file list for each modality in each split as JSON.
+        """
+        import json
+        for split, mod2files in self._split2mod2files.items():
+            index = {mod: files for mod, files in mod2files.items()}
+            fname = os.path.join(self.index_save_pth, f"{split}_index.json")
+            with open(fname, 'w') as f:
+                json.dump(index, f, indent=2)
+            print(f"Saved index for split '{split}' to {fname}")
+
+    def _collect_datapoints_for(self, src: Dict[str, Any]) -> List[Dict[str, str]]:
+        records = _collect_datapoints_from_source(src, self.base_modalities, self._rng)
+        if src.get('type')=='kfold':
+            test_src = src.get('test_source')
+            test_records = _collect_datapoints_from_source(test_src, self.base_modalities, self._rng)  
+            records.extend([rec for rec in test_records if rec['split']=='test'])
+        return records
+    
+
+
+def main():
+    split_cfg = {
+        "seed": 42,
+        "sources": [
+            {
+                "type": "folder",
+                "path": "/data/folder1",
+                "layout": "folders",
+                "modalities": {
+                    "image": {"folder": "imgs"},
+                    "label": {"folder": "lbls"}
+                },
+                "splits": {"train": "train_dir", "valid": "val_dir", "test": "test_dir"}
+            },
+            {
+                "type": "ratio",
+                "path": "/data/flat2",
+                "layout": "flat",
+                "modalities": {
+                    "image": {"pattern": r".*\\.jpg$"},
+                    "mask":  {"pattern": r".*\\.png$"}
+                },
+                "ratios": {"train": 0.7, "valid": 0.2, "test": 0.1}
+            },
+            {
+                "type": "kfold",
+                "num_folds": 5,
+                "fold_idx": 0,
+                "path": "/data/flat_tv",
+                "layout": "flat",
+                "modalities": {
+                    "image": {"pattern": r".*\.npy$"},
+                    "seg":   {"pattern": r".*\.npy$"}
+                },
+                "test_source":{
+                    # this can only be type ratio 
+                }
+            }
+        ]
+    }
+
+    splitter = Split(split_cfg)
+    for split_name in ("train", "valid", "test"):
+        mappings = splitter.get_split(split_name)
+        print(f"=== {split_name.upper()} ===")
+        for mod, files in mappings.items():
+            print(f"  {mod}: {len(files)} files")
+
+if __name__ == "__main__":
+    main()
 
 
 # ------------------------------------
-# losses/custom_loss.py
+# core/general_dataset/augmentations.py
 # ------------------------------------
+# augmentations_core.py  -------------------------------------------------------
+# Built for Kornia ≥0.7  ·  elasticdeform ≥0.5
+# Author: <you>  ·  2025-07
+# -----------------------------------------------------------------------------
 """
-Example custom loss for segmentation.
+Unified data-augmentation helper for both 2-D (C,H,W) and 3-D (C,D,H,W) tensors.
 
-This module demonstrates how to create a custom loss for the seglab framework.
+* Works on a *dict* of modalities (image, label, distance …)
+* Generates **one** random parameter set per augmentation and applies it
+  consistently to every selected modality.
+* Seamlessly switches between Kornia’s 2-D and 3-D ops.
+* Full GPU pipeline — even elastic deformation (elasticdeform.torch).
+
+Public API
+----------
+augment_images(data, aug_cfg, dim, rng=None, verbose=False)
+    data     : Dict[str, torch.Tensor]           (C,H,W) or (C,D,H,W)
+    aug_cfg  : Single entry of the YAML "augmentation:" list
+    dim      : 2 or 3
+    returns  : (augmented_dict, metadata)
 """
 
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple
+
+import inspect
+import math
+import numpy as np
 import torch
-import torch.nn as nn
+import kornia as K
+from torch import Tensor
 import torch.nn.functional as F
 
+import elasticdeform.torch as edt        # GPU warp
+import elasticdeform                     # grid sampler
 
-class TopologicalLoss(nn.Module):
+__all__ = ["augment_images"]
+
+# -----------------------------------------------------------------------------#
+# constants & helpers                                                          #
+# -----------------------------------------------------------------------------#
+_NEAREST, _LINEAR = "nearest", "bilinear"
+_RNG = np.random.Generator
+
+
+def _interp(mod: str) -> str:
+    """Label ⇒ nearest, everything else ⇒ bilinear/linear."""
+    return _NEAREST if mod == "label" else _LINEAR
+
+
+def _maybe_scalar(v: Any, rng: _RNG) -> float:
+    """Return scalar or sample from [lo,hi]."""
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        lo, hi = map(float, v)
+        return float(rng.uniform(lo, hi))
+    return float(v)
+
+
+def _maybe_tuple(v: Any, rng: _RNG, d: int) -> Tuple[float, ...]:
+    """Convert *v* into a d-tuple, sampling ranges if needed."""
+    if isinstance(v, (list, tuple)):
+        if len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
+            # isotropic range
+            scl = _maybe_scalar(v, rng)
+            return (scl,) * d
+        if len(v) == d:
+            return tuple(_maybe_scalar(x, rng) for x in v)
+    return (float(v),) * d
+
+
+# -----------------------------------------------------------------------------#
+# convenience selectors                                                        #
+# -----------------------------------------------------------------------------#
+def _kornia_cls(cls2d, cls3d, dim: int):
+    """Return the correct (2-D | 3-D) class or raise if missing."""
+    cls = cls2d if dim == 2 else cls3d
+    if cls is None:
+        raise RuntimeError(f"{cls2d.__name__} has no 3-D counterpart in this "
+                           "Kornia build – remove it from the 3-D pipeline.")
+    return cls
+
+
+def _has_arg(func, name: str) -> bool:
+    return name in inspect.signature(func).parameters
+
+
+# -----------------------------------------------------------------------------#
+# primitive transforms                                                         #
+# -----------------------------------------------------------------------------#
+def _apply_flip(x: Tensor, which: str, dim: int) -> Tensor:
+    axes = {"flip_horizontal": -1,
+            "flip_vertical":   -2,
+            "flip_depth":      -3}.get(which)
+    return x.flip(axes) if axes is not None else x
+
+
+def _apply_rotate(x: Tensor, angles, dim: int, mode: str) -> Tensor:
+    if dim == 2:
+        ang = torch.as_tensor([angles], device=x.device, dtype=x.dtype)
+        return K.geometry.transform.rotate(x, ang, mode=mode, align_corners=False)
+
+    # Kornia rotate3d(yaw, pitch, roll)
+    yaw, pitch, roll = angles
+    yaw   = torch.as_tensor([yaw],   device=x.device, dtype=x.dtype)
+    pitch = torch.as_tensor([pitch], device=x.device, dtype=x.dtype)
+    roll  = torch.as_tensor([roll],  device=x.device, dtype=x.dtype)
+    return K.geometry.transform.rotate3d(
+        x, yaw, pitch, roll, mode=mode, align_corners=False
+    )
+
+
+def _apply_scale(x: Tensor, scale, dim: int, mode: str) -> Tensor:
+    if dim == 2:
+        s = torch.as_tensor([scale], device=x.device, dtype=x.dtype)
+        return K.geometry.transform.scale(x, s, mode=mode, align_corners=False)
+
+    # Kornia’s RandomAffine3D handles scaling tuples
+    kw_interp = {"interpolation" if _has_arg(K.augmentation.RandomAffine3D, "interpolation")
+                 else "resample": mode}
+    aff = K.augmentation.RandomAffine3D(degrees=(0., 0., 0.),
+                                        scale=scale,
+                                        p=1.0,
+                                        align_corners=False,
+                                        **kw_interp)
+    return aff(x)
+
+
+def _apply_translate(x: Tensor, shift, dim: int, mode: str) -> Tensor:
+    if dim == 2:
+        t = torch.as_tensor([[shift, shift]], device=x.device, dtype=x.dtype)
+        return K.geometry.transform.translate(x, t, mode=mode, align_corners=False)
+
+    # Kornia lacks translate3d – emulate with integer roll
+    sx, sy, sz = shift
+    dx = int(round(sx * x.size(-3)))
+    dy = int(round(sy * x.size(-2)))
+    dz = int(round(sz * x.size(-1)))
+    return x.roll((dx, dy, dz), dims=(-3, -2, -1))
+
+
+def _apply_elastic(x: Tensor, sigma: float, pts: int, axis) -> Tensor:
     """
-    TopologicalLoss: A loss function that incorporates topological features.
-    
-    This example loss combines binary cross-entropy with a term that penalizes
-    topological errors like incorrect connectivity.
+    Elastic deformation that stays on GPU.
+
+    * If elasticdeform ≥ 0.5 is installed we call its
+      `random_displacement` helper.
+    * Otherwise we create a simple Gaussian-noise grid of identical shape.
+      (For data-augmentation that approximation is perfectly fine.)
     """
-    
-    def __init__(
-        self,
-        topo_weight: float = 0.5,
-        smoothness: float = 1.0,
-        connectivity_weight: float = 0.3
-    ):
-        """
-        Initialize the TopologicalLoss.
-        
-        Args:
-            topo_weight: Weight for the topological component
-            smoothness: Smoothness parameter for gradient computation
-            connectivity_weight: Weight for the connectivity component
-        """
-        super().__init__()
-        self.topo_weight = topo_weight
-        self.smoothness = smoothness
-        self.connectivity_weight = connectivity_weight
-        self.bce_loss = nn.BCELoss()
-    
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the topological loss.
-        
-        Args:
-            y_pred: Predicted segmentation masks
-            y_true: Ground truth segmentation masks
-            
-        Returns:
-            Tensor containing the calculated loss
-        """
-        # Binary cross-entropy component
-        bce = self.bce_loss(y_pred, y_true)
-        
-        # Compute gradients for topology
-        gradients_pred = self._compute_gradients(y_pred)
-        gradients_true = self._compute_gradients(y_true)
-        
-        # Compute gradient loss
-        gradient_loss = F.mse_loss(gradients_pred, gradients_true)
-        
-        # Compute connectivity loss (simplified example)
-        connectivity_loss = self._compute_connectivity_loss(y_pred, y_true)
-        
-        # Combine losses
-        topo_loss = gradient_loss + self.connectivity_weight * connectivity_loss
-        total_loss = (1 - self.topo_weight) * bce + self.topo_weight * topo_loss
-        
-        return total_loss
-    
-    def _compute_gradients(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute spatial gradients of the input tensor.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            Tensor of spatial gradients
-        """
-        # Ensure input is at least 4D: [batch, channels, height, width]
-        if x.dim() == 3:
-            x = x.unsqueeze(1)
-        
-        # Apply Sobel filters
-        sobel_x = torch.tensor([
-            [-1, 0, 1],
-            [-2, 0, 2],
-            [-1, 0, 1]
-        ], dtype=torch.float32, device=x.device).view(1, 1, 3, 3).repeat(1, x.shape[1], 1, 1)
-        
-        sobel_y = torch.tensor([
-            [-1, -2, -1],
-            [0, 0, 0],
-            [1, 2, 1]
-        ], dtype=torch.float32, device=x.device).view(1, 1, 3, 3).repeat(1, x.shape[1], 1, 1)
-        
-        grad_x = F.conv2d(x, sobel_x, padding=1, groups=x.shape[1])
-        grad_y = F.conv2d(x, sobel_y, padding=1, groups=x.shape[1])
-        
-        # Compute gradient magnitude
-        gradients = torch.sqrt(grad_x**2 + grad_y**2 + self.smoothness**2)
-        
-        return gradients
-    
-    def _compute_connectivity_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        Compute connectivity loss between prediction and ground truth.
-        
-        This is a simplified example that penalizes disconnected regions.
-        
-        Args:
-            y_pred: Predicted segmentation masks
-            y_true: Ground truth segmentation masks
-            
-        Returns:
-            Tensor containing the connectivity loss
-        """
-        # Apply morphological operations to find connected components
-        # This is a simplified approximation for demonstration purposes
-        
-        # Convert to binary
-        y_pred_bin = (y_pred > 0.5).float()
-        y_true_bin = (y_true > 0.5).float()
-        
-        # Use dilated difference to approximate connectivity errors
-        kernel_size = 3
-        dilated_pred = F.max_pool2d(y_pred_bin, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-        dilated_true = F.max_pool2d(y_true_bin, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-        
-        # Connectivity error is higher when dilated regions differ
-        connectivity_error = F.mse_loss(dilated_pred, dilated_true)
-        
-        return connectivity_error
+    ndim = len(axis)
+    dtype, device = x.dtype, x.device
+
+    # 1) displacement grid ---------------------------------------------------
+    if hasattr(elasticdeform, "random_displacement"):         # v0.5+
+        disp_np = elasticdeform.random_displacement(ndim, pts, pts, sigma)
+        disp = torch.as_tensor(disp_np, dtype=dtype, device=device)
+    else:                                                     # legacy build
+        # shape (ndim, pts, pts, …), same convention as elasticdeform
+        shape = (ndim,) + (pts,) * ndim
+        disp = torch.randn(*shape, dtype=dtype, device=device) * sigma
+
+    # 2) warp (all-torch, differentiable) -------------------------------
+    return edt.deform_grid(x, disp, axis=axis, order=3)
+
+# SIMPLE IMPLEMENTATION FOR NOT SUPPORTEDs 
+def _contrast_volume(x: Tensor, factor: float) -> Tensor:
+    """Simple per-tensor contrast:  y = (x - mean)*f + mean."""
+    mean = x.mean(dim=(-3, -2, -1), keepdim=True)
+    return (x - mean) * factor + mean
+
+def _brightness_volume(x: Tensor, factor: float) -> Tensor:
+    """Multiply full volume by *factor* (simple brightness)."""
+    return x * factor
+
+def _gamma_volume(x: Tensor, gamma: float) -> Tensor:
+    """Per-volume gamma correction:  y = x**gamma  (expects x in [0,1])."""
+    # clamp protects against inf / nan if values are exactly 0
+    return torch.clamp(x, min=1e-6) ** gamma
+
+def _gaussian_noise_volume(x: Tensor, mean: float, std: float) -> Tensor:
+    """Add i.i.d. Gaussian noise to the whole volume."""
+    noise = torch.randn_like(x) * std + mean
+    return x + noise
+
+def _gaussian_kernel1d(radius: int, sigma: float, dtype, device) -> Tensor:
+    """Returns a 1-D tensor of size (2*radius+1)."""
+    # gaussian centred at 0 … radius
+    x = torch.arange(-radius, radius + 1, dtype=dtype, device=device)
+    kernel = torch.exp(-(x**2) / (2 * sigma**2))
+    kernel /= kernel.sum()
+    return kernel
+
+
+def _gaussian_blur_volume(x: Tensor, k: int, sigma: float) -> Tensor:
+    """Depth-wise separable 3-D Gaussian blur (B,C,D,H,W)."""
+    r = k // 2
+    dtype, device = x.dtype, x.device
+    k1 = _gaussian_kernel1d(r, sigma, dtype, device)
+
+    # separable ⇒ three 1-D convolutions
+    pad = (r, r)
+    # along depth (dim=-3)
+    x = F.conv3d(F.pad(x, pad * 3, mode="reflect"),
+                 k1.view(1, 1, -1, 1, 1), groups=x.size(1))
+    # along height (dim=-2)
+    x = F.conv3d(F.pad(x, pad * 3, mode="reflect"),
+                 k1.view(1, 1, 1, -1, 1), groups=x.size(1))
+    # along width (dim=-1)
+    x = F.conv3d(F.pad(x, pad * 3, mode="reflect"),
+                 k1.view(1, 1, 1, 1, -1), groups=x.size(1))
+    return x
+# -----------------------------------------------------------------------------#
+# main entry                                                                    #
+# -----------------------------------------------------------------------------#
+def augment_images(
+    data: Dict[str, Tensor],
+    aug_cfg: Dict[str, Any],
+    dim: int,
+    rng: Optional[_RNG] = None,
+    verbose: bool = False,
+) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    name: str = aug_cfg["name"]
+    if rng.random() > aug_cfg.get("p", 1.0):
+        return data, {"name": name, "skipped": True}
+
+    # ---------- sample all random parameters once --------------------------------
+    prm, p = {}, aug_cfg.get("params", {})
+
+    if name in ("flip_horizontal", "flip_vertical", "flip_depth"):
+        pass
+
+    elif name == "rotation":
+        prm["angle"] = (_maybe_scalar(p["degrees"], rng)
+                        if dim == 2 else _maybe_tuple(p["degrees"], rng, 3))
+
+    elif name == "scaling":
+        prm["scale"] = (_maybe_scalar(p["scale_limit"], rng)
+                        if dim == 2 else (_maybe_tuple(p["scale_limit"], rng, 3)
+                        if isinstance(p["scale_limit"], (int, float))
+                        else tuple(_maybe_scalar(s, rng) if isinstance(s, (int, float))
+                                   else tuple(map(float, s))
+                                   for s in p["scale_limit"])))
+
+    elif name == "translation":
+        prm["shift"] = (_maybe_scalar(p["shift_limit"], rng)
+                        if dim == 2 else _maybe_tuple(p["shift_limit"], rng, 3))
+
+    elif name == "elastic_deformation":
+        prm["sigma"]  = _maybe_scalar(p["sigma"], rng)
+        prm["points"] = int(_maybe_scalar(p["alpha"], rng))
+
+    elif name in ("brightness", "contrast"):
+        lim = _maybe_scalar(p["limit"], rng)              # –0.15 … 0.15
+        lo, hi = 1.0 + lim, 1.0 - lim if lim < 0 else 1.0 + lim
+        prm["range"] = (min(lo, hi), max(lo, hi))
+
+    elif name == "gamma":
+        lo, hi = map(float, p["gamma_limit"])   # e.g. [0.9, 1.1] from YAML
+        prm["range"] = (lo, hi)
+
+    elif name == "gaussian_noise":
+        prm["mean"] = float(p.get("mean", 0.0))
+        prm["std"]  = _maybe_scalar(p["std"], rng)
+
+    elif name == "blur":
+        prm["kernel"] = int(np.clip(_maybe_scalar(p["kernel_size"], rng), 3, 31)) | 1
+        prm["sigma"]  = _maybe_scalar(p["sigma"], rng)
+
+    elif name == "color_jitter":
+        prm = {}
+        for k in ("brightness", "contrast", "saturation"):
+            prm[k] = 1.0 + _maybe_scalar(p[k], rng)          # > 0
+        delta_h = _maybe_scalar(p["hue"], rng)               # e.g. −0.05 … +0.05
+        prm["hue"] = abs(delta_h)                            # 0 … 0.05 (non-neg.)
+
+    else:
+        raise NotImplementedError(name)
+
+    if verbose:
+        print(f"[augment] {name:>18}  params={prm}")
+
+    # ---------- apply transform ---------------------------------------------------
+    mods = aug_cfg.get("modalities", data.keys())
+    out: Dict[str, Tensor] = {}
+
+    for mod, x in data.items():
+        if mod not in mods:                      # untouched modality
+            out[mod] = x
+            continue
+
+        xb = x.unsqueeze(0).float()              # Kornia expects BCHW / BCDHW
+        mode = _interp(mod)
+
+        if name.startswith("flip"):
+            yb = _apply_flip(xb, name, dim)
+
+        elif name == "rotation":
+            yb = _apply_rotate(xb, prm["angle"], dim, mode)
+
+        elif name == "scaling":
+            yb = _apply_scale(xb, prm["scale"], dim, mode)
+
+        elif name == "translation":
+            yb = _apply_translate(xb, prm["shift"], dim, mode)
+
+        elif name == "elastic_deformation":
+            axis = (2, 3) if dim == 2 else (2, 3, 4)
+            yb = _apply_elastic(xb, prm["sigma"], prm["points"], axis)
+
+        elif name == "brightness":
+            if dim == 2:
+                cls = K.augmentation.RandomBrightness      # class *does* exist for 2-D
+                yb  = cls(brightness=prm["range"], p=1.0)(xb)
+            else:                                          # 3-D fallback
+                fac = float(rng.uniform(*prm["range"]))
+                yb  = _brightness_volume(xb, fac)
+
+        elif name == "contrast":
+            if dim == 2:
+                cls = K.augmentation.RandomContrast
+                yb = cls(contrast=prm["range"], p=1.0)(xb)
+            else:                # 3-D fallback
+                fac = float(rng.uniform(*prm["range"]))
+                yb  = _contrast_volume(xb, fac)
+
+
+        elif name == "gamma":
+            if dim == 2:
+                # Kornia RandomGamma accepts a (min, max) tuple
+                yb = K.augmentation.RandomGamma(gamma=prm["range"], p=1.0)(xb)
+            else:                                   # 3-D fallback
+                g  = float(rng.uniform(*prm["range"]))   # sample γ ∈ [lo, hi]
+                yb = _gamma_volume(xb, g)
+
+        elif name == "gaussian_noise":
+            if dim == 2:
+                yb = K.augmentation.RandomGaussianNoise(mean=prm["mean"],
+                                                        std=prm["std"], p=1.0)(xb)
+            else:                       # 3-D fallback
+                yb = _gaussian_noise_volume(xb, prm["mean"], prm["std"])
+
+
+        elif name == "blur":
+            ks = prm["kernel"]
+            if dim == 2:
+                yb = K.augmentation.RandomGaussianBlur(
+                        (ks, ks),
+                        sigma=(prm["sigma"], prm["sigma"]),
+                        p=1.0,
+                    )(xb)
+            else:                                        # 3-D fallback
+                yb = _gaussian_blur_volume(xb, ks, prm["sigma"])
+
+        elif name == "color_jitter":
+            if dim == 3:                        # not supported -> skip
+                yb = xb
+            else:
+                yb = K.augmentation.ColorJiggle(
+                    brightness=prm["brightness"],
+                    contrast=prm["contrast"],
+                    saturation=prm["saturation"],
+                    hue=prm["hue"],
+                    p=1.0,
+                )(xb)
+
+        else:
+            raise RuntimeError(f"unhandled {name}")
+
+        out[mod] = yb.squeeze(0).to(x.dtype)
+
+    meta = {"name": name,
+            "sampled_params": prm,
+            "modalities": list(mods),
+            "skipped": False}
+    return out, meta
+
 
 # ------------------------------------
-# losses/cape/loss.py
+# core/general_dataset/normalizations.py
 # ------------------------------------
+"""
+normalizations.py
+
+Unified normalization utilities that work seamlessly with **both** NumPy
+arrays and PyTorch tensors.  
+
+Pass in a NumPy array → you get a NumPy array back.  
+Pass in a Torch tensor → you get a Torch tensor back.
+
+All math happens in the backend that the input came from.
+"""
+from __future__ import annotations
+
+from typing import Optional, Union, List
+
+import numpy as np
 import torch
-from torch import nn
-import numpy as np
-import skimage.graph
+from core.general_dataset.logger import logger
+
+TensorOrArray = Union[np.ndarray, torch.Tensor]
+
+# -----------------------------------------------------------------------------#
+# Helper utilities                                                             #
+# -----------------------------------------------------------------------------#
+def _is_torch(x: TensorOrArray) -> bool:           
+    """Return *True* if *x* is a :class:`torch.Tensor`."""
+    return isinstance(x, torch.Tensor)
+
+
+def _validate_input(x: TensorOrArray) -> None:
+    """Validate input is a proper numpy array or torch tensor."""
+    if not isinstance(x, (np.ndarray, torch.Tensor)):
+        raise TypeError(f"Expected numpy array or torch tensor, got {type(x)}")
+    
+    # Fix bug #1: Properly check for empty tensors/arrays
+    if _is_torch(x):
+        if x.numel() == 0:
+            raise ValueError("Empty arrays/tensors are not supported")
+    else:
+        if x.size == 0:
+            raise ValueError("Empty arrays/tensors are not supported")
+
+
+def _to_float(x: TensorOrArray) -> TensorOrArray: 
+    """Cast to ``float32`` **without** switching backend."""
+    _validate_input(x)
+    return x.float() if _is_torch(x) else x.astype(np.float32, copy=False)
+
+
+def _full_like(x: TensorOrArray, value: float) -> TensorOrArray:   
+    """Backend-aware ``full_like`` that preserves dtype & device."""
+    return torch.full_like(x, value) if _is_torch(x) else np.full_like(x, value)
+
+
+def _zeros_like(x: TensorOrArray) -> TensorOrArray:   
+    """Backend-aware ``zeros_like``."""
+    return torch.zeros_like(x) if _is_torch(x) else np.zeros_like(x)
+
+
+def _clamp(x: TensorOrArray, lo: float, hi: float) -> TensorOrArray:   
+    """Backend-aware clamp/clip with identical semantics."""
+    return torch.clamp(x, lo, hi) if _is_torch(x) else np.clip(x, lo, hi)
+
+
+def _quantile(x: TensorOrArray, q: Union[float, List[float]]) -> Union[float, List[float]]:              
+    """
+    Backend-aware quantile.
+
+    Always returns ``float`` if *q* is scalar or ``list[float]`` if *q* is
+    iterable, never tensors/arrays.
+    """
+    if _is_torch(x):
+        # Fix bug #3: Use same dtype as input tensor to avoid dtype mismatch
+        if isinstance(q, (list, tuple)):
+            q_tensor = torch.tensor(q, dtype=x.dtype, device=x.device)
+        else:
+            q_tensor = torch.tensor([q], dtype=x.dtype, device=x.device)
+        
+        qt = torch.quantile(x, q_tensor)
+        
+        if isinstance(q, (list, tuple)):
+            return [float(v) for v in qt.cpu().tolist()]
+        else:
+            return float(qt.item())
+
+    qt = np.quantile(x, q)
+    if isinstance(q, (list, tuple)):
+        return [float(v) for v in np.asarray(qt).tolist()]
+    else:
+        return float(qt)
+
+
+def _is_binary_data(x: TensorOrArray) -> bool:
+    """Check if data is already binary (contains only 0s and 1s)."""
+    # Fix bug #2: Add early guard for empty tensors
+    if _is_torch(x):
+        if x.numel() == 0:
+            return False
+        unique_vals = torch.unique(x)
+        return len(unique_vals) <= 2 and torch.all((unique_vals == 0) | (unique_vals == 1))
+    else:
+        if x.size == 0:
+            return False
+        unique_vals = np.unique(x)
+        return len(unique_vals) <= 2 and np.all((unique_vals == 0) | (unique_vals == 1))
+
+
+def _has_nan_or_inf(x: TensorOrArray) -> bool:
+    """Check if array/tensor contains NaN or Inf values."""
+    if _is_torch(x):
+        return torch.isnan(x).any() or torch.isinf(x).any()
+    else:
+        return np.isnan(x).any() or np.isinf(x).any()
+
+
+# -----------------------------------------------------------------------------#
+# Normalization functions                                                      #
+# -----------------------------------------------------------------------------#
+def min_max_normalize(
+    image: TensorOrArray,
+    new_min: float = 0.0,
+    new_max: float = 1.0,
+    old_min: Optional[float] = None,
+    old_max: Optional[float] = None,
+) -> TensorOrArray:
+    """Rescale intensities to **[new_min, new_max]** while preserving backend."""
+    img = _to_float(image)
+    
+    if _has_nan_or_inf(img):
+        logger.warning("Min-Max normalization: input contains NaN or Inf values")
+    
+    lo = old_min if old_min is not None else float(img.min().item() if _is_torch(img) else img.min())
+    hi = old_max if old_max is not None else float(img.max().item() if _is_torch(img) else img.max())
+
+    if hi <= lo:
+        logger.error(
+            "Min-Max normalization: invalid range old_min=%s, old_max=%s; "
+            "returning new_min.", lo, hi
+        )
+        return _full_like(img, new_min)
+
+    scaled = (img - lo) / (hi - lo)
+    return scaled * (new_max - new_min) + new_min
+
+
+def z_score_normalize(image: TensorOrArray, eps: float = 1e-8) -> TensorOrArray:
+    """Subtract mean and divide by std; backend preserved."""
+    img = _to_float(image)
+    
+    if _has_nan_or_inf(img):
+        logger.warning("Z-Score normalization: input contains NaN or Inf values")
+    
+    mean = img.mean()
+    std = img.std()
+    std_val = float(std.item() if _is_torch(std) else std)
+
+    if std_val < eps:
+        logger.error("Z-Score normalization: low variance, returning zeros.")
+        return _zeros_like(img)
+
+    return (img - mean) / std
+
+
+def robust_normalize(
+    image: TensorOrArray, lower_q: float = 0.05, upper_q: float = 0.95
+) -> TensorOrArray:
+    """Clip to quantiles then min-max scale (backend preserved)."""
+    img = _to_float(image)
+    
+    if _has_nan_or_inf(img):
+        logger.warning("Robust normalization: input contains NaN or Inf values")
+    
+    low, high = _quantile(img, [lower_q, upper_q])
+
+    if high == low:
+        logger.error("Robust normalization: quantiles equal, returning zeros.")
+        return _zeros_like(img)
+
+    clipped = _clamp(img, low, high)
+    return (clipped - low) / (high - low)
+
+
+def percentile_normalize(
+    image: TensorOrArray, q_low: float = 1.0, q_high: float = 99.0
+) -> TensorOrArray:
+    """Percentile wrapper around :func:`robust_normalize`."""
+    return robust_normalize(image, q_low / 100.0, q_high / 100.0)
+
+
+def clip_normalize(
+    image: TensorOrArray, min_val: float, max_val: float
+) -> TensorOrArray:
+    """Clip to ``[min_val,max_val]`` then scale to **[0,1]** (backend preserved)."""
+    img = _to_float(image)
+    
+    if max_val == min_val:
+        logger.error("Clip normalization: min_val == max_val, returning zeros.")
+        return _zeros_like(img)
+
+    clipped = _clamp(img, min_val, max_val)
+    return (clipped - min_val) / (max_val - min_val)
+
+
+def hard_clip(image: TensorOrArray, min_val: float, max_val: float) -> TensorOrArray:
+    """Hard clip to ``[min_val,max_val]`` **without** rescaling (backend preserved)."""
+    img = _to_float(image)
+    if max_val == min_val:
+        logger.error("Hard clip: min_val == max_val, returning constant value.")
+        return _full_like(img, min_val)
+    return _clamp(img, min_val, max_val)
+
+
+def divide_by(image: TensorOrArray, threshold: float) -> TensorOrArray:
+    """Element-wise division by *threshold* (backend preserved)."""
+    if threshold == 0.0:
+        raise ValueError("Cannot divide by zero")
+    
+    img = _to_float(image)
+    
+    # Fix bug #5: Add NaN/Inf guard like other helpers
+    if _has_nan_or_inf(img):
+        logger.warning("Divide by: input contains NaN or Inf values")
+    
+    return img / threshold
+
+
+def binarize(
+    image: TensorOrArray,
+    threshold: Union[float, int],
+    *,
+    greater_is_road: bool = True,
+    return_bool: bool = True,
+    verbose: bool = False,
+) -> TensorOrArray:
+    """
+    Convert label / probability map to binary mask (**backend preserved**).
+
+    * If the data already looks binary (all values 0/1) it is returned
+      as-is (optionally type-converted).
+    """
+    if not isinstance(image, (np.ndarray, torch.Tensor)):
+        raise TypeError(
+            f"image must be numpy.ndarray or torch.Tensor, got {type(image)}"
+        )
+
+    img = _to_float(image)
+
+    # Fast path for already-binary data
+    if _is_binary_data(img):
+        if _is_torch(img):
+            mask = img.bool()
+        else:
+            mask = img.astype(bool)
+        
+        if return_bool:
+            return mask
+        else:
+            return mask.to(torch.uint8) if _is_torch(mask) else mask.astype(np.uint8)
+
+    # Apply threshold
+    if greater_is_road:
+        mask_bool = img > threshold
+    else:
+        mask_bool = img <= threshold
+
+    if verbose:
+        info = {
+            "backend": "torch" if _is_torch(image) else "numpy",
+            "dtype": str(image.dtype),
+            "shape": tuple(image.shape),
+            "min": float(img.min().item() if _is_torch(img) else img.min()),
+            "max": float(img.max().item() if _is_torch(img) else img.max()),
+            "threshold": float(threshold),
+            "greater_is_road": greater_is_road,
+        }
+        print("[binarize]", info)
+
+    if return_bool:
+        return mask_bool
+    else:
+        return mask_bool.to(torch.uint8) if _is_torch(mask_bool) else mask_bool.astype(np.uint8)
+
+
+def boolean(image: TensorOrArray) -> TensorOrArray:
+    """Cast any numeric array/tensor to **uint8** 0-1 representation."""
+    # Fix bug #6: Skip _to_float for boolean input to avoid redundant conversion
+    if _is_torch(image):
+        if image.dtype == torch.bool:
+            return image.to(torch.uint8)
+        else:
+            img = image.float()
+            return img.bool().to(torch.uint8)
+    else:
+        if image.dtype == bool:
+            return image.astype(np.uint8)
+        else:
+            img = image.astype(np.float32, copy=False)
+            return img.astype(bool).astype(np.uint8)
+
+
+# -----------------------------------------------------------------------------#
+# Dispatcher                                                                   #
+# -----------------------------------------------------------------------------#
+def normalize(
+    image: TensorOrArray,
+    method: str = "minmax",
+    **kwargs,
+) -> TensorOrArray:
+    """
+    Backend-agnostic dispatcher.  
+    Returns the **same type** it was given.
+    """
+    method = method.lower()
+    
+    # Validate required parameters for each method
+    if method == "minmax":
+        return min_max_normalize(image, **kwargs)
+    elif method == "zscore":
+        return z_score_normalize(image, **kwargs)
+    elif method == "robust":
+        return robust_normalize(image, **kwargs)
+    elif method == "percentile":
+        return percentile_normalize(image, **kwargs)
+    elif method == "clip":
+        if 'min_val' not in kwargs or 'max_val' not in kwargs:
+            raise ValueError("clip method requires 'min_val' and 'max_val' parameters")
+        return hard_clip(image, **kwargs)
+    elif method == "clip_normalize":
+        if 'min_val' not in kwargs or 'max_val' not in kwargs:
+            raise ValueError("clip_normalize method requires 'min_val' and 'max_val' parameters")
+        return clip_normalize(image, **kwargs)
+    elif method == "divide_by":
+        if 'threshold' not in kwargs:
+            raise ValueError("divide_by method requires 'threshold' parameter")
+        return divide_by(image, **kwargs)
+    elif method == "binarize":
+        if 'threshold' not in kwargs:
+            raise ValueError("binarize method requires 'threshold' parameter")
+        return binarize(image, **kwargs)
+    elif method == "boolean":
+        return boolean(image)
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+
+
+# Back-compat alias
+normalize_image = normalize
+
+# Export all public functions
+__all__ = [
+    'TensorOrArray',
+    'min_max_normalize',
+    'z_score_normalize', 
+    'robust_normalize',
+    'percentile_normalize',
+    'clip_normalize',
+    'hard_clip',  # Fix bug #4: Expose hard_clip publicly
+    'divide_by',
+    'binarize',
+    'boolean',
+    'normalize',
+    'normalize_image',
+]
+
+# Example normalization configurations
+normalization_config = {
+    "minmax": {
+        "method": "minmax",
+        "new_min": 0.0,    # lower bound of output range
+        "new_max": 1.0     # upper bound of output range
+    },
+    "zscore": {
+        "method": "zscore",
+        "eps": 1e-8        # small constant to avoid division by zero
+    },
+    "robust": {
+        "method": "robust",
+        "lower_q": 0.05,   # clip everything below 5th quantile
+        "upper_q": 0.95    # clip everything above 95th quantile
+    },
+    "percentile": {
+        "method": "percentile",
+        "q_low": 1.0,      # clip below 1st percentile
+        "q_high": 99.0     # clip above 99th percentile
+    },
+    "clip": {
+        "method": "clip",
+        "min_val": 0.0,    # hard clamp lower bound (no scaling)
+        "max_val": 200.0   # hard clamp upper bound (no scaling)
+    },
+    "clip_normalize": {
+        "method": "clip_normalize", 
+        "min_val": 0.0,    # clamp then scale: lower bound
+        "max_val": 200.0   # clamp then scale: upper bound
+    },
+    "divide_by": {
+        "method": "divide_by",
+        "threshold": 255.0  # division factor
+    },
+    "binarize": {
+        "method": "binarize",
+        "threshold": 0.5,           # binarization threshold
+        "greater_is_road": True,    # threshold direction
+        "return_bool": True         # return boolean or uint8
+    }
+}
+
+
+# ------------------------------------
+# core/general_dataset/crop.py
+# ------------------------------------
+from __future__ import annotations
+
+"""Patch‑sampling utilities (channel‑aware).
+Public API
+~~~~~~~~~~
+* **bigger_crop** - pad spatial dims, then return a random crop whose spatial
+  size is ``ceil(√D · patch_size)``.
+* **center_crop** - symmetric crop back to *patch_size* in spatial dims.
+
+"""
+
+from typing import Dict, Sequence, Tuple
+import math
 import random
-import cv2
-from skimage.morphology import skeletonize
-from .utils.graph_from_skeleton_3D import graph_from_skeleton as graph_from_skeleton_3D
-from .utils.graph_from_skeleton_2D import graph_from_skeleton as graph_from_skeleton_2D
-from .utils.crop_graph import crop_graph_2D, crop_graph_3D
-from skimage.draw import line_nd
-from scipy.ndimage import binary_dilation, generate_binary_structure
-import networkx as nx
+import numpy as np
 
+__all__ = [
+    "bigger_crop",
+    "center_crop",
+]
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# -----------------------------------------------------------------------------
+# Internal helpers
+# -----------------------------------------------------------------------------
 
-class CAPE(nn.Module):
-    def __init__(self, window_size=128, three_dimensional=False, dilation_radius=10, shifting_radius=5, is_binary=False, distance_threshold=20, single_edge=False):
-        super().__init__()
-        """
-        Initialize the CAPE loss module.
+def _channel_flags_and_spatial_shape(
+    data: Dict[str, np.ndarray],
+    dim: int,
+) -> Tuple[Tuple[int, ...], Dict[str, bool]]:
+    """Return common *spatial* shape and ``{key: has_channel_axis}`` mapping."""
+    if not data:
+        raise ValueError("`data` must contain at least one modality.")
 
-        Args:
-            window_size (int): Size of the square patch (window) to process at a time.
-            three_dimensional (bool): If True, operate in 3D mode; otherwise, operate in 2D.
-            dilation_radius (int): Radius used to dilate ground-truth paths for masking.
-            shifting_radius (int): Radius for refining start/end points to lowest-cost nearby pixels.
-            is_binary (bool): If True, treat inputs as binary maps (invert predictions/ground truth).
-            distance_threshold (float): Maximum value used for clipping ground-truth distance maps.
-            single_edge (bool): If True, sample a single edge at a time; otherwise, sample a path.
-        """
-        self.window_size = window_size
-        self.three_dimensional = three_dimensional
-        self.dilation_radius = dilation_radius
-        self.shifting_radius = shifting_radius
-        self.is_binary = is_binary
-        self.distance_threshold = distance_threshold
-        self.single_edge = single_edge
-        self.data_dim = 3 if three_dimensional else 2
-    
-    def _ensure_no_channel(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Remove a channel dimension for 2D or 3D data if it's a singleton.
-
-        For 2D:
-        (B,1,H,W) -> (B,H,W)
-        For 3D:
-        (B,1,D,H,W) -> (B,D,H,W)
-        Leaves (B,H,W) or (B,D,H,W) unchanged.
-        """
-        expected_dim = 1 + self.data_dim  # batch + spatial
-        if t.dim() != expected_dim and t.size(1) == 1:
-            return t.squeeze(1)
-        return t
-        
-
-    def _random_connected_pair(self, G):
-        """
-        Pick two distinct nodes that are in the same connected component.
-        """
-        node1 = random.choice(list(G.nodes()))
-        reachable = list(nx.node_connected_component(G, node1))
-        if len(reachable) == 1:
-            return self._random_connected_pair(G)
-        node2 = random.choice([n for n in reachable if n != node1])
-        return node1, node2
-
-
-    def _dilate_path_2D(self, shape, path_pts, radius):
-        """
-        Rasterise a poly-line into a thick 2D mask.
-        """
-        mask = np.zeros(shape, dtype=np.uint8)
-        for p, q in zip(path_pts[:-1], path_pts[1:]):
-            cv2.line(mask,
-                    (int(p[0]), int(p[1])),
-                    (int(q[0]), int(q[1])),
-                    1, int(radius))
-        return mask
-    
-    
-    def _dilate_path_3D(self, shape, path_positions, radius):
-        """
-        Rasterise a poly-line into a thick 3D mask.
-        """
-        mask = np.zeros(shape, dtype=np.uint8)
-
-        for p1, p2 in zip(path_positions[:-1], path_positions[1:]):
-            temp = np.zeros(shape, dtype=np.uint8)
-            
-            rr, cc, zz = line_nd(tuple(map(int, p1)), tuple(map(int, p2)))
-            temp[zz, cc, rr] = 1
-
-            struct = generate_binary_structure(3, 1)
-            dilated_segment = binary_dilation(temp, structure=struct, iterations=int(radius))
-
-            mask = np.logical_or(mask, dilated_segment)
-
-        return mask.astype(np.uint8)
-        
-        
-    def draw_line_with_thickness_3D(self, volume, start_point, end_point, value=1, thickness=1):
-        """
-        Draw a 3D line with specified thickness between two points in a volume using dilation.
-        """
-        rr, cc, zz = line_nd(start_point, end_point)
-        volume[zz, cc, rr] = value
-        
-        struct = generate_binary_structure(3, 1)
-        dilated_volume = binary_dilation(volume, structure=struct, iterations=thickness)
-        
-        return dilated_volume
-      
-
-    def find_min_in_radius_2D(self, array: np.ndarray, center: tuple, radius: float):
-        """
-        Finds the coordinates of the minimum value inside a given radius from a center point in a 2D array.
-        """
-        x0, y0 = center
-        height, width = array.shape
-
-        y_min, y_max = max(0, y0 - int(radius)), min(height, y0 + int(radius) + 1)
-        x_min, x_max = max(0, x0 - int(radius)), min(width, x0 + int(radius) + 1)
-
-        sub_image = array[y_min:y_max, x_min:x_max]
-        
-        min_idx = np.unravel_index(np.argmin(sub_image), sub_image.shape)
-
-        min_coords = (y_min + min_idx[0], x_min + min_idx[1])
-        return min_coords
-    
-    
-    def find_min_in_radius_3D(self, array: np.ndarray, center: tuple, radius: float):
-        """
-        Finds the coordinates of the minimum value inside a given radius from a center point in a 3D array.
-        """
-        x0, y0, z0 = center
-        depth, height, width = array.shape
-
-        z_min, z_max = max(0, z0 - int(radius)), min(depth, z0 + int(radius) + 1)
-        y_min, y_max = max(0, y0 - int(radius)), min(height, y0 + int(radius) + 1)
-        x_min, x_max = max(0, x0 - int(radius)), min(width, x0 + int(radius) + 1)
-
-        sub_volume = array[z_min:z_max, y_min:y_max, x_min:x_max]
-        
-        
-        min_idx = np.unravel_index(np.argmin(sub_volume), sub_volume.shape)
-        
-        min_coords = (z_min + min_idx[0], y_min + min_idx[1], x_min + min_idx[2])
-        return min_coords
-    
-    
-    def path_cost_2D(self, cost_tensor, pred_cost_map, start_point, end_point, dilation_radius=20, extra_path=None):  
-        """
-        Compute the shortest path cost in 2D using Dijkstra's algorithm.
-        """
-        start_point = (int(start_point[0]), int(start_point[1]))
-        end_point   = (int(end_point[0]), int(end_point[1]))
-        dilation_radius = int(dilation_radius)
-
-        if extra_path is None:                            
-            dilated_image = np.zeros_like(pred_cost_map, dtype=np.uint8)
-            cv2.line(dilated_image, start_point, end_point,
-                    color=1, thickness=int(dilation_radius))
-        else:                                             
-            dilated_image = self._dilate_path_2D(pred_cost_map.shape,
-                                                extra_path,
-                                                dilation_radius)
-
-        pred_cost_map = self.distance_threshold - pred_cost_map
-        dilated_image = dilated_image * pred_cost_map
-        dilated_image = self.distance_threshold - dilated_image
-        dilated_image = np.where(dilated_image == self.distance_threshold, float('inf'), dilated_image)
-        path_cost = torch.tensor(0.0, requires_grad=True).to(device)
-        
-        start_refined = self.find_min_in_radius_2D(dilated_image, start_point, radius=self.shifting_radius)
-        end_refined = self.find_min_in_radius_2D(dilated_image, end_point, radius=self.shifting_radius)
-
-        dilated_image = np.maximum(dilated_image, 0) + 0.00001
-        
-        try:
-
-            path_coords, _ = skimage.graph.route_through_array(
-                dilated_image, start=start_refined, end=end_refined, fully_connected=True, geometric=True)
-
-            path_coords = np.transpose(np.array(path_coords), (1, 0))
-            path_cost = torch.sum(cost_tensor[path_coords[0], path_coords[1]] ** 2).to(device)
-            
-            return path_cost
-        
-        except Exception as e:
-
-            return path_cost
-        
-        
-    def path_cost_3D(self, cost_tensor, pred_cost_map, start_point, end_point, dilation_radius=5, extra_path=None):
-        """
-        Compute the shortest path cost in 3D using Dijkstra's algorithm.
-        """
-        if extra_path is None:
-            dilated_image = self.draw_line_with_thickness_3D(
-                np.zeros_like(pred_cost_map, dtype=np.uint8),
-                start_point, end_point, value=1, thickness=dilation_radius)
-            
-        else:                                           
-            dilated_image = self._dilate_path_3D(pred_cost_map.shape,
-                                                extra_path,
-                                                dilation_radius)
-        
-        
-        dilated_image = dilated_image.astype(np.uint8)
-        dilated_image = np.where(dilated_image, 1, 0)
-        
-        pred_cost_map_temp = self.distance_threshold - pred_cost_map
-        dilated_image = dilated_image * pred_cost_map_temp
-        dilated_image = self.distance_threshold - dilated_image
-        dilated_image = np.where(dilated_image == self.distance_threshold, float('inf'), dilated_image)
-        
-        start_refined = self.find_min_in_radius_3D(dilated_image, start_point, radius=self.shifting_radius)
-        end_refined = self.find_min_in_radius_3D(dilated_image, end_point, radius=self.shifting_radius)
-        
-        dilated_image = np.maximum(dilated_image, 0) + 0.00001
-        
-        try:
-            path_coords, _ = skimage.graph.route_through_array(
-                dilated_image, start=start_refined, end=end_refined, fully_connected=True, geometric=True
+    spatial_shape: Tuple[int, ...] | None = None
+    ch_flag: Dict[str, bool] = {}
+    for k, v in data.items():
+        if v.ndim not in (dim, dim + 1):
+            raise ValueError(f"'{k}' must have {dim} or {dim+1} dims, got {v.ndim}")
+        cur_spatial = v.shape[-dim:]
+        if spatial_shape is None:
+            spatial_shape = cur_spatial
+        elif cur_spatial != spatial_shape:
+            raise ValueError(
+                f"All modalities must share spatial shape {spatial_shape}, but '{k}' has {cur_spatial}."
             )
-            path_coords = np.array(path_coords).T
-            path_cost = torch.sum((cost_tensor[path_coords[0], path_coords[1], path_coords[2]]) ** 2).to(device)
-            
-            return path_cost
-        
-        except Exception as e:
-            return torch.tensor(0.0, requires_grad=True).to(device)
-        
+        ch_flag[k] = (v.ndim == dim + 1)
+    return spatial_shape, ch_flag
 
-    def forward(self, predictions, ground_truths):
-        """
-        Compute the average CAPE loss over a batch of predictions and ground truths.
 
-        The method splits each prediction volume/mask into patches (windows), extracts
-        or receives a graph representation of the skeletonized ground truth in each window,
-        samples paths from the graph, computes the squared-distance sum along each predicted path,
-        and accumulates these costs to return the mean loss per batch.
+def _compute_sizes(dim: int, patch_size: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
+    if len(patch_size) != dim:
+        raise ValueError("`patch_size` length must match spatial dim")
+    scale = math.sqrt(dim)
+    patch_size = np.asarray(patch_size, dtype=int)
+    big = np.ceil(scale * patch_size).astype(int)
+    pad = ((big - patch_size) + 1) // 2  # ceil‑to‑left
+    return pad, big
 
-        Args:
-            predictions (torch.Tensor): Distance maps of shape
-                - (batch, H, W) for 2D
-                - (batch, D, H, W) for 3D
-            ground_truths (Union[nx.Graph, np.ndarray, torch.Tensor]):
-                - Graph objects for direct skeleton-based sampling,
-                - Or binary masks (arrays or tensors) to skeletonize.
 
-        Returns:
-            torch.Tensor: Scalar tensor representing the mean CAPE loss over the batch.
-        """
-        predictions = self._ensure_no_channel(predictions)
-        ground_truths = self._ensure_no_channel(ground_truths)
+def _random_start(
+    rng: random.Random | np.random.RandomState | np.random.Generator,
+    full_shape: Sequence[int],
+    crop_shape: Sequence[int],
+) -> np.ndarray:
+    """Random spatial corner so *crop_shape* fits inside *full_shape*."""
+    max_start = np.array(full_shape) - np.array(crop_shape)
+    if np.any(max_start < 0):
+        raise ValueError("`crop_shape` larger than padded shape - bug in logic.")
 
-        batch_size = predictions.size(0)
-        total_loss = 0.0
-
-        if isinstance(ground_truths[0], nx.Graph):
-            gt_type = 0
-        
-        elif isinstance(ground_truths, np.ndarray):
-            gt_type = 1
-            
-        elif isinstance(ground_truths, torch.Tensor):
-            ground_truths = ground_truths.detach().cpu().numpy()
-            gt_type = 1
-        
-        
-        if self.is_binary:
-            
-            predictions = 1 - predictions
-            
-            if gt_type == 1:
-                ground_truths = 1 - ground_truths
-                
-            self.distance_threshold = 1
-        
-        
-        
-        # ── 2D MODE ───────────────────────────────────────────────────────────────
-        
-        if self.three_dimensional == False:
-
-            for b in range(batch_size):
-
-                full_prediction_map = predictions[b]
-                
-                # NO GRAPH INPUT
-                if gt_type == 1:
-                    full_ground_truth_mask = (ground_truths[b] == 0).astype(np.uint8)
-                
-                # GRAPH INPUT    
-                elif gt_type == 0:
-                    complete_graph = ground_truths[b]
-
-                assert predictions.shape[-1] % self.window_size == 0, "Width must be divisible by window size"
-                assert predictions.shape[-2] % self.window_size == 0, "Height must be divisible by window size"
-
-                num_windows_height = predictions.shape[-2] // self.window_size
-                num_windows_width = predictions.shape[-1] // self.window_size
-
-                crop_loss_sum = 0.0
-                
-
-                for i in range(num_windows_height):
-                    for j in range(num_windows_width):
-                        window_pred = full_prediction_map[i * full_prediction_map.shape[0] // num_windows_height:(i + 1) * full_prediction_map.shape[0] // num_windows_height, :]
-                        window_pred = window_pred[:, j * full_prediction_map.shape[1] // num_windows_width:(j + 1) * full_prediction_map.shape[1] // num_windows_width]
-                        
-                        # NO GRAPH INPUT
-                        if gt_type == 1:
-                            
-                            window_gt = full_ground_truth_mask[i * full_prediction_map.shape[0] // num_windows_height:(i + 1) * full_prediction_map.shape[0] // num_windows_height, :]
-                            window_gt = window_gt[:, j * full_prediction_map.shape[1] // num_windows_width:(j + 1) * full_prediction_map.shape[1] // num_windows_width]
-
-                            skeleton = skeletonize(window_gt)
-                            graph = graph_from_skeleton_2D(skeleton, angle_range=(175,185), verbose=False)
-                        
-                        # GRAPH INPUT
-                        elif gt_type == 0:
-                            graph = crop_graph_2D(complete_graph,
-                                                ymin=i * full_prediction_map.shape[0] // num_windows_height,
-                                                xmin=j * full_prediction_map.shape[1] // num_windows_width,
-                                                ymax=(i + 1) * full_prediction_map.shape[0] // num_windows_height,
-                                                xmax=(j + 1) * full_prediction_map.shape[1] // num_windows_width)
-
-                        window_loss = 0.0
-                        
-                        if self.single_edge == False:
-                        
-                            while list(graph.edges()):
-                                n1, n2 = self._random_connected_pair(graph)
-
-                                path_nodes = nx.shortest_path(graph, n1, n2)
-                                path_pos   = [graph.nodes[n]['pos'] for n in path_nodes]
-
-                                single_loss = self.path_cost_2D(
-                                    cost_tensor=window_pred,
-                                    pred_cost_map=window_pred.detach().cpu().numpy(),
-                                    start_point=path_pos[0], end_point=path_pos[-1],
-                                    dilation_radius=self.dilation_radius,
-                                    extra_path=path_pos
-                                )
-
-                                graph.remove_edges_from(zip(path_nodes[:-1], path_nodes[1:]))
-                                window_loss += single_loss                            
-                            
-                        else:
-                            
-                            edges = list(graph.edges())
-                            
-                            while list(graph.edges()):
-                                edges = list(graph.edges())
-        
-                                edge = random.choice(edges)
-                                node_1 = edge[0]
-                                node_2 = edge[1]
-                                
-                                node_idx1 = list(graph.nodes).index(node_1)
-                                node_idx2 = list(graph.nodes).index(node_2)
-
-                                node1 = list(graph.nodes)[node_idx1]
-                                node2 = list(graph.nodes)[node_idx2]
-
-                                node1_pos = graph.nodes()[node1]['pos']
-                                node2_pos = graph.nodes()[node2]['pos']
-
-                                single_loss = self.path_cost_2D(
-                                    cost_tensor=window_pred,
-                                    pred_cost_map=window_pred.detach().cpu().numpy(),
-                                    start_point=node1_pos, end_point=node2_pos,
-                                    dilation_radius=self.dilation_radius
-                                )
-                                
-                                graph.remove_edge(*edge)
-                                window_loss += single_loss
-                            
-                        crop_loss_sum += window_loss
-                        
-                total_loss += crop_loss_sum
-                
-            return total_loss / batch_size if batch_size > 0 else 0
-
-        # ── 3D MODE ───────────────────────────────────────────────────────────────
-
+    starts = []
+    for m in max_start:
+        if hasattr(rng, "integers"):
+            starts.append(int(rng.integers(0, m + 1)))  # numpy Generator
         else:
-            
-            for b in range(batch_size):
-                full_prediction_map = predictions[b]
-                
-                # NO GRAPH INPUT
-                if gt_type == 1:
-                    full_ground_truth_mask = (ground_truths[b] == 0).astype(np.uint8)
-                
-                # GRAPH INPUT    
-                elif gt_type == 0:
-                    complete_graph = ground_truths[b]
-                    
-                assert predictions.shape[-3] % self.window_size == 0, "Depth must be divisible by window size"
-                assert predictions.shape[-2] % self.window_size == 0, "Height must be divisible by window size"
-                assert predictions.shape[-1] % self.window_size == 0, "Width must be divisible by window size"
-
-                num_windows_depth = predictions.shape[-3] // self.window_size
-                num_windows_height = predictions.shape[-2] // self.window_size
-                num_windows_width = predictions.shape[-1] // self.window_size
-                
-                crop_loss_sum = 0.0
-                for d in range(num_windows_depth):
-                    for i in range(num_windows_height):
-                        for j in range(num_windows_width):
-                            window_pred = full_prediction_map[
-                                d * self.window_size:(d + 1) * self.window_size,
-                                i * self.window_size:(i + 1) * self.window_size,
-                                j * self.window_size:(j + 1) * self.window_size
-                            ]
-                            
-                            # NO GRAPH INPUT
-                            if gt_type == 1:
-                                
-                                window_gt = full_ground_truth_mask[
-                                    d * self.window_size:(d + 1) * self.window_size,
-                                    i * self.window_size:(i + 1) * self.window_size,
-                                    j * self.window_size:(j + 1) * self.window_size
-                                ]
-                                skeleton = skeletonize(window_gt)
-                                graph = graph_from_skeleton_3D(skeleton, angle_range=(175,185), verbose=False)
-                            
-                            # GRAPH INPUT
-                            elif gt_type == 0:
-                                graph = crop_graph_3D(       
-                                        complete_graph,
-                                        xmin=j * self.window_size,
-                                        ymin=i * self.window_size,
-                                        zmin=d * self.window_size,
-                                        xmax=j * self.window_size + self.window_size,
-                                        ymax=i * self.window_size + self.window_size,
-                                        zmax=d * self.window_size + self.window_size)
-                            
-                            window_loss = 0.0
-                            
-                            if self.single_edge == False:
-                            
-                                while list(graph.edges()):
-                                    n1, n2 = self._random_connected_pair(graph)
-
-                                    path_nodes = nx.shortest_path(graph, n1, n2)
-                                    path_pos   = [graph.nodes[n]['pos'] for n in path_nodes]
-
-                                    single_loss = self.path_cost_3D(
-                                        cost_tensor=window_pred,
-                                        pred_cost_map=window_pred.detach().cpu().numpy(),
-                                        start_point=path_pos[0], end_point=path_pos[-1],
-                                        dilation_radius=self.dilation_radius,
-                                        extra_path=path_pos
-                                    )
-                                    
-                                    graph.remove_edges_from(zip(path_nodes[:-1], path_nodes[1:]))
-                                    window_loss += single_loss
-                               
-                            else: 
-                                
-                                while list(graph.edges()):
-                                    edge = random.choice(list(graph.edges()))
-                                    node1, node2 = edge
-                                    node1_pos = graph.nodes[node1]['pos']
-                                    node2_pos = graph.nodes[node2]['pos']
-
-                                    single_loss = self.path_cost_3D(
-                                        cost_tensor=window_pred,
-                                        pred_cost_map=window_pred.detach().cpu().numpy(),
-                                        start_point=node1_pos, end_point=node2_pos,
-                                        dilation_radius=self.dilation_radius
-                                    )
-                                    
-                                    graph.remove_edge(*edge)
-                                    window_loss += single_loss
-                            
-                            crop_loss_sum += window_loss
-                            
-                total_loss += crop_loss_sum
-                
-            return total_loss / batch_size if batch_size > 0 else 0
-
-
-
-# ------------------------------------
-# losses/cape/__init__.py
-# ------------------------------------
-
-
-# ------------------------------------
-# losses/cape/utils/graph_from_skeleton_2D.py
-# ------------------------------------
-import numpy as np
-import networkx as nx
-import time
-import copy
-
-def pixel_graph(skeleton):
-
-    _skeleton = copy.deepcopy(np.uint8(skeleton))
-    _skeleton[0,:] = 0
-    _skeleton[:,0] = 0
-    _skeleton[-1,:] = 0
-    _skeleton[:,-1] = 0
-    G = nx.Graph()
-
-    # add one node for each active pixel
-    xs,ys = np.where(_skeleton>0)
-    G.add_nodes_from([(int(x),int(y)) for i,(x,y) in enumerate(zip(xs,ys))])
-
-    # add one edge between each adjacent active pixels
-    for (x,y) in G.nodes():
-        patch = _skeleton[x-1:x+2, y-1:y+2]
-        patch[1,1] = 0
-        for _x,_y in zip(*np.where(patch>0)):
-            if not G.has_edge((x,y),(x+_x-1,y+_y-1)):
-                G.add_edge((x,y),(x+_x-1,y+_y-1))
-
-    for n,data in G.nodes(data=True):
-        data['pos'] = np.array(n)[::-1]
-
-    return G
-
-def compute_angle_degree(c, p0, p1):
-    p0c = np.sqrt((c[0] - p0[0]) ** 2 + (c[1] - p0[1]) ** 2)
-    p1c = np.sqrt((c[0] - p1[0]) ** 2 + (c[1] - p1[1]) ** 2)
-    p0p1 = np.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2)
-
-    # Prevent division by zero
-    denominator = 2 * p1c * p0c
-    if denominator == 0:
-        return 0  # or some default value like 180
-
-    cos_value = (p1c**2 + p0c**2 - p0p1**2) / denominator
-
-    # Clip values to prevent NaN issues
-    cos_value = np.clip(cos_value, -1.0, 1.0)
-
-    return np.arccos(cos_value) * 180 / np.pi
-
-
-def distance_point_line(c,p0,p1):
-    return np.linalg.norm(np.cross(p0-c, c-p1))/np.linalg.norm(p1-p0)
-
-def decimate_nodes_angle_distance(G, angle_range=(110,240), dist=0.3, verbose=True):
-
-    H = copy.deepcopy(G)
-
-    def f():
-        start = time.time()
-        nodes = list(H.nodes())
-        np.random.shuffle(nodes)
-        changed = False
-        for n in nodes:
-
-            ajacent_nodes = list(nx.neighbors(H, n))
-            if n in ajacent_nodes:
-                ajacent_nodes.remove(n)
-            if len(ajacent_nodes)==2:
-                angle = compute_angle_degree(n, *ajacent_nodes)
-                d = distance_point_line(np.array(n), np.array(ajacent_nodes[0]), np.array(ajacent_nodes[1]))
-                if d<dist or (angle>angle_range[0] and angle<angle_range[1]):
-                    H.remove_node(n)
-                    H.add_edge(*ajacent_nodes)
-                    changed = True
-        return changed
-
-    while True:
-        if verbose:
-            print("Remaining nodes:", len(H.nodes()))
-        if not f():
-            break
-
-    if verbose:
-        print("Finished. Remaining nodes:", len(H.nodes()))
-
-    return H
-
-def remove_close_nodes(G, dist=10, verbose=True):
-
-    H = copy.deepcopy(G)
-    def _remove_close_nodes():
-        edges = list(H.edges())
-        changed = False
-        for (s,t) in edges:
-            if H.has_node(s) and H.has_node(t):
-                d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
-                if d<dist:
-                    if len(H.edges(s))==2:
-                        ajacent_nodes = list(nx.neighbors(H, s))
-                        if s in ajacent_nodes:
-                            ajacent_nodes.remove(s)
-                        if t in ajacent_nodes:
-                            ajacent_nodes.remove(t)
-                        if len(ajacent_nodes)==1:
-                            d = np.sqrt((s[0]-ajacent_nodes[0][0])**2+(s[1]-ajacent_nodes[0][1])**2)
-                            if d<dist:
-                                H.remove_node(s)
-                                H.add_edge(ajacent_nodes[0], t)
-                                changed = True
-                    elif len(H.edges(t))==2:
-                        ajacent_nodes = list(nx.neighbors(H, t))
-                        if s in ajacent_nodes:
-                            ajacent_nodes.remove(s)
-                        if t in ajacent_nodes:
-                            ajacent_nodes.remove(t)
-                        if len(ajacent_nodes)==1:
-                            d = np.sqrt((t[0]-ajacent_nodes[0][0])**2+(t[1]-ajacent_nodes[0][1])**2)
-                            if d<dist:
-                                H.remove_node(t)
-                                H.add_edge(ajacent_nodes[0], s)
-                                changed = True
-        return changed
-
-    while True:
-        if verbose:
-            print("Remaining nodes:", len(H.nodes()))
-        if not _remove_close_nodes():
-            break
-
-    if verbose:
-        print("Finished. Remaining nodes:", len(H.nodes()))
-
-    return H
-
-def remove_small_dangling(G, length=10, verbose=True):
-
-    H = copy.deepcopy(G)
-    edges = list(H.edges())
-    for (s,t) in edges:
-        d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
-        if d<length:
-            edge_count_s = len(H.edges(s))
-            edge_count_t = len(H.edges(t))
-            if edge_count_s==1:
-                H.remove_node(s)
-            if edge_count_t==1:
-                H.remove_node(t)
-
-    return H
-
-def merge_close_intersections(G, dist=10, verbose=True):
-
-    H = copy.deepcopy(G)
-    def _merge_close_intersections():
-        edges = list(H.edges())
-        changed = False
-        for (s,t) in edges:
-            d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2)
-            if d<dist:
-                if len(H.edges(s))>2 and len(H.edges(t))>2:
-                    ajacent_nodes = list(nx.neighbors(H, s))
-                    if t in ajacent_nodes:
-                        ajacent_nodes.remove(t)
-                    H.remove_node(s)
-                    for n in ajacent_nodes:
-                        H.add_edge(n, t)
-                    changed = True
-                else:
-                    pass
-        return changed
-
-    while True:
-        if verbose:
-            print("Remaining nodes:", len(H.nodes()))
-        if not _merge_close_intersections():
-            break
-
-    if verbose:
-        print("Finished. Remaining nodes:", len(H.nodes()))
-
-    return H
-
-def graph_from_skeleton(skeleton, angle_range=(135,225), dist_line=3,
-                        dist_node=10, verbose=True, max_passes=20, relabel=True):
-    """
-    Parameters
-    ----------
-    skeleton : numpy.ndarray
-        binary skeleton
-    angle_range : (min,max) in degree
-        two connected edges are merged into one if the angle between them
-        is in this range
-    dist_line : pixels
-        two connected edges are merged into one if the distance between
-        the central node to the line connecting the external nodes is
-        lower then this value.
-    dist_node : pixels
-        two nodes that are connected by an edge are "merged" if their distance is
-        lower than this value.
-    """
-    if verbose: print("Creation of densly connected graph.")
-    G = pixel_graph(skeleton)
-
-    for i in range(max_passes):
-
-        if verbose: print("Pass {}:".format(i))
-
-        n = len(G.nodes())
-
-        if verbose: print("\tFirst decimation of nodes.")
-        G = decimate_nodes_angle_distance(G, angle_range, dist_line, verbose)
-
-        if verbose: print("\tFirst removing close nodes.")
-        G = remove_close_nodes(G, dist_node, verbose)
-
-
-        if verbose: print("\tRemoving short danglings.")
-        G = remove_small_dangling(G, length=dist_node)
-
-        if verbose: print("\tMerging close intersections.")
-        G = merge_close_intersections(G, dist_node, verbose)
-
-        if n==len(G.nodes()):
-            break
-
-    if relabel:
-        mapping = dict(zip(G.nodes(), range(len(G.nodes()))))
-        G = nx.relabel_nodes(G, mapping)
-
-    return G
-
-
-# ------------------------------------
-# losses/cape/utils/graph_from_skeleton_3D.py
-# ------------------------------------
-import numpy as np
-import networkx as nx
-import time
-import copy
-
-def pixel_graph(skeleton):
-
-    _skeleton = copy.deepcopy(np.uint8(skeleton))
-    _skeleton[0,:,:] = 0
-    _skeleton[:,0,:] = 0
-    _skeleton[:,:,0] = 0
-    _skeleton[-1,:,:] = 0
-    _skeleton[:,-1,:] = 0
-    _skeleton[:,:,-1] = 0
-    G = nx.Graph()
-
-    # add one node for each active pixel
-    xs,ys,zs = np.where(_skeleton>0)
-    G.add_nodes_from([(int(x),int(y),int(z)) for i,(x,y,z) in enumerate(zip(xs,ys,zs))])
-
-    # add one edge between each adjacent active pixels
-    for (x,y,z) in G.nodes():
-        patch = _skeleton[x-1:x+2, y-1:y+2, z-1:z+2]
-        patch[1,1,1] = 0
-        for _x,_y,_z in zip(*np.where(patch>0)):
-            if not G.has_edge((x,y,z),(x+_x-1,y+_y-1,z+_z-1)):
-                G.add_edge((x,y,z),(x+_x-1,y+_y-1,z+_z-1))
-
-    for n,data in G.nodes(data=True):
-        data['pos'] = np.array(n)[::-1]
-
-    return G
-
-def compute_angle_degree(c, p0, p1):
-    p0c = np.sqrt((c[0]-p0[0])**2+(c[1]-p0[1])**2+(c[2]-p0[2])**2)
-    p1c = np.sqrt((c[0]-p1[0])**2+(c[1]-p1[1])**2+(c[2]-p1[2])**2)
-    p0p1 = np.sqrt((p1[0]-p0[0])**2+(p1[1]-p0[1])**2+(p1[2]-p0[2])**2)
-    return np.arccos((p1c*p1c+p0c*p0c-p0p1*p0p1)/(2*p1c*p0c))*180/np.pi
-    # cos_val = (p1c*p1c + p0c*p0c - p0p1*p0p1) / (2 * p1c * p0c)
-    ## clamp to [-1, 1] to guard against floating-point drift
-    # cos_val = np.clip(cos_val, -1.0, 1.0)
-    # angle_rad = np.arccos(cos_val)
-    # return angle_rad * 180.0 / np.pi
-
-def distance_point_line(c,p0,p1):
-    return np.linalg.norm(np.cross(p0-c, c-p1))/np.linalg.norm(p1-p0)
-
-def decimate_nodes_angle_distance(G, angle_range=(110,240), dist=0.3, verbose=True):
-
-    H = copy.deepcopy(G)
-
-    def f():
-        start = time.time()
-        nodes = list(H.nodes())
-        np.random.shuffle(nodes)
-        changed = False
-        for n in nodes:
-
-            ajacent_nodes = list(nx.neighbors(H, n))
-            if n in ajacent_nodes:
-                ajacent_nodes.remove(n)
-            if len(ajacent_nodes)==2:
-                angle = compute_angle_degree(n, *ajacent_nodes)
-                d = distance_point_line(np.array(n), np.array(ajacent_nodes[0]), np.array(ajacent_nodes[1]))
-                if d<dist or (angle>angle_range[0] and angle<angle_range[1]):
-                    H.remove_node(n)
-                    H.add_edge(*ajacent_nodes)
-                    changed = True
-        return changed
-
-    while True:
-        if verbose:
-            print("Remaining nodes:", len(H.nodes()))
-        if not f():
-            break
-
-    if verbose:
-        print("Finished. Remaining nodes:", len(H.nodes()))
-
-    return H
-
-def remove_close_nodes(G, dist=10, verbose=True):
-
-    H = copy.deepcopy(G)
-    def _remove_close_nodes():
-        edges = list(H.edges())
-        changed = False
-        for (s,t) in edges:
-            if H.has_node(s) and H.has_node(t):
-                d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2+(s[2]-t[2])**2)
-                if d<dist:
-                    if len(H.edges(s))==2:
-                        ajacent_nodes = list(nx.neighbors(H, s))
-                        if s in ajacent_nodes:
-                            ajacent_nodes.remove(s)
-                        if t in ajacent_nodes:
-                            ajacent_nodes.remove(t)
-                        if len(ajacent_nodes)==1:
-                            d = np.sqrt((s[0]-ajacent_nodes[0][0])**2+(s[1]-ajacent_nodes[0][1])**2+(s[2]-ajacent_nodes[0][2])**2)
-                            if d<dist:
-                                H.remove_node(s)
-                                H.add_edge(ajacent_nodes[0], t)
-                                changed = True
-                    elif len(H.edges(t))==2:
-                        ajacent_nodes = list(nx.neighbors(H, t))
-                        if s in ajacent_nodes:
-                            ajacent_nodes.remove(s)
-                        if t in ajacent_nodes:
-                            ajacent_nodes.remove(t)
-                        if len(ajacent_nodes)==1:
-                            d = np.sqrt((t[0]-ajacent_nodes[0][0])**2+(t[1]-ajacent_nodes[0][1])**2+(t[2]-ajacent_nodes[0][2])**2)
-                            if d<dist:
-                                H.remove_node(t)
-                                H.add_edge(ajacent_nodes[0], s)
-                                changed = True
-        return changed
-
-    while True:
-        if verbose:
-            print("Remaining nodes:", len(H.nodes()))
-        if not _remove_close_nodes():
-            break
-
-    if verbose:
-        print("Finished. Remaining nodes:", len(H.nodes()))
-
-    return H
-
-def remove_small_dangling(G, length=10, verbose=True):
-
-    H = copy.deepcopy(G)
-    edges = list(H.edges())
-    for (s,t) in edges:
-        d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2+(s[2]-t[2])**2)
-        if d<length:
-            edge_count_s = len(H.edges(s))
-            edge_count_t = len(H.edges(t))
-            if edge_count_s==1:
-                H.remove_node(s)
-            if edge_count_t==1:
-                H.remove_node(t)
-
-    return H
-
-def merge_close_intersections(G, dist=10, verbose=True):
-
-    H = copy.deepcopy(G)
-    def _merge_close_intersections():
-        edges = list(H.edges())
-        changed = False
-        for (s,t) in edges:
-            d = np.sqrt((s[0]-t[0])**2+(s[1]-t[1])**2+(s[2]-t[2])**2)
-            if d<dist:
-                if len(H.edges(s))>2 and len(H.edges(t))>2:
-                    ajacent_nodes = list(nx.neighbors(H, s))
-                    if t in ajacent_nodes:
-                        ajacent_nodes.remove(t)
-                    H.remove_node(s)
-                    for n in ajacent_nodes:
-                        H.add_edge(n, t)
-                    changed = True
-                else:
-                    pass
-        return changed
-
-    while True:
-        if verbose:
-            print("Remaining nodes:", len(H.nodes()))
-        if not _merge_close_intersections():
-            break
-
-    if verbose:
-        print("Finished. Remaining nodes:", len(H.nodes()))
-
-    return H
-
-def graph_from_skeleton(skeleton, angle_range=(135,225), dist_line=3,
-                        dist_node=10, verbose=True, max_passes=20, relabel=True):
-    """
-    Parameters
-    ----------
-    skeleton : numpy.ndarray
-        binary skeleton
-    angle_range : (min,max) in degree
-        two connected edges are merged into one if the angle between them
-        is in this range
-    dist_line : pixels
-        two connected edges are merged into one if the distance between
-        the central node to the line connecting the external nodes is
-        lower then this value.
-    dist_node : pixels
-        two nodes that are connected by an edge are "merged" if their distance is
-        lower than this value.
-    """
-    if verbose: print("Creation of densly connected graph.")
-    G = pixel_graph(skeleton)
-
-    for i in range(max_passes):
-
-        if verbose: print("Pass {}:".format(i))
-
-        n = len(G.nodes())
-
-        if verbose: print("\tFirst decimation of nodes.")
-        G = decimate_nodes_angle_distance(G, angle_range, dist_line, verbose)
-
-        if verbose: print("\tFirst removing close nodes.")
-        G = remove_close_nodes(G, dist_node, verbose)
-
-
-        if verbose: print("\tRemoving short danglings.")
-        G = remove_small_dangling(G, length=dist_node)
-
-        if verbose: print("\tMerging close intersections.")
-        G = merge_close_intersections(G, dist_node, verbose)
-
-        if n==len(G.nodes()):
-            break
-
-    if relabel:
-        mapping = dict(zip(G.nodes(), range(len(G.nodes()))))
-        G = nx.relabel_nodes(G, mapping)
-
-    return G
-
-
-# ------------------------------------
-# losses/cape/utils/crop_graph.py
-# ------------------------------------
-import numpy as np
-from shapely.geometry import box, LineString, Point
-import networkx as nx
-
-def crop_graph_2D(graph, xmin, ymin, xmax, ymax, precision=8):
-    
-    bounding_box = box(xmin, ymin, xmax, ymax)
-    
-    cropped_graph = nx.Graph()
-    node_positions = {}      
-    inside_nodes = {}        
-    coord_to_node = {}      
-    
-    for n, data in graph.nodes(data=True):
-        pos = data['pos']
-        node_positions[n] = pos
-        x, y = pos
-        if xmin <= x <= xmax and ymin <= y <= ymax:
-            new_pos = (x - xmin, y - ymin)
-            inside_nodes[n] = new_pos
-            cropped_graph.add_node(n, pos=new_pos)
-    
-            key = (round(new_pos[0], precision), round(new_pos[1], precision))
-            coord_to_node[key] = n
-    
-    max_node_index = max(graph.nodes()) if graph.nodes else 0
-
-    for u, v, data in graph.edges(data=True):
-        u_pos = node_positions[u]
-        v_pos = node_positions[v]
-        line = LineString([u_pos, v_pos])
-        
-        if u in inside_nodes and v in inside_nodes:
-            if u != v:
-                cropped_graph.add_edge(u, v, **data)
-            continue
-        
-        if not bounding_box.intersects(line):
-            continue
-
-        intersection = bounding_box.intersection(line)
-        if intersection.is_empty:
-            continue
-
-        if intersection.geom_type == 'Point':
-            pts = [(intersection.x, intersection.y)]
-        elif intersection.geom_type == 'MultiPoint':
-            pts = [(pt.x, pt.y) for pt in intersection.geoms]
-        elif intersection.geom_type == 'LineString':
-            pts = list(intersection.coords)
-        else:
-            continue
-
-        pts.sort(key=lambda pt: line.project(Point(pt)))
-        
-        new_nodes = []
-        for pt in pts:
-            new_pos = (pt[0] - xmin, pt[1] - ymin)
-            key = (round(new_pos[0], precision), round(new_pos[1], precision))
-            if key in coord_to_node:
-                node_id = coord_to_node[key]
-            else:
-                max_node_index += 1
-                node_id = max_node_index
-                cropped_graph.add_node(node_id, pos=new_pos)
-                coord_to_node[key] = node_id
-            new_nodes.append(node_id)
-        
-        endpoints = []
-        if u in inside_nodes:
-            endpoints.append(u)
-        endpoints.extend(new_nodes)
-        if v in inside_nodes:
-            endpoints.append(v)
-
-        for i in range(len(endpoints) - 1):
-            if endpoints[i] != endpoints[i+1]:
-                cropped_graph.add_edge(endpoints[i], endpoints[i+1], **data)
-    
-    return cropped_graph
-
-
-def crop_graph_3D(graph, xmin, ymin, zmin, xmax, ymax, zmax, precision=8):
-    
-    def _to_voxel(u, lo, hi):
-        v = int(np.floor(u - lo))          
-        return max(0, min(v, hi - lo - 1)) 
-
-    def _segment_box_intersections(p0, p1):
-
-        pts = []
-        (x0, y0, z0), (x1, y1, z1) = p0, p1
-        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-
-        for plane, (k0, k1, p) in (
-            ("x", (x0, dx, xmin)), ("x", (x0, dx, xmax)),
-            ("y", (y0, dy, ymin)), ("y", (y0, dy, ymax)),
-            ("z", (z0, dz, zmin)), ("z", (z0, dz, zmax)),
-        ):
-            k0, dk, plane_val = k0, k1, p
-            if dk == 0:                        
-                continue
-            t = (plane_val - k0) / dk
-            if 0 < t < 1:                      
-                x = x0 + t * dx
-                y = y0 + t * dy
-                z = z0 + t * dz
-                if xmin - 1e-6 <= x <= xmax + 1e-6 and \
-                ymin - 1e-6 <= y <= ymax + 1e-6 and \
-                zmin - 1e-6 <= z <= zmax + 1e-6:
-                    pts.append((x, y, z))
-
-        pts.sort(key=lambda pt: (pt[0]-x0)**2 + (pt[1]-y0)**2 + (pt[2]-z0)**2)
-        return pts
-
-    cropped = nx.Graph()
-    inside_nodes, pos_cache, coord2id = {}, {}, {}
-
-    for n, d in graph.nodes(data=True):
-        x, y, z = d["pos"]
-        pos_cache[n] = (x, y, z)
-        if xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax:
-            vx, vy, vz = (_to_voxel(x, xmin, xmax),
-                        _to_voxel(y, ymin, ymax),
-                        _to_voxel(z, zmin, zmax))
-            
-            inside_nodes[n] = (vx, vy, vz)
-            cropped.add_node(n, pos=inside_nodes[n])
-            coord2id[(vx, vy, vz)] = n
-
-    next_id = (max(graph.nodes()) if graph.nodes else 0) + 1
-
-    for u, v, edata in graph.edges(data=True):
-        p0, p1 = pos_cache[u], pos_cache[v]
-
-        if (u not in inside_nodes) and (v not in inside_nodes):
-
-            if (p0[0] < xmin and p1[0] < xmin) or (p0[0] > xmax and p1[0] > xmax) \
-            or (p0[1] < ymin and p1[1] < ymin) or (p0[1] > ymax and p1[1] > ymax) \
-            or (p0[2] < zmin and p1[2] < zmin) or (p0[2] > zmax and p1[2] > zmax):
-                continue
-
-        split_pts = _segment_box_intersections(p0, p1)
-
-        node_chain = []
-        if u in inside_nodes:
-            node_chain.append(u)
-
-        for pt in split_pts:
-            
-            vz = _to_voxel(pt[2], zmin, zmax)
-            vy = _to_voxel(pt[1], ymin, ymax)
-            vx = _to_voxel(pt[0], xmin, xmax)
-        
-            key = (vx, vy, vz)
-            if key in coord2id:
-                node_id = coord2id[key]
-            else:
-                node_id = next_id
-                next_id += 1
-                cropped.add_node(node_id, pos=(vx, vy, vz))
-                coord2id[key] = node_id
-            node_chain.append(node_id)
-
-        if v in inside_nodes:
-            node_chain.append(v)
-
-        for a, b in zip(node_chain[:-1], node_chain[1:]):
-            if a != b:
-                cropped.add_edge(a, b, **edata)
-
+            starts.append(int(rng.randint(0, int(m))))  # RandomState or random.Random
+    return np.asarray(starts, dtype=int)
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+
+def bigger_crop(
+    data: Dict[str, np.ndarray],
+    patch_size: Sequence[int],
+    *,
+    pad_mode: str = "edge",
+    rng: random.Random | np.random.RandomState | np.random.Generator | None = None,
+) -> Dict[str, np.ndarray]:
+    rng = rng or np.random.default_rng()
+    dim = len(patch_size)
+
+    _, has_ch = _channel_flags_and_spatial_shape(data, dim)
+    pad, big = _compute_sizes(dim, patch_size)
+    pad_spatial = [(int(p), int(p)) for p in pad]
+
+    # Pad spatial dims
+    padded = {}
+    for k, v in data.items():
+        pad_cfg = pad_spatial if not has_ch[k] else [(0, 0)] + pad_spatial
+        padded[k] = np.pad(v, pad_cfg, mode=pad_mode)
+
+    # One random crop applied to all modalities
+    spatial_full = padded[next(iter(padded))].shape[-dim:]
+    start = _random_start(rng, spatial_full, big)
+    end = start + big
+    spatial_slice = tuple(slice(int(s), int(e)) for s, e in zip(start, end))
+
+    cropped = {}
+    for k, v in padded.items():
+        full_slice = (slice(None),) + spatial_slice if has_ch[k] else spatial_slice
+        cropped[k] = v[full_slice]
     return cropped
 
 
+def center_crop(
+    data: Dict[str, np.ndarray],
+    patch_size: Sequence[int],
+) -> Dict[str, np.ndarray]:
+    dim = len(patch_size)
+    _, has_ch = _channel_flags_and_spatial_shape(data, dim)
+    patch_sz_arr = np.asarray(patch_size, dtype=int)
+
+    out = {}
+    for k, v in data.items():
+        spatial_shape = np.array(v.shape[-dim:])
+        extra = spatial_shape - patch_sz_arr
+        if np.any(extra < 0):
+            raise ValueError("`patch_size` larger than input along some axis.")
+        offset = extra // 2
+        spatial_slice = tuple(slice(int(o), int(o + p)) for o, p in zip(offset, patch_sz_arr))
+        full_slice = (slice(None),) + spatial_slice if has_ch[k] else spatial_slice
+        out[k] = v[full_slice]
+    return out
+
+
+# ------------------------------------
+# core/general_dataset/patch_validity.py
+# ------------------------------------
+from typing import Any, Dict, List, Optional
+import numpy as np
+from core.general_dataset.logger import logger
+
+
+def check_min_thrsh_road(label_patch: np.ndarray, patch_size, threshold) -> bool:
+    """
+    Check if the label patch has at least a minimum percentage of road pixels.
+
+    Args:
+        label_patch (np.ndarray): The label patch.
+    
+    Returns:
+        bool: True if the patch meets the minimum threshold; False otherwise.
+    """
+    patch = label_patch
+    if patch.max() > 1:
+        patch = (patch > 127).astype(np.uint8)
+    road_percentage = np.sum(patch) / (patch_size * patch_size)
+    return road_percentage >= threshold
+
+
+def check_small_window(image_patch: np.ndarray, small_window_size) -> bool:
+    """
+    Check that no small window in the image patch is entirely black or white.
+
+    Args:
+        image_patch (np.ndarray): Input patch (H x W) or (C x H x W)
+
+    Returns:
+        bool: True if valid, False if any window is all black or white.
+    """
+    sw = small_window_size
+
+    # Ensure image has shape (C, H, W)
+    if image_patch.ndim == 2:
+        image_patch = image_patch[None, :, :]  # Add channel dimension
+
+    C, H, W = image_patch.shape
+    if H < sw or W < sw:
+        return False
+
+    # Set thresholds
+    max_val = image_patch.max()
+    if max_val > 1.0:
+        high_thresh = 255
+        low_thresh = 0
+    else:
+        high_thresh = 255 / 255.0
+        low_thresh = 0 / 255.0
+
+    # Slide window over spatial dimensions
+    for c in range(C):
+        for y in range(0, H - sw + 1):
+            for x in range(0, W - sw + 1):
+                window = image_patch[c, y:y + sw, x:x + sw]
+                window_var = np.var(window)
+                if window_var < 0.01:
+                    return False
+                # print(window)
+                if np.all(window >= high_thresh):
+                    return False  # Found an all-white window
+                if np.all(window <= low_thresh):
+                    return False  # Found an all-black window
+
+    return True  # All windows passed
+
+
+
+
+# ------------------------------------
+# core/general_dataset/io.py
+# ------------------------------------
+from pathlib import Path
+from typing import Optional
+import numpy as np
+import rasterio
+import logging
+import warnings
+from rasterio.errors import NotGeoreferencedWarning
+import torch
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
+logger = logging.getLogger(__name__)
+
+def load_array_from_file(file_path: str) -> Optional[np.ndarray]:
+    """
+    Load an array from disk. Supports:
+      - .npy      → numpy.load
+      - .tif/.tiff → rasterio.open + read
+    Returns:
+      np.ndarray on success, or None if the file cannot be read.
+    """
+    path = Path(file_path)
+    ext = path.suffix.lower()
+    
+    loaders = {
+        '.npy': lambda p: np.load(p),
+        '.tif': lambda p: rasterio.open(p).read().astype(np.float32),
+        '.tiff': lambda p: rasterio.open(p).read().astype(np.float32),
+    }
+    
+    loader = loaders.get(ext)
+    if loader is None:
+        logger.warning("Unsupported file extension '%s' for %s", ext, file_path)
+        return None
+
+    try:
+        return loader(str(path))
+    except Exception as e:
+        # logger.warning("Failed to load '%s': %s", file_path, e)
+        return None
+    
+def to_tensor(obj):
+    """Convert numpy ↦ torch (shared memory) but keep others unchanged."""
+    if isinstance(obj, np.ndarray):
+        return torch.from_numpy(obj)          # 0-copy, preserves shape/dtype
+    return obj
+
+# ------------------------------------
+# core/general_dataset/__init__.py
+# ------------------------------------
+# core/general_dataset/__init__.py
+
+from .base    import GeneralizedDataset
+from .collate import custom_collate_fn, worker_init_fn
+
+# Optionally, define __all__
+__all__ = [
+    "GeneralizedDataset",
+    "custom_collate_fn",
+    "worker_init_fn",
+]
+
+
+# ------------------------------------
+# core/general_dataset/visualizations.py
+# ------------------------------------
+from typing import Any, Dict, List, Optional
+import matplotlib.pyplot as plt
+import numpy as np
+
+def visualize_batch_2d(batch: Dict[str, Any], num_per_batch: Optional[int] = None) -> None:
+    """
+    Visualizes patches in a batch: image, label, distance, and SDF (if available).
+
+    Args:
+        batch (Dict[str, Any]): Dictionary containing batched patches.
+        num_per_batch (Optional[int]): Maximum number of patches to visualize.
+    """
+    print('batch["image_patch"].shape:', batch["image_patch"].shape)
+    num_to_plot = batch["image_patch"].shape[0]
+    if num_per_batch:
+        num_to_plot = min(num_to_plot, num_per_batch)
+    for i in range(num_to_plot):
+        sample_image = batch["image_patch"][i].numpy()
+        if sample_image.shape[0] == 3:  # CHW to HWC
+            sample_image = sample_image.transpose(1, 2, 0)
+        elif sample_image.shape[0] == 1:
+            sample_image = sample_image[0]  # grayscale
+        else:
+            sample_image = sample_image.transpose(1, 2, 0)
+
+        sample_label = np.squeeze(batch["label_patch"][i].numpy())
+        sample_distance = batch["distance_patch"][i].numpy() if "distance_patch" in batch else None
+        sample_sdf = batch["sdf_patch"][i].numpy() if "sdf_patch" in batch else None
+
+        print(f'Patch {i}')
+        print('  image:', sample_image.min(), sample_image.max())
+        print('  label:', sample_label.min(), sample_label.max())
+        if sample_distance is not None:
+            print('  distance:', sample_distance.min(), sample_distance.max())
+        if sample_sdf is not None:
+            print('  sdf:', sample_sdf.min(), sample_sdf.max())
+
+        num_subplots = 3 + (1 if sample_sdf is not None else 0)
+        fig, axs = plt.subplots(1, num_subplots, figsize=(12, 4))
+        axs[0].imshow(sample_image, cmap='gray' if sample_image.ndim == 2 else None)
+        axs[0].set_title("Image")
+        axs[0].axis("off")
+        axs[1].imshow(sample_label, cmap='gray')
+        axs[1].set_title("Label")
+        axs[1].axis("off")
+        if sample_distance is not None:
+            axs[2].imshow(sample_distance[0], cmap='gray')
+            axs[2].set_title("Distance")
+            axs[2].axis("off")
+        else:
+            axs[2].text(0.5, 0.5, "No Distance", ha='center', va='center')
+            axs[2].axis("off")
+        if sample_sdf is not None:
+            axs[3].imshow(sample_sdf[0], cmap='coolwarm')
+            axs[3].set_title("SDF")
+            axs[3].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+
+def visualize_batch_3d(
+    batch: Dict[str, Any],
+    slice_dim: int = 2
+) -> None:
+    """
+    Visualizes 3D patches in a batch by projecting along the Z axis.
+    
+    Args:
+        batch: dict with keys image_patch, label_patch, etc., each a Tensor [B,C,Z,H,W] or [B,Z,H,W]
+        projection: one of "max", "min", "mean"
+        num_per_batch: how many samples to plot
+    """
+    images = batch["image_patch"]
+    distlbls = batch["distance_patch"]
+    lbls = batch["label_patch"]
+
+    for img, distlbl, lbl in zip(images, distlbls, lbls):
+        # Projections
+        img_proj  = img[0].numpy().max(slice_dim)
+        dist_proj = distlbl[0].numpy().min(slice_dim)
+        lbl_proj  = lbl[0].numpy().max(slice_dim)
+
+        # Plot side by side images
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        for ax, proj, title in zip(
+            axes[:3],
+            (img_proj, dist_proj, lbl_proj),
+            ("Image Projection", "Distance Map", "Label Projection"),
+        ):
+            ax.imshow(proj)
+            ax.set_title(title)
+            ax.axis("off")
+        
+        # Compute stats
+        stats = {
+            'Image': (img_proj.min(), img_proj.max(), img_proj.mean()),
+            'Distance': (dist_proj.min(), dist_proj.max(), dist_proj.mean()),
+            'Label': (lbl_proj.min(), lbl_proj.max(), lbl_proj.mean()),
+        }
+        print(stats)
+        # Bar chart of stats
+        categories = list(stats.keys())
+        mins = [stats[k][0] for k in categories]
+        maxs = [stats[k][1] for k in categories]
+        means = [stats[k][2] for k in categories]
+        
+        x = np.arange(len(categories))
+        width = 0.2
+        
+        ax_stats = axes[3]
+        ax_stats.bar(x - width, mins,    width, label='Min')
+        ax_stats.bar(x,         means,  width, label='Mean')
+        ax_stats.bar(x + width, maxs,    width, label='Max')
+        ax_stats.set_xticks(x)
+        ax_stats.set_xticklabels(categories)
+        ax_stats.set_title('Min/Mean/Max per Projection')
+        ax_stats.legend()
+        ax_stats.grid(True, linestyle='--', alpha=0.5)
+
+        plt.tight_layout()
+        plt.show()
 
 # ------------------------------------
 # models/base_models.py
