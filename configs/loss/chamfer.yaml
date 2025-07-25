@@ -5,16 +5,10 @@ primary_loss:
   path: "losses.chamfer_class"
   class: "ChamferBoundarySDFLoss"
   params:
-    pixel_weight:      1.0      # weight of the L1 term
-    chamfer_weight:    1.0      # overall scale of the injected gradient
-    update_scale:      10.0     # multiplier inside make_dSDF
-    dist_threshold:    2.0      # max pairing distance in pixels
-    max_points:        2048     # subsample number of zero‐crossings
-    normalize_normals: false    # whether to re‐normalize normals in dSDF
-    use_hook:          true     # register the backward hook
-    clip_sdf_to:       null     # no clipping of raw SDF values
-    clip_dSDF:         null     # no clipping of the injected gradient
-
+    weight_sdf:      0.0     # multiplier inside make_dSDF
+    weight_chamfer:  1.0      # max pairing distance in pixels
+    update_scale:    1.0      # weight of the L1 term
+    dist_threshold:  3
   # path: "losses.weighted_mse"
   # class: "WeightedMSELoss"
   # params:
@@ -38,7 +32,7 @@ primary_loss:
 #     pixel_weight: 1.0          # weight for the “pixel” term
 
 ## Mixing parameters
-alpha: 0.1  # Weight for the secondary loss 
+alpha: 1  # Weight for the secondary loss 
 start_epoch: 0  # Epoch to start using the secondary loss
 
 

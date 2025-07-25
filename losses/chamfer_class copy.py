@@ -297,10 +297,15 @@ def make_dSDF(pred_sdf: torch.Tensor,
         w11 = dr * dc
 
         # accumulation
-        dSDF.index_put_((r0, c0), dot_val * w00, accumulate=True)
-        dSDF.index_put_((r0, c1), dot_val * w01, accumulate=True)
-        dSDF.index_put_((r1, c0), dot_val * w10, accumulate=True)
-        dSDF.index_put_((r1, c1), dot_val * w11, accumulate=True)
+        incr00 = (dot_val * w00).to(dSDF.dtype)
+        incr01 = (dot_val * w01).to(dSDF.dtype)
+        incr10 = (dot_val * w10).to(dSDF.dtype)
+        incr11 = (dot_val * w11).to(dSDF.dtype)
+
+        dSDF.index_put_((r0, c0), incr00, accumulate=True)
+        dSDF.index_put_((r0, c1), incr01, accumulate=True)
+        dSDF.index_put_((r1, c0), incr10, accumulate=True)
+        dSDF.index_put_((r1, c1), incr11, accumulate=True)
 
     if clip_val is not None:
         dSDF = torch.clamp(dSDF, -clip_val, clip_val)
