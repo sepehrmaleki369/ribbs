@@ -5,10 +5,8 @@ primary_loss:
   path: "losses.chamfer_loss"
   class: "SDFChamferLoss"
   params:
-    weight_sdf:      0.0     # multiplier inside make_dSDF
-    weight_chamfer:  1.0      # max pairing distance in pixels
-    update_scale:    1.0      # weight of the L1 term
-    dist_threshold:  3
+    weight_sdf:  1.0      # max pairing distance in pixels
+    weight_chamfer:    1.0      # weight of the L1 term
   # path: "losses.weighted_mse"
   # class: "WeightedMSELoss"
   # params:
