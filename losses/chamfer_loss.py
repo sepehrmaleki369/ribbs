@@ -145,20 +145,23 @@ class SDFChamferLoss(nn.Module):
         self.w_sdf  = float(weight_sdf)
         self.w_ch   = float(weight_chamfer)
 
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # y_pred, y_true: [B,1,H,W]
+    def forward(self, y_pred, y_true):
         pred = y_pred.squeeze(1)
         gt   = y_true.squeeze(1)
-
         total = 0.0
         for p, g in zip(pred, gt):
-            pred_zc = extract_zero_crossings_interpolated_positions(p)
-            gt_zc   = extract_zero_crossings_interpolated_positions(g)
+            p_zc = extract_zero_crossings_interpolated_positions(p)
+            g_zc = extract_zero_crossings_interpolated_positions(g)
 
-            loss_chamfer = torch.abs(compute_chamfer_distance(pred_zc, gt_zc))
-            loss_sdf     = F.l1_loss(p, g)
+            # if either set is empty, skip it
+            if p_zc.numel() == 0 or g_zc.numel() == 0:
+                loss_ch = 0.0
+            else:
+                cd = compute_chamfer_distance(p_zc, g_zc)
+                loss_ch = torch.abs(cd)
 
-            total += self.w_ch * loss_chamfer + self.w_sdf * loss_sdf
+            loss_sdf = F.l1_loss(p, g)
+            total += self.w_ch * loss_ch + self.w_sdf * loss_sdf
 
         return total / pred.size(0)
 
