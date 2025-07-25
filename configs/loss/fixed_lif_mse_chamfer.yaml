@@ -25,8 +25,8 @@ primary_loss:
 
 # # Secondary loss (activated after start_epoch)
 secondary_loss:
-  path: "losses.chamfer_class"
-  class: "ChamferBoundarySDFLoss"
+  path: "losses.chamfer_loss"
+  class: "SDFChamferLoss"
   params:
     update_scale:      1000.0     # multiplier inside make_dSDF
     dist_threshold:    1.5      # max pairing distance in pixels

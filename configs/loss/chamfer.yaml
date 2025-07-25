@@ -2,8 +2,8 @@
 
 # Primary loss (used from the beginning)
 primary_loss:
-  path: "losses.chamfer_class"
-  class: "ChamferBoundarySDFLoss"
+  path: "losses.chamfer_loss"
+  class: "SDFChamferLoss"
   params:
     weight_sdf:      0.0     # multiplier inside make_dSDF
     weight_chamfer:  1.0      # max pairing distance in pixels

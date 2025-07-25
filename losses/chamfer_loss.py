@@ -125,6 +125,8 @@ def manual_chamfer_grad(pred_sdf: torch.Tensor,
                         dist_threshold: float = 3.0) -> torch.Tensor:
     """Pixel‑wise gradient used by the first (toy) base notebook."""
     dSDF = torch.zeros_like(pred_sdf)
+    if pred_zc.numel() == 0 or gt_zc.numel() == 0:
+        return dSDF
 
     normals = compute_normals(pred_sdf)
     n_at_p  = sample_normals_at_positions(normals, pred_zc)  # N×2
