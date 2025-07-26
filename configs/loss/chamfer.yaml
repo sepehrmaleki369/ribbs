@@ -5,8 +5,16 @@ primary_loss:
   path: "losses.chamfer_loss"
   class: "SDFChamferLoss"
   params:
-    weight_sdf:  1.0      # max pairing distance in pixels
-    weight_chamfer:    1.0      # weight of the L1 term
+    weight_sdf:          1.0
+    band:                0          # disable band filtering (or e.g. 3.0)
+    use_squared:         false      # L2² vs. L2 distances
+    update_scale:        1.0        # strength of the pseudo‑gradient
+    normalize_normals:   true       # unit‑norm before projection
+    iso:                 0.0        # iso‐surface value
+    eps:                 1e-3       # width for capturing exact zeros
+
+
+
   # path: "losses.weighted_mse"
   # class: "WeightedMSELoss"
   # params:

@@ -12,7 +12,7 @@ inference_config: "chunk.yaml"
 callbacks_config: "callbacks_2d.yaml"
 
 # Output directory
-output_dir: "runs/base_sdf_lif_mse_chamfer_smoke_test"
+output_dir: "outputs/base_sdf_lif_mse_chamfer_smoke_test"
 
 # Trainer configuration
 trainer:

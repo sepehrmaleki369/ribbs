@@ -28,16 +28,41 @@ secondary_loss:
   path: "losses.chamfer_loss"
   class: "SDFChamferLoss"
   params:
-    update_scale:      1000.0     # multiplier inside make_dSDF
-    dist_threshold:    1.5      # max pairing distance in pixels
-    pixel_loss_weight: 0.0      # weight of the L1 term
-    fallback_zero_value: 'zero'
-    max_gt_zc: 20000
-    use_cpu_on_oom: True
+    weight_sdf:          1.0
+    band:                null       # disable band filtering (or e.g. 3.0)
+    use_squared:         false      # L2² vs. L2 distances
+    update_scale:        1.0        # strength of the pseudo‑gradient
+    normalize_normals:   true       # unit‑norm before projection
+    iso:                 0.0        # iso‐surface value
+    eps:                 1e-3       # width for capturing exact zeros
+
 
 ## Mixing parameters
-alpha: 100  # Weight for the secondary loss 
+alpha: 0.1  # Weight for the secondary loss 
 start_epoch: 0  # Epoch to start using the secondary loss
+
+
+
+# primary_loss:
+#   path: "losses.fixed_lif_weighted_mse"
+#   class: "FixedLUTWeightedMSELoss"
+#   params:
+#     sdf_min: -7
+#     sdf_max: 7.0
+#     n_bins: 15
+#     reduction: "mean"
+#     lut_path: "weights/mass_7_lif_weights.pt"
+
+# secondary_loss:
+#   path: "losses.chamfer_loss"
+#   class: "SDFChamferLoss"
+#   params:
+#     weight_sdf:  1.0     
+#     weight_chamfer:    1.0     
+
+# ## Mixing parameters
+# alpha: 1  # Weight for the secondary loss 
+# start_epoch: 0  # Epoch to start using the secondary loss
 
 
 

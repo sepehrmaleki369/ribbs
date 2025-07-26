@@ -1,177 +1,244 @@
+from __future__ import annotations
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+from typing import Tuple, Optional
+import torch, torch.nn as nn, torch.nn.functional as F
 
-# =============================== Helpers (exact copies) ===============================
+# ---------------------------- helpers ----------------------------
 
-def sample_pred_at_positions(pred, positions):
-    r = positions[:, 0]
-    c = positions[:, 1]
-    r0 = r.floor().long(); c0 = c.floor().long()
-    r1 = r0 + 1;           c1 = c0 + 1
-    dr = (r - r0.float()).unsqueeze(1)
-    dc = (c - c0.float()).unsqueeze(1)
-    H, W = pred.shape
-    r0 = r0.clamp(0, H - 1); r1 = r1.clamp(0, H - 1)
-    c0 = c0.clamp(0, W - 1); c1 = c1.clamp(0, W - 1)
-    Ia = pred[r0, c0].unsqueeze(1)
-    Ib = pred[r0, c1].unsqueeze(1)
-    Ic = pred[r1, c0].unsqueeze(1)
-    Id = pred[r1, c1].unsqueeze(1)
-    return (Ia*(1-dr)*(1-dc) + Ib*(1-dr)*dc + Ic*dr*(1-dc) + Id*dr*dc).squeeze(1)
+def _prep_sdf(t: torch.Tensor) -> torch.Tensor:
+    if t.dim() == 4:  # [B,1,H,W]
+        return t.squeeze(1)
+    if t.dim() == 3:  # [B,H,W]
+        return t
+    raise ValueError(f"Expected [B,1,H,W] or [B,H,W], got {t.shape}")
 
-def compute_normals(sdf):
+
+def _zero_crossings_lin_interp(
+    sdf: torch.Tensor,
+    iso: float = 0.0,
+    eps: float = 1e-3,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sub‑pixel iso-surface extraction along rows/cols.
+    Count a crossing if:
+      • sign change OR
+      • either endpoint within ±eps of iso.
+    Returns:
+        P : (K,3) -> [b, row, col]
+        counts : (B,)
+    """
+    sdf = sdf - iso
+    B, H, W = sdf.shape
+    dev = sdf.device
+    sign = torch.sign(sdf)
+
+    def _interp_axis(a1, a2, axis):
+        # a1,a2 : tensors sharing B except along 'axis'
+        # axis=0 (vertical) => rows interp; axis=1 (horizontal) => cols interp
+        denom = (a1.abs() + a2.abs()).clamp_min(1e-8)
+        alpha = (a1.abs() / denom).clamp(0.0, 1.0)
+        return alpha
+
+    # vertical (rows)
+    s1v, s2v = sign[:, :-1, :], sign[:, 1:, :]
+    v1,  v2  = sdf[:, :-1, :],  sdf[:, 1:, :]
+    mask_v = ((s1v * s2v) < 0) | (v1.abs() <= eps) | (v2.abs() <= eps)
+    alpha_v = _interp_axis(v1, v2, axis=0)
+    r_v = torch.arange(H - 1, device=dev, dtype=torch.float32).view(1, -1, 1).expand(B, -1, W)
+    c_v = torch.arange(W,     device=dev, dtype=torch.float32).view(1, 1, -1).expand(B, H - 1, -1)
+    rows_v = r_v + alpha_v
+    cols_v = c_v
+
+    # horizontal (cols)
+    s1h, s2h = sign[:, :, :-1], sign[:, :, 1:]
+    v1h, v2h = sdf[:, :, :-1],  sdf[:, :, 1:]
+    mask_h = ((s1h * s2h) < 0) | (v1h.abs() <= eps) | (v2h.abs() <= eps)
+    alpha_h = _interp_axis(v1h, v2h, axis=1)
+    r_h = torch.arange(H, device=dev, dtype=torch.float32).view(1, -1, 1).expand(B, H, W - 1)
+    c_h = torch.arange(W - 1, device=dev, dtype=torch.float32).view(1, 1, -1).expand(B, H, -1)
+    rows_h = r_h
+    cols_h = c_h + alpha_h
+
+    def _pack(mask, rows, cols):
+        idx = mask.nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return torch.empty(0, 3, device=dev), torch.zeros(B, dtype=torch.long, device=dev)
+        b = idx[:, 0]
+        r = rows[idx[:, 0], idx[:, 1], idx[:, 2]]
+        c = cols[idx[:, 0], idx[:, 1], idx[:, 2]]
+        pts = torch.stack([b.float(), r, c], dim=1)
+        cnt = torch.bincount(b, minlength=B)
+        return pts, cnt
+
+    Pv, cnt_v = _pack(mask_v, rows_v, cols_v)
+    Ph, cnt_h = _pack(mask_h, rows_h, cols_h)
+
+    return torch.cat([Pv, Ph], dim=0), cnt_v + cnt_h
+
+
+def _compute_normals(sdf: torch.Tensor) -> torch.Tensor:
     H, W = sdf.shape
-    grad_row = torch.zeros_like(sdf)
-    grad_col = torch.zeros_like(sdf)
-    sdf_smoothed = sdf
-    grad_row[1:-1]   = (sdf_smoothed[2:]   - sdf_smoothed[:-2]) / 2.0
-    grad_col[:,1:-1] = (sdf_smoothed[:,2:] - sdf_smoothed[:,:-2]) / 2.0
-    grad_row[0]      =  sdf_smoothed[1]  - sdf_smoothed[0]
-    grad_row[-1]     =  sdf_smoothed[-1] - sdf_smoothed[-2]
-    grad_col[:,0]    =  sdf_smoothed[:,1] - sdf_smoothed[:,0]
-    grad_col[:,-1]   =  sdf_smoothed[:,-1]- sdf_smoothed[:,-2]
-    return torch.stack([grad_row, grad_col], dim=2)
+    grad_r = torch.zeros_like(sdf)
+    grad_c = torch.zeros_like(sdf)
+    grad_r[1:-1] = (sdf[2:] - sdf[:-2]) * 0.5
+    grad_r[0]    = sdf[1] - sdf[0]
+    grad_r[-1]   = sdf[-1] - sdf[-2]
+    grad_c[:, 1:-1] = (sdf[:, 2:] - sdf[:, :-2]) * 0.5
+    grad_c[:, 0]    = sdf[:, 1] - sdf[:, 0]
+    grad_c[:, -1]   = sdf[:, -1] - sdf[:, -2]
+    return torch.stack([grad_r, grad_c], dim=-1)
 
-def sample_normals_at_positions(normals, positions, normalize=True):
+
+def _sample_normals(normals: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     H, W, _ = normals.shape
-    r = positions[:, 0]; c = positions[:, 1]
-    r0 = r.floor().long(); c0 = c.floor().long()
-    r1 = r0 + 1;           c1 = c0 + 1
+    r, c = pos[:, 0], pos[:, 1]
+    r0 = r.floor().long().clamp(0, H - 1)
+    c0 = c.floor().long().clamp(0, W - 1)
+    r1 = (r0 + 1).clamp(0, H - 1)
+    c1 = (c0 + 1).clamp(0, W - 1)
     dr = (r - r0.float()).unsqueeze(1)
     dc = (c - c0.float()).unsqueeze(1)
-    r0 = r0.clamp(0, H-1); r1 = r1.clamp(0, H-1)
-    c0 = c0.clamp(0, W-1); c1 = c1.clamp(0, W-1)
-    Ia = normals[r0, c0]; Ib = normals[r0, c1]
-    Ic = normals[r1, c0]; Id = normals[r1, c1]
-    normal_interp = (Ia*(1-dr)*(1-dc) + Ib*(1-dr)*dc + Ic*dr*(1-dc) + Id*dr*dc)
-    if normalize:
-        norm_val = torch.norm(normal_interp, dim=1, keepdim=True) + 1e-8
-        normal_interp = normal_interp / norm_val
-    return normal_interp
+    Ia = normals[r0, c0]
+    Ib = normals[r0, c1]
+    Ic = normals[r1, c0]
+    Id = normals[r1, c1]
+    return Ia * (1 - dr) * (1 - dc) + Ib * (1 - dr) * dc + Ic * dr * (1 - dc) + Id * dr * dc
 
-def extract_zero_crossings_interpolated_positions(sdf_tensor, requires_grad=False):
-    epsilon = 1e-8
-    positions = []
-    H, W = sdf_tensor.shape
-    sdf_np = sdf_tensor.detach().cpu().numpy()
 
-    for i in range(H - 1):
-        for j in range(W):
-            v1 = sdf_np[i, j]; v2 = sdf_np[i + 1, j]
-            if v1 == 0: positions.append([i, j])
-            elif v2 == 0: positions.append([i + 1, j])
-            elif v1 * v2 < 0:
-                alpha = abs(v1) / (abs(v1) + abs(v2) + epsilon)
-                positions.append([i + alpha, j])
+def _splat_bilinear(buf: torch.Tensor, pos: torch.Tensor, val: torch.Tensor) -> None:
+    if val.dtype != buf.dtype:
+        val = val.to(buf.dtype)
+    H, W = buf.shape
+    r, c = pos[:, 0], pos[:, 1]
+    r0 = r.floor().long().clamp(0, H - 1)
+    c0 = c.floor().long().clamp(0, W - 1)
+    r1 = (r0 + 1).clamp(0, H - 1)
+    c1 = (c0 + 1).clamp(0, W - 1)
+    wr1 = r - r0.float(); wr0 = 1 - wr1
+    wc1 = c - c0.float(); wc0 = 1 - wc1
+    w00 = wr0 * wc0; w01 = wr0 * wc1; w10 = wr1 * wc0; w11 = wr1 * wc1
+    buf.index_put_((r0, c0), val * w00, accumulate=True)
+    buf.index_put_((r0, c1), val * w01, accumulate=True)
+    buf.index_put_((r1, c0), val * w10, accumulate=True)
+    buf.index_put_((r1, c1), val * w11, accumulate=True)
 
-    for i in range(H):
-        for j in range(W - 1):
-            v1 = sdf_np[i, j]; v2 = sdf_np[i, j + 1]
-            if v1 == 0: positions.append([i, j])
-            elif v2 == 0: positions.append([i, j + 1])
-            elif v1 * v2 < 0:
-                alpha = abs(v1) / (abs(v1) + abs(v2) + epsilon)
-                positions.append([i, j + alpha])
 
-    if positions:
-        return torch.tensor(positions, dtype=torch.float32,
-                            device=sdf_tensor.device, requires_grad=requires_grad)
-    else:
-        return torch.empty((0, 2), dtype=torch.float32,
-                           device=sdf_tensor.device, requires_grad=requires_grad)
-
-def compute_chamfer_distance(points1, points2):
-    if points1.numel() == 0 or points2.numel() == 0:
-        return torch.tensor(float('inf'), device=points1.device)
-    diff  = points1.unsqueeze(1) - points2.unsqueeze(0)
-    dists = torch.norm(diff, dim=2)
-    min_dists1, _ = torch.min(dists, dim=1)
-    min_dists2, _ = torch.min(dists, dim=0)
-    return -torch.mean(min_dists1) + torch.mean(min_dists2)
-
-def manual_chamfer_grad(pred_sdf, pred_zc, gt_zc, update_scale=1.0, dist_threshold=3.0):
-    dSDF = torch.zeros_like(pred_sdf)
-    normals = compute_normals(pred_sdf)
-    sampled_normals = sample_normals_at_positions(normals, pred_zc)
-    gt_zc_cpu   = gt_zc.detach().cpu()
-    pred_zc_cpu = pred_zc.detach().cpu()
-
-    for i in range(pred_zc.shape[0]):
-        p = pred_zc_cpu[i]
-        diff = gt_zc_cpu - p
-        dist = torch.norm(diff, dim=1)
-        if dist.numel() == 0:
-            continue
-        min_dist, min_index = torch.min(dist, dim=0)
-        if min_dist > dist_threshold:
-            continue
-        matched_gt = gt_zc_cpu[min_index]
-        dl_dp = matched_gt - p
-        n = sampled_normals[i]
-        n = n / (torch.norm(n) + 1e-8)
-        dot_val = torch.dot(dl_dp.to(n.device), n) * update_scale
-
-        r, c = p[0].item(), p[1].item()
-        r0, c0 = int(np.floor(r)), int(np.floor(c))
-        r1, c1 = r0 + 1, c0 + 1
-        wr1, wr0 = r - r0, 1 - (r - r0)
-        wc1, wc0 = c - c0, 1 - (c - c0)
-        H, W = dSDF.shape
-
-        if 0 <= r0 < H and 0 <= c0 < W: dSDF[r0, c0] += dot_val * wr0 * wc0
-        if 0 <= r0 < H and 0 <= c1 < W: dSDF[r0, c1] += dot_val * wr0 * wc1
-        if 0 <= r1 < H and 0 <= c0 < W: dSDF[r1, c0] += dot_val * wr1 * wc0
-        if 0 <= r1 < H and 0 <= c1 < W: dSDF[r1, c1] += dot_val * wr1 * wc1
-
-    return dSDF
-
-# =============================== Loss class ===============================
-
+# ---------------------------- loss ----------------------------
 class SDFChamferLoss(nn.Module):
     """
-    EXACT same behavior as your training loop:
+    Chamfer-style loss for SDFs with an L1 term.
 
-    batch_loss = λ_chamfer * |Chamfer(pred_zc, gt_zc)| + λ_sdf * L1(pred_sdf, gt_sdf)
-
-    No hidden tricks. No algorithm change.
+    Parameters
+    ----------
+    weight_sdf : float
+        Weight for the pixel-wise L1(pred, gt).
+    band, reduction, use_squared, update_scale, normalize_normals,
+    iso, eps : same as before.
     """
-
-    def __init__(self,
-                 weight_sdf:     float = 1.0,
-                 weight_chamfer: float = 1.0):
+    def __init__(
+        self,
+        weight_sdf:      float = 1.0,
+        band:            Optional[float] = 3.0,
+        reduction:       str = "mean",
+        use_squared:     bool = False,
+        update_scale:    float = 1.0,
+        normalize_normals: bool = True,
+        iso:             float = 0.0,
+        eps:             float = 1e-3,
+    ):
         super().__init__()
-        self.w_sdf  = float(weight_sdf)
-        self.w_ch   = float(weight_chamfer)
+        assert reduction in {"mean", "sum"}
+        self.weight_sdf  = weight_sdf
+        self.band   = band
+        self.red    = reduction
+        self.use_sq = use_squared
+        self.scale  = update_scale
+        self.norm_n = normalize_normals
+        self.iso    = iso
+        self.eps    = float(eps)
 
-    def forward(self, y_pred, y_true):
-        pred = y_pred.squeeze(1)
-        gt   = y_true.squeeze(1)
-        total = 0.0
-        for p, g in zip(pred, gt):
-            p_zc = extract_zero_crossings_interpolated_positions(p)
-            g_zc = extract_zero_crossings_interpolated_positions(g)
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        pred_sdf_in: torch.Tensor,
+        gt_sdf_in:   torch.Tensor,
+        *, return_parts: bool = False,
+    ):
+        pred_sdf = _prep_sdf(pred_sdf_in)
+        gt_sdf   = _prep_sdf(gt_sdf_in)
+        B, _, _  = pred_sdf.shape
+        dev, dt  = pred_sdf.device, pred_sdf.dtype
 
-            # if either set is empty, skip it
-            if p_zc.numel() == 0 or g_zc.numel() == 0:
-                loss_ch = 0.0
+        # ---------- iso-curve extraction (no grad) ----------
+        P_all, P_cnt = _zero_crossings_lin_interp(pred_sdf.detach(), self.iso, self.eps)
+        G_all, G_cnt = _zero_crossings_lin_interp(gt_sdf.detach(),   self.iso, self.eps)
+
+        if P_all.numel() == 0 and G_all.numel() == 0:
+            # fall-back to pure L1 if nothing to match
+            l1 = F.l1_loss(pred_sdf, gt_sdf, reduction=self.red)
+            loss_out = self.weight_sdf * l1
+            return (loss_out, 0.0, l1, torch.tensor(0.0, device=dev)) if return_parts else loss_out
+
+        chamfers, pseudos = [], []
+        p_off = g_off = 0
+        for b in range(B):
+            p_n, g_n = P_cnt[b].item(), G_cnt[b].item()
+            P = P_all[p_off:p_off+p_n, 1:] if p_n else torch.empty(0, 2, device=dev)
+            G = G_all[g_off:g_off+g_n, 1:] if g_n else torch.empty(0, 2, device=dev)
+            p_off += p_n; g_off += g_n
+
+            if p_n == 0 or g_n == 0:
+                chamfers.append(torch.zeros((), dtype=dt, device=dev))
+                pseudos .append(torch.zeros((), dtype=dt, device=dev))
+                continue
+
+            d = torch.cdist(P, G, p=2)
+
+            if self.band is not None:
+                maskP = d.min(1).values <= self.band
+                maskG = d.min(0).values <= self.band
             else:
-                cd = compute_chamfer_distance(p_zc, g_zc)
-                loss_ch = torch.abs(cd)
+                maskP = torch.ones(p_n, dtype=torch.bool, device=dev)
+                maskG = torch.ones(g_n, dtype=torch.bool, device=dev)
 
-            loss_sdf = F.l1_loss(p, g)
-            total += self.w_ch * loss_ch + self.w_sdf * loss_sdf
+            dP = d[maskP].min(1).values if maskP.any() else torch.zeros(0, device=dev, dtype=dt)
+            dG = d[:, maskG].min(0).values if maskG.any() else torch.zeros(0, device=dev, dtype=dt)
+            if self.use_sq:
+                dP = dP.pow(2); dG = dG.pow(2)
+            chamfers.append(dP.mean() + dG.mean())
 
-        return total / pred.size(0)
+            # pseudo-grad
+            if maskP.any():
+                normals  = _compute_normals(pred_sdf[b])
+                valid_P  = P[maskP]
+                idx      = d[maskP].argmin(1)
+                matchedG = G[idx]
+                dl_dp    = matchedG - valid_P
+                n        = _sample_normals(normals, valid_P)
+                if self.norm_n:
+                    n = n / (n.norm(1, keepdim=True) + 1e-8)
+                proj     = (dl_dp * n).sum(1) * self.scale
+                grad_map = torch.zeros_like(pred_sdf[b], dtype=proj.dtype, device=dev)
+                _splat_bilinear(grad_map, valid_P, proj)
+                pseudos.append( - (pred_sdf[b] * grad_map).sum() )
+            else:
+                pseudos.append(torch.zeros((), dtype=dt, device=dev))
 
-# expose helpers
-__all__ = [
-    "SDFChamferLoss",
-    "extract_zero_crossings_interpolated_positions",
-    "compute_chamfer_distance",
-    "manual_chamfer_grad",
-    "sample_pred_at_positions",
-    "compute_normals",
-    "sample_normals_at_positions",
-]
+        chamfers = torch.stack(chamfers)   # no grad
+        pseudos  = torch.stack(pseudos)    # carries grad
+
+        # ---------- dense L1 term ----------
+        l1 = F.l1_loss(pred_sdf, gt_sdf, reduction=self.red)
+
+        # ---------- final scalar ----------
+        opt_loss = pseudos + self.weight_sdf * l1        # has grad
+        log_val  = chamfers.abs() + self.weight_sdf * l1 # what you print
+
+        opt_loss = opt_loss.mean() if self.red == "mean" else opt_loss.sum()
+        log_val  = log_val.mean()  if self.red == "mean" else log_val.sum()
+
+        if return_parts:
+            grad_mag = pseudos.abs().mean()
+            return opt_loss, log_val, chamfers.mean(), l1, grad_mag
+        return opt_loss
