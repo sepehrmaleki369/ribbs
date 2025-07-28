@@ -28,17 +28,17 @@ secondary_loss:
   path: "losses.chamfer_loss"
   class: "SDFChamferLoss"
   params:
-    weight_sdf:          1.0
-    band:                null       # disable band filtering (or e.g. 3.0)
+    weight_sdf:          0.0
+    band:                0          # disable band filtering (or e.g. 3.0)
     use_squared:         false      # L2² vs. L2 distances
-    update_scale:        1.0        # strength of the pseudo‑gradient
+    update_scale:        1000.0        # strength of the pseudo‑gradient
     normalize_normals:   true       # unit‑norm before projection
     iso:                 0.0        # iso‐surface value
     eps:                 1e-3       # width for capturing exact zeros
 
 
 ## Mixing parameters
-alpha: 0.1  # Weight for the secondary loss 
+alpha: 1  # Weight for the secondary loss 
 start_epoch: 0  # Epoch to start using the secondary loss
 
 

@@ -5,14 +5,14 @@
 # dataset_config: "mass.yaml"
 dataset_config: "mass_test.yaml"
 model_config: "baseline.yaml"
-# loss_config: "fixed_lif_mse_chamfer.yaml"
-loss_config: "chamfer.yaml"
+loss_config: "fixed_lif_mse_chamfer.yaml"
+# loss_config: "chamfer.yaml"
 metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 callbacks_config: "callbacks_2d.yaml"
 
 # Output directory
-output_dir: "outputs/base_sdf_lif_mse_chamfer_smoke_test"
+output_dir: "outputs/lif_mse_chamfer_WO_l1_us1000_smoke_test"
 
 # Trainer configuration
 trainer:
@@ -24,7 +24,7 @@ trainer:
   train_metrics_every_n_epochs: 1 # compute/log train metrics every epoch
   val_metrics_every_n_epochs: 1  # compute/log val   metrics every epoch
   save_gt_pred_val_test_every_n_epochs: 1  # Save GT+pred every 10 epochs
-  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
+  save_gt_pred_val_test_after_epoch: 10000      # Start saving after epoch 0
   # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
   compute_val_loss: false
   
