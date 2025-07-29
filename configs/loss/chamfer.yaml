@@ -2,18 +2,28 @@
 
 # Primary loss (used from the beginning)
 primary_loss:
-  path: "losses.chamfer_loss"
-  class: "SDFChamferLoss"
+  # path: "losses.chamfer_loss"
+  # class: "SDFChamferLoss"
+  # params:
+  #   weight_sdf:          1.0
+  #   band:                0          # disable band filtering (or e.g. 3.0)
+  #   use_squared:         false      # L2² vs. L2 distances
+  #   update_scale:        1.0        # strength of the pseudo‑gradient
+  #   normalize_normals:   true       # unit‑norm before projection
+  #   iso:                 0.0        # iso‐surface value
+  #   eps:                 1e-3       # width for capturing exact zeros
+
+  path: losses.shape_loss
+  class: ShapeLoss
   params:
-    weight_sdf:          1.0
-    band:                0          # disable band filtering (or e.g. 3.0)
-    use_squared:         false      # L2² vs. L2 distances
-    update_scale:        1.0        # strength of the pseudo‑gradient
-    normalize_normals:   true       # unit‑norm before projection
-    iso:                 0.0        # iso‐surface value
-    eps:                 1e-3       # width for capturing exact zeros
-
-
+    chamfer_weight: 1.0
+    occupancy_weight: 2.0
+    eikonal_weight: 0.05
+    occ_band: 1.5
+    softplus_beta: 1.0
+    softplus_threshold: 10.0
+    pad_width: 1
+    contour_level: 0.0
 
   # path: "losses.weighted_mse"
   # class: "WeightedMSELoss"

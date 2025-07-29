@@ -5,14 +5,14 @@
 # dataset_config: "mass.yaml"
 dataset_config: "mass_test.yaml"
 model_config: "baseline.yaml"
-loss_config: "fixed_lif_mse_chamfer.yaml"
-# loss_config: "chamfer.yaml"
+# loss_config: "fixed_lif_mse_chamfer.yaml"
+loss_config: "chamfer.yaml"
 metrics_config: "segmentation.yaml"
 inference_config: "chunk.yaml"
 callbacks_config: "callbacks_2d.yaml"
 
 # Output directory
-output_dir: "outputs/lif_mse_chamfer_WO_l1_us1000_smoke_test"
+output_dir: "new_exp/only_chamfer_occupancy_eikonal_smoke_test"
 
 # Trainer configuration
 trainer:
