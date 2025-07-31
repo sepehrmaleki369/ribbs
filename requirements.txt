@@ -1,0 +1,34 @@
+# Core ML dependencies
+torch>=1.9.0
+torchvision>=0.10.0
+pytorch-lightning>=1.5.0
+tensorboard>=2.8.0
+
+# Data processing
+numpy>=1.21.0
+Pillow>=8.3.0
+scipy>=1.7.0
+rasterio>=1.2.0
+imageio>=2.9.0
+scikit-learn>=1.0.0
+
+# Computer vision
+kornia>=0.6.0
+
+# Visualization and analysis
+matplotlib>=3.4.0
+networkx>=2.6.0
+shapely>=1.8.0
+
+# Utilities
+tqdm>=4.62.0
+PyYAML>=6.0
+requests>=2.26.0
+beautifulsoup4>=4.10.0
+
+# Optional: for elastic deformation
+elasticdeform>=0.4.0
+
+# Development tools
+jupyter>=1.0.0
+ipykernel>=6.0.0 
