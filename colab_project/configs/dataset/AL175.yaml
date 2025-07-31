@@ -1,0 +1,161 @@
+# Massachusetts Roads Dataset Configuration
+seed: 42  # Random seed
+split_cfg:
+  seed: 42
+  # index_save_pth: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175-inds"
+  index_save_pth: "/home/ri/Desktop/Projects/Datasets/AL175-inds"
+  sources:
+    - type: "ratio"
+      path: "/home/ri/Desktop/Projects/Datasets/AL175"
+      # path: "/cvlabdata2/cvlab/home/oner/Sinergia2/AL175"
+      layout: "flat"
+      modalities:
+        image:
+          pattern: "^cube_(.*)\\.npy$"
+        label:
+          pattern: "^lbl_(.*)\\.npy$"
+        distance:
+          pattern: "^distlbl_(.*)\\.npy$"
+      ratios:
+        train: 0.75
+        valid: 0.2
+        test:  0.05
+
+base_modalities: ["label", "image"]
+
+
+# -----------------------------------------------------------------------------
+# Dimensionality & Patch Extraction
+# -----------------------------------------------------------------------------
+data_dim: 3                # 2 = 2D patches, 3 = 3D volumes
+patch_size: [120,120,120]            # XY patch size
+max_images: 5           # limit number of loaded images (null = no limit)
+# max_images: null           # limit number of loaded images (null = no limit)
+# max_attempts: 10           # retries to find a valid patch
+
+# -----------------------------------------------------------------------------
+# Computed Modalities
+# -----------------------------------------------------------------------------
+save_computed: true               # save new distance/SDF files
+compute_again_modalities: false   # overwrite existing if true
+
+distance_threshold: 15.0          # clip distance maps (null = no clip)
+# sdf_iterations: 3                 # dilation iterations before SDF
+# sdf_thresholds: [-7, 7]           # clip range for SDF values
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+train_batch_size: 1
+# train_batch_size: 32
+val_batch_size: 1
+test_batch_size: 1
+num_workers: 4
+pin_memory: true
+
+# ─────────────────────────────────────────────────────────────────────
+# Augmentation
+# ─────────────────────────────────────────────────────────────────────
+augmentation:
+  # ── GLOBAL DEFAULTS (apply to every op unless overridden) ────────
+  - defaults:                  # <= this dict is *consumed*, not executed
+      p: 1
+      modalities: ["image", "label", "distance", "sdf"]
+      interpolation:
+        image: bilinear
+        label: nearest
+
+  # ── MIRRORING ────────────────────────────────────────────────────
+  - name: flip_horizontal
+  - name: flip_vertical
+  - name: flip_depth           # 3-D only
+    when_3d: true
+
+  # ── ROTATION ────────────────────────────────────────────────────
+  - name: rotation
+    params: { degrees: [-15, 15] }
+
+  # ── SCALING (ZOOM) ──────────────────────────────────────────────
+  - name: scaling
+    params: { scale_limit: [0.8, 1.2] }
+
+  # ── TRANSLATION (SHIFT) ─────────────────────────────────────────
+  - name: translation
+    params: { shift_limit: [-0.05, 0.05] }
+    modalities: ["image", "label"]
+
+  # ── ELASTIC DEFORMATION ─────────────────────────────────────────
+  - name: elastic_deformation
+    params: { alpha: [3, 6], sigma: [8, 12] }
+    modalities: ["image", "label"]
+
+  # ── INTENSITY JITTER (images only) ──────────────────────────────
+  - name: brightness
+    params: { limit: [-0.15, 0.15] }
+    modalities: ["image"]
+
+  - name: contrast
+    params: { limit: [-0.15, 0.15] }
+    modalities: ["image"]
+
+  - name: gamma
+    params: { gamma_limit: [0.9, 1.1] }
+    modalities: ["image"]
+
+  - name: gaussian_noise
+    params: { mean: 0.0, std: [0.0, 0.02] }
+    modalities: ["image"]
+
+  - name: blur
+    params: { kernel_size: [3, 7], sigma: [0.0, 0.8] }
+    modalities: ["image"]
+
+  - name: color_jitter
+    params:
+      brightness: [0.1, 0.3]
+      contrast:   [0.4, 0.6]
+      saturation: [-0.2, 0.2]
+      hue:        [-0.05, 0.05]
+    modalities: ["image"]
+
+
+
+# -----------------------------------------------------------------------------
+# Normalization Settings
+# -----------------------------------------------------------------------------
+
+normalization:
+  image:
+    method: "divide_by"    
+    threshold: 255      
+
+  # image:
+    # method: "zscore"     # options: minmax, zscore, robust, percentile, clip
+    # eps: !!float 1e-8         # lower bound of your data range (or null to infer from image)
+
+  distance: 
+    method: "clip"     # no extra parameters
+    min_val: 0
+    max_val: 15
+
+  # # 3) Robust normalization: clip to [lower_q, upper_q] quantiles, then min–max to [0,1]
+  # sdf:
+  #   method: "clip"
+  #   min_val: -7    
+  #   max_val: 7  
+
+  # label:
+  #   method: "boolean"
+  
+  # label:
+  #   method: "binarize"
+  #   threshold: 127
+  #   greater_is_road: True
+  #   return_bool: true
+
+order_ops: ["norm", "aug"]   # normalise → augment 
+
+# -----------------------------------------------------------------------------
+# Miscellaneous
+# -----------------------------------------------------------------------------
+verbose: true

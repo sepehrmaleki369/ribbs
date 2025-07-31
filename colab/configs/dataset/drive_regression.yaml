@@ -1,0 +1,41 @@
+# Drive dataset configuration for regression (distance map prediction)
+seed: 42  # Random seed
+split_cfg:
+  seed: 42
+  index_save_pth: "./drive/inds_regression"
+  sources:
+    # Training data
+    - type: "folder"
+      path: "./drive"
+      layout: "folders"
+      modalities:
+        image:
+          folder: "training/images_npy"
+        distance_map:
+          folder: "training/distance_maps"
+      splits:
+        train: "training"
+        valid: "training"  # Use training data for validation too
+
+base_modalities: ["distance_map", "image"]
+
+# -----------------------------------------------------------------------------
+# Dimensionality & Patch Extraction
+# -----------------------------------------------------------------------------
+data_dim: 2                # 2 = 2D patches, 3 = 3D volumes
+patch_size: [512, 512]            
+max_images: null           # limit number of loaded images (null = no limit)
+
+# -----------------------------------------------------------------------------
+# Processing order
+# -----------------------------------------------------------------------------
+order_ops: []  # No processing operations
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+train_batch_size: 4
+val_batch_size: 2
+test_batch_size: 2
+num_workers: 4
+pin_memory: true 

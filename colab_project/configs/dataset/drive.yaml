@@ -1,0 +1,107 @@
+# Drive Dataset Configuration
+seed: 42  # Random seed
+split_cfg:
+  seed: 42
+  index_save_pth: "./drive/inds"
+  sources:
+    # Training data
+    - type: "folder"
+      path: "./drive"
+      layout: "folders"
+      modalities:
+        image:
+          folder: "images"
+        label:
+          folder: "mask"
+      splits:
+        train: "training"
+        valid: "training"  # Use training data for validation too
+        test: "test"
+
+base_modalities: ["label", "image"]
+
+# -----------------------------------------------------------------------------
+# Dimensionality & Patch Extraction
+# -----------------------------------------------------------------------------
+data_dim: 2                # 2 = 2D patches, 3 = 3D volumes
+patch_size: [512, 512]            
+max_images: null           # limit number of loaded images (null = no limit)
+# max_attempts: 10           # retries to find a valid patch
+
+# -----------------------------------------------------------------------------
+# Processing order
+# -----------------------------------------------------------------------------
+order_ops: ["aug", "norm"]
+
+# -----------------------------------------------------------------------------
+# Normalization
+# -----------------------------------------------------------------------------
+normalization:
+  image:
+    method: "minmax"
+    min_val: 0
+    max_val: 255
+  label:
+    method: "binarize"
+    threshold: 0.5
+    greater_is_road: True
+    return_bool: False
+
+# -----------------------------------------------------------------------------
+# Computed Modalities
+# -----------------------------------------------------------------------------
+save_computed: true               # save new distance/SDF files
+compute_again_modalities: false   # overwrite existing if true
+
+# -----------------------------------------------------------------------------
+# DataLoader Settings
+# -----------------------------------------------------------------------------
+train_batch_size: 4
+val_batch_size: 2
+test_batch_size: 2
+num_workers: 4
+pin_memory: true
+
+# ─────────────────────────────────────────────────────────────────────
+# Augmentation
+# Works with both 2-D (H×W) and 3-D (D×H×W) volumes
+# ─────────────────────────────────────────────────────────────────────
+augmentation:
+  # ── GLOBAL DEFAULTS (apply to every op unless overridden) ────────
+  - defaults:                  # <= this dict is *consumed*, not executed
+      p: 1
+      modalities: ["image", "label"]
+      interpolation:
+        image: bilinear
+        label: nearest
+
+  # ── MIRRORING ────────────────────────────────────────────────────
+  - name: flip_horizontal
+  - name: flip_vertical
+
+  # ── ROTATION ────────────────────────────────────────────────────
+  - name: rotation
+    params: { degrees: [-15, 15] }
+
+  # ── SCALING (ZOOM) ──────────────────────────────────────────────
+  - name: scaling
+    params: { scale_limit: [0.8, 1.2] }
+
+  # ── TRANSLATION (SHIFT) ─────────────────────────────────────────
+  - name: translation
+    params: { shift_limit: [-0.05, 0.05] }
+    modalities: ["image", "label"]
+
+  # ── ELASTIC DEFORMATION ─────────────────────────────────────────
+  - name: elastic_deformation
+    params: { alpha: [3, 6], sigma: [8, 12] }
+    modalities: ["image", "label"]
+
+  # ── INTENSITY JITTER (images only) ──────────────────────────────
+  - name: brightness
+    params: { limit: [-0.15, 0.15] }
+    modalities: ["image"]
+
+  - name: contrast
+    params: { limit: [-0.15, 0.15] }
+    modalities: ["image"] 

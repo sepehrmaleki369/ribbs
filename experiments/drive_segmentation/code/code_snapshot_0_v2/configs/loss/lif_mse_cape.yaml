@@ -1,0 +1,43 @@
+# Mixed Topological Loss Configuration
+
+# Primary loss (used from the beginning)
+primary_loss:
+  path: "losses.lif_weighted_mse"
+  class: "LIFWeightedMSELoss"
+  params:
+    sdf_min: 0
+    sdf_max: 20.0
+    n_bins: 15
+    eps: 0.02
+    freeze_after_first: False
+    reduction: "mean"
+
+  # path: "losses.weighted_mse"
+  # class: "WeightedMSELoss"
+  # params:
+  #   road_weight: 4
+  #   bg_weight: 1
+  #   threshold: 0
+  #   greater_is_road: False
+  #   reduction: mean
+
+  # class: "MSELoss"  # Built-in PyTorch loss
+  # params: {}
+
+# # Secondary loss (activated after start_epoch)
+secondary_loss:
+  path: "losses.cape.loss"  # Path to the module containing the loss
+  class: "CAPE"  # Name of the loss class
+  params:
+    window_size: 90
+    three_dimensional: true
+    distance_threshold: 20.0
+    dilation_radius: 10.0 
+
+# # Mixing parameters
+alpha: 0.0001  # Weight for the secondary loss (0 to 1)
+start_epoch: 30000  # Epoch to start using the secondary loss
+
+
+
+ 

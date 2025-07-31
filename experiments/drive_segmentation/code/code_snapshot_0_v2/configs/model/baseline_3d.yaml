@@ -1,0 +1,16 @@
+path: "models.base_models"
+class: "UNet"
+
+params:
+  three_dimensional: true    # enable 3D convolutions, pooling & upsampling
+  in_channels: 1             # e.g. RGB volume or 3 input modalities
+  out_channels: 1            # single-channel output (e.g. binary mask or regression)
+  m_channels: 32             # base number of feature maps
+  n_convs: 2                 # conv layers per block
+  n_levels: 3                # depth of the U-Net (number of down/up steps)
+  dropout: 0.1               # dropout probability in each block
+  norm_type: "group"           # batch / group
+  num_groups: 8            # use GroupNorm (8 groups) after each conv
+  upsampling: "bilinear"       # "deconv" for transposed conv; alternatives: "nearest", "bilinear"
+  pooling: "max"             # pooling type in down-blocks ("max" or "avg")
+  apply_final_relu: true     # ReLU after last 1×1 conv (clips negatives to zero)

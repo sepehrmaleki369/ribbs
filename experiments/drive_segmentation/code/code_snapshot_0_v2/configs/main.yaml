@@ -1,0 +1,50 @@
+# Main configuration file for drive dataset segmentation experiments
+# This file references all sub-configs and sets high-level training parameters
+
+# Sub-config references
+dataset_config: "drive.yaml"
+model_config: "baseline.yaml"
+loss_config: "bce_loss.yaml"
+metrics_config: "dice_iou.yaml"
+inference_config: "chunk.yaml"
+callbacks_config: "callbacks_2d_simple.yaml"
+
+# Output directory
+output_dir: "experiments/drive_segmentation"
+
+# Trainer configuration
+trainer:
+  num_sanity_val_steps: 0
+  max_epochs: 10
+  check_val_every_n_epoch: 2      # Validate every N epochs
+  skip_validation_until_epoch: 0  # Skip validation until this epoch
+  log_every_n_steps: 5           # log metrics every step
+  train_metrics_every_n_epochs: 2 # compute/log train metrics every epoch
+  val_metrics_every_n_epochs: 2   # compute/log val metrics every epoch
+  save_gt_pred_val_test_every_n_epochs: 5  # Save GT+pred every 5 epochs
+  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
+
+  extra_args:
+    accelerator: "auto" 
+    precision: 16-mixed  
+    deterministic: false
+
+# Optimizer configuration
+optimizer:
+  name: "Adam"
+  params:
+    lr: 0.0001
+    weight_decay: 0.0001
+  
+  # Optional learning rate scheduler
+  scheduler:
+    name: "ReduceLROnPlateau"
+    params:
+      patience: 10
+      factor: 0.5
+      monitor: "val_loss"
+      mode: "min"
+      min_lr: 0.00001
+
+target_x: "image_patch"
+target_y: "label_patch" 

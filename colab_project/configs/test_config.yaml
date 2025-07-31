@@ -1,0 +1,40 @@
+# Test configuration for SegLab
+# This is a simplified config for testing the setup
+
+# Sub-config references
+dataset_config: "mass.yaml"
+model_config: "baseline.yaml"
+loss_config: "bce_loss.yaml"
+metrics_config: "dice_iou.yaml"
+inference_config: "chunk.yaml"
+callbacks_config: "basic_callbacks.yaml"
+
+# Output directory
+output_dir: "outputs/test_run"
+
+# Trainer configuration
+trainer:
+  num_sanity_val_steps: 0
+  max_epochs: 10  # Short run for testing
+  check_val_every_n_epoch: 2
+  skip_validation_until_epoch: 0
+  log_every_n_steps: 10
+  train_metrics_every_n_epochs: 2
+  val_metrics_every_n_epochs: 2
+  save_gt_pred_val_test_every_n_epochs: 5
+  save_gt_pred_val_test_after_epoch: 0
+
+  extra_args:
+    accelerator: "auto" 
+    precision: 16-mixed  
+    deterministic: false
+
+# Optimizer configuration
+optimizer:
+  name: "Adam"
+  params:
+    lr: 0.001
+    weight_decay: 0.0001
+
+target_x: "image_patch"
+target_y: "label_patch" 

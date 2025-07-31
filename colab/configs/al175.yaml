@@ -1,0 +1,58 @@
+# Main configuration file for segmentation experiments
+# This file references all sub-configs and sets high-level training parameters
+
+# Sub-config references
+dataset_config: "AL175.yaml"
+model_config: "baseline_3d.yaml"
+loss_config: "fixed_lif_mse_cape.yaml"
+metrics_config: "dice_iou_ccq.yaml"
+inference_config: "chunk_3d.yaml"
+callbacks_config: "callbacks_3d.yaml"
+
+# Output directory
+output_dir: "experiments/al175_lif_mse_cape_a1"
+
+# Trainer configuration
+trainer:
+  num_sanity_val_steps: 0
+  max_epochs: 15000
+  check_val_every_n_epoch: 200      # Validate every N epochs (this is redundant with val_check_interval=1.0)
+  skip_validation_until_epoch: 0  # Skip validation until this epoch
+  log_every_n_steps: 1            # log metrics every step
+  train_metrics_every_n_epochs: 200 # compute/log train metrics every epoch
+  val_metrics_every_n_epochs: 200  # compute/log val   metrics every epoch
+  save_gt_pred_val_test_every_n_epochs: 1000  # Save GT+pred every 10 epochs
+  save_gt_pred_val_test_after_epoch: 0      # Start saving after epoch 0
+  # save_gt_pred_max_samples: 3            # No limit on samples (or set an integer)
+
+  extra_args:
+    accelerator: "auto" 
+    precision: 16-mixed  
+    deterministic: false
+    # gradient_clip_val: 1.0
+    # accumulate_grad_batches: 1
+    # max_time: "24:00:00"
+
+# Optimizer configuration
+optimizer:
+  name: "Adam"
+  params:
+    lr: 0.0001
+    weight_decay: 0.0001
+  
+  # Optional learning rate scheduler
+  scheduler:
+    # name: "ReduceLROnPlateau"
+    # params:
+    #   patience: 10
+    #   factor: 0.5
+    #   monitor: "val_loss"
+    #   mode: "min"
+    #   min_lr: 0.00001
+    name: "LambdaLR"
+    params:
+      lr_decay_factor: 0.001
+
+target_x: "image_patch"
+target_y: "distance_patch"
+

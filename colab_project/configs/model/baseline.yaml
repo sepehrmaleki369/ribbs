@@ -1,0 +1,20 @@
+# TopoTokens Model Configuration
+
+# Model path and class
+path: "models.base_models"  # Path to the module containing the model
+class: "UNet"  # Name of the model class
+
+# Model parameters
+params:
+  three_dimensional: False
+  m_channels: 32
+  n_convs: 2
+  n_levels: 3
+  dropout: 0.1
+  norm_type: 'group' # batch
+  upsampling: "bilinear"
+  pooling: "max"
+  in_channels: 3
+  out_channels: 1
+  apply_final_relu: False
+  num_groups: 8            # use GroupNorm (8 groups) after each conv
