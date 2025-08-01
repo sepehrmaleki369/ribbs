@@ -51,8 +51,20 @@ def show_best_regression_predictions():
     ).to(device)
     
     # Load best model weights
-    model_path = 'checkpoints_regression/best_regression_model.pth'
+    model_path = 'checkpoints_regression/best_model.pth'
     print(f"Loading model from: {model_path}")
+    
+    # Check if the model file exists
+    if not os.path.exists(model_path):
+        print(f"❌ Model not found at {model_path}")
+        print("Available models in checkpoints_regression/:")
+        if os.path.exists('checkpoints_regression/'):
+            for file in os.listdir('checkpoints_regression/'):
+                if file.endswith('.pth'):
+                    print(f"  - {file}")
+        else:
+            print("  No checkpoints_regression directory found")
+        return
     
     checkpoint = torch.load(model_path, map_location=device)
     if 'model_state_dict' in checkpoint:
