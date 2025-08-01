@@ -1,5 +1,0 @@
-# MSE Loss configuration for regression
-loss:
-  name: "MSELoss"
-  params:
-    reduction: "mean" 

@@ -1,8 +1,0 @@
-# Binary Cross Entropy Loss Configuration
-primary_loss:
-  class: "BCELoss"
-  params: {}
-
-secondary_loss: null
-alpha: 0.0
-start_epoch: 0 
