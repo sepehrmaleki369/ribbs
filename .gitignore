@@ -180,8 +180,8 @@ cython_debug/
 *.tar.gz
 *.zip
 checkpoints/
-# checkpoints_regression/*  # Temporarily commented out to add folder contents
-# predictions/*  # Temporarily commented out to add folder contents
+checkpoints_regression/*
+predictions/*
 # *.pth  # Commented out to allow model files
 # *.npy  # Commented out to allow dataset files
 # *.txt  # Commented out to allow requirements.txt
