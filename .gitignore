@@ -1,6 +1,6 @@
 outputs/
 AllFayzad/
-*.npy
+# *.npy  # Commented out to allow dataset files
 *.ckpt
 tmp*
 epoch*
@@ -103,19 +103,19 @@ ipython_config.py
 
 # UV
 #   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   This is generally recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
 #uv.lock
 
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   This is generally recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
 #   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
 #poetry.lock
 
 # pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
 #pdm.lock
 #   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
 #   in version control.
@@ -180,12 +180,14 @@ cython_debug/
 *.tar.gz
 *.zip
 checkpoints/
-*.pth
-*.npy
-*.txt
+# checkpoints_regression/*  # Temporarily commented out to add folder contents
+# predictions/*  # Temporarily commented out to add folder contents
+# *.pth  # Commented out to allow model files
+# *.npy  # Commented out to allow dataset files
+# *.txt  # Commented out to allow requirements.txt
 wandb/
 *.log
 *.mp4
-*.png
+# *.png  # Commented out to allow prediction images
 **/logs/*
 **/lightning_logs/*
