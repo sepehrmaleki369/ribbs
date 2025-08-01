@@ -26,7 +26,7 @@ class RegressionDataset(Dataset):
         
         # Define paths
         image_dir = "drive/training/images_npy"
-        distance_map_dir = "drive/training/distance_maps"
+        distance_map_dir = "drive/training/discrete_distance_maps"  # Changed to discrete distance maps
         
         # Get all image files
         image_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.npy')])
@@ -34,7 +34,9 @@ class RegressionDataset(Dataset):
         # Create corresponding distance map file names
         for img_file in image_files:
             stem = img_file.replace('.npy', '')
-            distance_file = f"{stem}_distance_map.npy"
+            # Extract the number from the training file name (e.g., "21_training" -> "21")
+            number = stem.split('_')[0]
+            distance_file = f"{number}_manual1_discrete_distance_map.npy"  # Fixed naming pattern
             
             # Check if distance map file exists
             distance_path = os.path.join(distance_map_dir, distance_file)
