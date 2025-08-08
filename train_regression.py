@@ -80,10 +80,10 @@ def train_regression():
     
     model = UNet(
         in_channels=3,
-        m_channels=32,        # Reduced from 64 to 32 to match baseline
+        m_channels=64,        # Keep original to match existing checkpoint
         out_channels=1,
         n_convs=2,
-        n_levels=3,           # Increased from 2 to 3 for better feature extraction
+        n_levels=2,           # Keep original to match existing checkpoint
         dropout=0.1,
         norm_type='batch',
         upsampling='bilinear',
