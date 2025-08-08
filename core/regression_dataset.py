@@ -23,6 +23,7 @@ class RegressionDataset(Dataset):
         # Load file lists
         self.image_files = []
         self.distance_map_files = []
+        self.sample_ids = []
         
         # Define paths
         image_dir = "drive/training/images_npy"
@@ -41,6 +42,8 @@ class RegressionDataset(Dataset):
             if os.path.exists(distance_path):
                 self.image_files.append(os.path.join(image_dir, img_file))
                 self.distance_map_files.append(distance_path)
+                # sample_id = first token before underscore (e.g., 21 from 21_training)
+                self.sample_ids.append(stem.split('_')[0])
         
         print(f"Found {len(self.image_files)} image-distance map pairs")
         
@@ -50,11 +53,13 @@ class RegressionDataset(Dataset):
             split_idx = int(len(self.image_files) * 0.8)
             self.image_files = self.image_files[split_idx:]
             self.distance_map_files = self.distance_map_files[split_idx:]
+            self.sample_ids = self.sample_ids[split_idx:]
         elif split == 'train':
             # Use first 80% for training
             split_idx = int(len(self.image_files) * 0.8)
             self.image_files = self.image_files[:split_idx]
             self.distance_map_files = self.distance_map_files[:split_idx]
+            self.sample_ids = self.sample_ids[:split_idx]
         
         print(f"{split} split: {len(self.image_files)} samples")
         
@@ -72,6 +77,7 @@ class RegressionDataset(Dataset):
         # Load image and distance map
         image = load_array_from_file(self.image_files[idx])
         distance_map = load_array_from_file(self.distance_map_files[idx])
+        sample_id = self.sample_ids[idx]
         
         # Ensure distance map is 2D
         if distance_map.ndim == 3:
@@ -80,7 +86,8 @@ class RegressionDataset(Dataset):
         # Create data dictionary
         data = {
             'image': image,
-            'distance_map': distance_map
+            'distance_map': distance_map,
+            'sample_id': sample_id,
         }
         
         # Skip normalization and augmentation as requested

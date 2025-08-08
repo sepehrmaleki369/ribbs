@@ -39,3 +39,23 @@ val_batch_size: 2
 test_batch_size: 2
 num_workers: 4
 pin_memory: true 
+
+training:
+  num_epochs: 3             # 1 epoch MSE + 2 epochs Snake
+  resume_checkpoint: null   # not resuming
+  additional_epochs: null   # not continuing
+
+snake_loss:
+  enabled: true
+  type: fast                # SnakeFastLoss
+  start_epoch: 2            # switch after 1 epoch of MSE
+  pretrained_checkpoint: null  # no warm-start
+  stepsz: 0.1
+  alpha: 0.0001
+  beta: 0.01
+  fltrstdev: 0.5
+  nsteps: 10
+  cropsz: [32, 32, 32]
+  dmax: 15
+  maxedgelen: 5
+  extgradfac: 2
