@@ -41,21 +41,21 @@ num_workers: 4
 pin_memory: true 
 
 training:
-  num_epochs: 3             # 1 epoch MSE + 2 epochs Snake
-  resume_checkpoint: null   # not resuming
-  additional_epochs: null   # not continuing
+  num_epochs: 300
+  resume_checkpoint: /content/drive/MyDrive/ribbs/checkpoints_regression/checkpoint_epoch_200.pth
+  additional_epochs: 100
 
 snake_loss:
   enabled: true
-  type: fast                # SnakeFastLoss
-  start_epoch: 2            # switch after 1 epoch of MSE
-  pretrained_checkpoint: null  # no warm-start
+  type: fast
+  start_epoch: 201        # switch right after resuming from epoch 200
+  pretrained_checkpoint: null
   stepsz: 0.1
   alpha: 0.0001
   beta: 0.01
   fltrstdev: 0.5
   nsteps: 10
-  cropsz: [32, 32, 32]
-  dmax: 15
-  maxedgelen: 5
-  extgradfac: 2
+  cropsz: [128, 128]      # 2D only
+  dmax: 155.0             # matches DRIVE distance map range
+  maxedgelen: 10.0
+  extgradfac: 2.0 

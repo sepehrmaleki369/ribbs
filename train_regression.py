@@ -192,6 +192,13 @@ def train_regression():
         # Training
         model.train()
         epoch_num_print = epoch + 1
+        use_snake_this_epoch = use_snake and (epoch_num_print) >= snake_epoch_start
+        loss_name = (
+            'SnakeFast' if (use_snake_this_epoch and snake_type == 'fast') else 
+            ('SnakeSimple' if (use_snake_this_epoch and snake_type == 'simple') else 'MSE')
+        )
+        print(f"Epoch {epoch_num_print}: using loss = {loss_name}")
+        
         train_loss = 0.0
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch_num_print}/{end_epoch} [Train]')
         
@@ -218,7 +225,7 @@ def train_regression():
                 targets = targets[:, :h, :w]
             
             # Compute loss
-            if use_snake and (epoch_num_print) >= snake_epoch_start:
+            if use_snake_this_epoch:
                 # Build lbl_graphs for this batch
                 lbl_graphs = []
                 for sid in sample_ids:
