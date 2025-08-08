@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 import os
-import shutil
 
 # New imports for snake losses and graph loading
 from losses_n import SnakeFastLoss, SnakeSimpleLoss
@@ -20,16 +19,6 @@ def train_regression():
     """Train regression model for distance map prediction with optional Snake losses"""
     
     print("=== TRAINING REGRESSION MODEL ===")
-    
-    # Mount Google Drive (if running on Colab)
-    try:
-        from google.colab import drive
-        drive.mount('/content/drive')
-        drive_path = '/content/drive/MyDrive/regression_checkpoints'
-        print(f"Google Drive mounted. Checkpoints will be saved to: {drive_path}")
-    except:
-        drive_path = None
-        print("Not running on Colab or Drive mount failed. Checkpoints will only be saved locally.")
     
     # Load configuration
     with open('configs/dataset/drive_regression.yaml', 'r') as f:
@@ -71,18 +60,18 @@ def train_regression():
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=2,
+        batch_size=config.get('train_batch_size', 1),  # Use config value, default to 1
         shuffle=True,
-        num_workers=0,
-        pin_memory=False
+        num_workers=config.get('num_workers', 0),      # Use config value, default to 0
+        pin_memory=config.get('pin_memory', False)     # Use config value, default to False
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=2,
+        batch_size=config.get('val_batch_size', 1),    # Use config value, default to 1
         shuffle=False,
-        num_workers=0,
-        pin_memory=False
+        num_workers=config.get('num_workers', 0),      # Use config value, default to 0
+        pin_memory=config.get('pin_memory', False)     # Use config value, default to False
     )
     
     # Create model using existing UNet
@@ -91,10 +80,10 @@ def train_regression():
     
     model = UNet(
         in_channels=3,
-        m_channels=64,
+        m_channels=32,        # Reduced from 64 to 32 to match baseline
         out_channels=1,
         n_convs=2,
-        n_levels=2,
+        n_levels=3,           # Increased from 2 to 3 for better feature extraction
         dropout=0.1,
         norm_type='batch',
         upsampling='bilinear',
@@ -145,12 +134,9 @@ def train_regression():
         if device.type == 'cuda':
             snake_loss = snake_loss.cuda()
     
-    # Create checkpoint directories
+    # Create checkpoint directory
     local_checkpoint_dir = 'checkpoints_regression'
     os.makedirs(local_checkpoint_dir, exist_ok=True)
-    
-    if drive_path:
-        os.makedirs(drive_path, exist_ok=True)
     
     train_losses = []
     val_losses = []
@@ -160,7 +146,7 @@ def train_regression():
     print(f"Checkpoints will be saved every 50 epochs")
     
     def save_checkpoint(epoch, model, optimizer, train_losses, val_losses, is_best=False):
-        """Save checkpoint locally and to Google Drive"""
+        """Save checkpoint locally only"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -176,17 +162,7 @@ def train_regression():
             local_path = os.path.join(local_checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
         
         torch.save(checkpoint, local_path)
-        print(f"✅ Checkpoint saved locally: {local_path}")
-        
-        # Save to Google Drive
-        if drive_path:
-            if is_best:
-                drive_file_path = os.path.join(drive_path, 'best_model.pth')
-            else:
-                drive_file_path = os.path.join(drive_path, f'checkpoint_epoch_{epoch}.pth')
-            
-            shutil.copy2(local_path, drive_file_path)
-            print(f"✅ Checkpoint saved to Drive: {drive_file_path}")
+        print(f"✅ Checkpoint saved: {local_path}")
     
     for epoch in range(start_epoch, end_epoch):
         # Training
@@ -294,7 +270,7 @@ def train_regression():
     
     save_checkpoint(end_epoch, model, optimizer, train_losses, val_losses, is_best=False)
     
-    # Plot curves as before
+    # Plot curves
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Training Loss')
     if val_losses:
@@ -307,16 +283,10 @@ def train_regression():
     plt.legend()
     plt.grid(True)
     plt.savefig('regression_training_curves.png', dpi=300, bbox_inches='tight')
-    if drive_path:
-        drive_plot_path = os.path.join(drive_path, 'regression_training_curves.png')
-        plt.savefig(drive_plot_path, dpi=300, bbox_inches='tight')
-        print(f"Training curves saved to Drive: {drive_plot_path}")
     print("Training curves saved as regression_training_curves.png")
     
     print(f"\n✅ Regression training completed successfully!")
-    print(f"📁 Local checkpoints saved in: {local_checkpoint_dir}")
-    if drive_path:
-        print(f"☁️ Drive checkpoints saved in: {drive_path}")
+    print(f"📁 Checkpoints saved in: {local_checkpoint_dir}")
     print(f"🏆 Best validation loss: {best_val_loss:.4f}")
 
 if __name__ == "__main__":

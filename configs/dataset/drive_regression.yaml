@@ -34,11 +34,11 @@ order_ops: []  # No processing operations
 # -----------------------------------------------------------------------------
 # DataLoader Settings
 # -----------------------------------------------------------------------------
-train_batch_size: 4
-val_batch_size: 2
-test_batch_size: 2
-num_workers: 4
-pin_memory: true 
+train_batch_size: 1        # Reduced from 4 to 1 for Snake Fast memory efficiency
+val_batch_size: 1          # Reduced from 2 to 1 for Snake Fast memory efficiency
+test_batch_size: 1         # Reduced from 2 to 1 for Snake Fast memory efficiency
+num_workers: 0             # Reduced from 4 to 0 to save memory
+pin_memory: false          # Disabled to save memory
 
 training:
   num_epochs: 300
@@ -54,8 +54,8 @@ snake_loss:
   alpha: 0.0001
   beta: 0.01
   fltrstdev: 0.5
-  nsteps: 10
-  cropsz: [128, 128]      # 2D only
-  dmax: 155.0             # matches DRIVE distance map range
-  maxedgelen: 10.0
-  extgradfac: 2.0 
+  nsteps: 5               # Reduced from 10 to 5 to save memory
+  cropsz: [16, 16]        # Further reduced from [32, 32] for extreme memory efficiency
+  dmax: 15.0              # Reduced from 155.0 to match baseline
+  maxedgelen: 3.0         # Further reduced from 5.0 to save memory
+  extgradfac: 1.0         # Reduced from 2.0 to save memory 
