@@ -63,8 +63,19 @@ class SnakeFastLoss(nn.Module):
         return self
 
     def forward(self,pred_dmap,lbl_graphs,crops=None):
+        # Ensure filter is on the same device as input
+        if pred_dmap.device != self.fltrt.device:
+            self.fltrt = self.fltrt.to(pred_dmap.device)
+            # Update iscuda flag based on actual device
+            self.iscuda = pred_dmap.device.type == 'cuda'
     
         pred_ = pred_dmap
+        
+        # Final safety check before cmptGradIm
+        if pred_.device != self.fltrt.device:
+            # Force move one more time
+            self.fltrt = self.fltrt.to(pred_.device)
+        
         gimg = gradImSnake.cmptGradIm(pred_,self.fltrt)
         gimg *= self.extgradfac
         snake_dmap = []
@@ -88,6 +99,10 @@ class SnakeFastLoss(nn.Module):
             snake_dmap.append(dmap)
 
         snake_dm = torch.stack(snake_dmap,0).unsqueeze(1)
+        # Ensure snake_dm is on the same device as pred_dmap
+        if snake_dm.device != pred_dmap.device:
+            snake_dm = snake_dm.to(pred_dmap.device)
+        
         loss = torch.pow(pred_dmap-snake_dm,2).mean()
                   
         self.snake = s
@@ -122,8 +137,19 @@ class SnakeSimpleLoss(nn.Module):
         return self
 
     def forward(self,pred_dmap,lbl_graphs,crops=None):
+        # Ensure filter is on the same device as input
+        if pred_dmap.device != self.fltrt.device:
+            self.fltrt = self.fltrt.to(pred_dmap.device)
+            # Update iscuda flag based on actual device
+            self.iscuda = pred_dmap.device.type == 'cuda'
     
         pred_=pred_dmap.detach()
+        
+        # Final safety check before cmptGradIm
+        if pred_.device != self.fltrt.device:
+            # Force move one more time
+            self.fltrt = self.fltrt.to(pred_.device)
+        
         gimg=gradImSnake.cmptGradIm(pred_,self.fltrt)
         gimg*=self.extgradfac
         snake_dmap=[]
@@ -149,9 +175,20 @@ class SnakeSimpleLoss(nn.Module):
                 dmap = dist(1-lbl)
                 dmap[dmap > self.dmax] = self.dmax
                 
-            snake_dmap.append(torch.Tensor(dmap).type(torch.float32).cuda())
+            # Create tensor and move to the same device as pred_dmap
+            dmap_tensor = torch.Tensor(dmap).type(torch.float32)
+            if pred_dmap.device.type == 'cuda':
+                dmap_tensor = dmap_tensor.cuda()
+            else:
+                dmap_tensor = dmap_tensor.to(pred_dmap.device)
+            
+            snake_dmap.append(dmap_tensor)
 
         snake_dm=torch.stack(snake_dmap,0).unsqueeze(1)
+        # Ensure snake_dm is on the same device as pred_dmap
+        if snake_dm.device != pred_dmap.device:
+            snake_dm = snake_dm.to(pred_dmap.device)
+        
         loss=torch.pow(pred_dmap-snake_dm,2).mean()
                   
         self.snake=s
