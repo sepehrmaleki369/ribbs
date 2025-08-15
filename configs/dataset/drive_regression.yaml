@@ -41,21 +41,23 @@ num_workers: 0             # Reduced from 4 to 0 to save memory
 pin_memory: false          # Disabled to save memory
 
 training:
-  num_epochs: 300
-  resume_checkpoint: /content/drive/MyDrive/ribbs/checkpoints_regression/checkpoint_epoch_200.pth
-  additional_epochs: 100
+  num_epochs: 3            # Changed: 3 epochs with snake simple only
+  resume_checkpoint: null  # Changed: Start from scratch (no resume)
+  additional_epochs: 3     # 3 epochs with snake loss
 
 snake_loss:
   enabled: true
-  type: fast
-  start_epoch: 201        # switch right after resuming from epoch 200
+  type: simple             # Using Snake Simple
+  start_epoch: 1           # Changed: Start Snake Simple from epoch 1
   pretrained_checkpoint: null
+  ndims: 2                 # 2D for image data
   stepsz: 0.1
   alpha: 0.0001
   beta: 0.01
   fltrstdev: 0.5
-  nsteps: 5               # Reduced from 10 to 5 to save memory
-  cropsz: [16, 16]        # Further reduced from [32, 32] for extreme memory efficiency
-  dmax: 15.0              # Reduced from 155.0 to match baseline
-  maxedgelen: 3.0         # Further reduced from 5.0 to save memory
-  extgradfac: 1.0         # Reduced from 2.0 to save memory 
+  nsteps: 5                # 5 steps for simple
+  cropsz: [16, 16]        # [16, 16] for simple
+  dmax: 15.0               # Matches your clipped distance maps
+  maxedgelen: 3.0          # 3.0 for simple
+  extgradfac: 1.0          # 1.0 for simple
+  evolved_graphs_dir: graphs/evolved 

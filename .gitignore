@@ -191,3 +191,4 @@ wandb/
 # *.png  # Commented out to allow prediction images
 **/logs/*
 **/lightning_logs/*
+graphs/evolved/*.pkl
