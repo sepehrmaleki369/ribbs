@@ -41,14 +41,14 @@ num_workers: 0             # Reduced from 4 to 0 to save memory
 pin_memory: false          # Disabled to save memory
 
 training:
-  num_epochs: 3            # Changed: 3 epochs with snake simple only
-  resume_checkpoint: null  # Changed: Start from scratch (no resume)
-  additional_epochs: 3     # 3 epochs with snake loss
+  num_epochs: 110          # Changed: 100 (MSE) + 10 (snake) = 110 total
+  resume_checkpoint: /content/drive/MyDrive/ribbs/checkpoints_regression/checkpoint_epoch_100.pth  # Resume from epoch 100
+  additional_epochs: 10    # 10 epochs with snake loss
 
 snake_loss:
   enabled: true
   type: simple             # Using Snake Simple
-  start_epoch: 1           # Changed: Start Snake Simple from epoch 1
+  start_epoch: 101         # Changed: Start Snake Simple at epoch 101 (after resuming from 100)
   pretrained_checkpoint: null
   ndims: 2                 # 2D for image data
   stepsz: 0.1
