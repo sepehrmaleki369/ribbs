@@ -154,6 +154,10 @@ class SnakeSimpleLoss(nn.Module):
         gimg*=self.extgradfac
         snake_dmap=[]
 
+        # FIXED: Store all snakes instead of just the last one
+        self.snakes = []  # List to store ALL snakes
+        self.snake_sample_ids = []  # List to store sample IDs
+
         for i,lg in enumerate(zip(lbl_graphs,gimg)):
             l = lg[0]
             g = lg[1]
@@ -166,6 +170,13 @@ class SnakeSimpleLoss(nn.Module):
             if self.iscuda: s.cuda()
 
             s.optim(self.nsteps)
+
+            # FIXED: Store this snake
+            self.snakes.append(s)
+            
+            # Try to get sample ID from the graph if possible
+            sample_id = getattr(l, 'sample_id', i)
+            self.snake_sample_ids.append(sample_id)
 
             lbl = np.zeros(g.shape[1:])
             lbl = s.renderSnakeWithLines(lbl)
@@ -190,8 +201,13 @@ class SnakeSimpleLoss(nn.Module):
             snake_dm = snake_dm.to(pred_dmap.device)
         
         loss=torch.pow(pred_dmap-snake_dm,2).mean()
-                  
-        self.snake=s
+        
+        # FIXED: Keep backward compatibility by setting self.snake to last snake
+        if self.snakes:
+            self.snake = self.snakes[-1]  # Last snake for backward compatibility
+        else:
+            self.snake = None
+            
         self.gimg=gimg
         
         return loss
