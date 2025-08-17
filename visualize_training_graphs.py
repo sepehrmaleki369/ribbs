@@ -3,11 +3,12 @@ import re
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple
+from tqdm import tqdm
 
 SAMPLES = [21, 27, 34]  # change/extend as needed
 IMAGES_DIR = 'drive/training/images_npy'
 GRAPHS_DIR = 'drive/training/graphs'
-OUT_DIR = 'predictions'
+OUT_DIR = 'all_graph_overlays'
 
 
 def load_image(sample_id: int) -> np.ndarray:
@@ -104,7 +105,6 @@ def validate_graph(nodes_xy: np.ndarray, edges: List[Tuple[int, int]], img_shape
 
 
 def plot_graph_on_image(sample_id: int):
-    os.makedirs(OUT_DIR, exist_ok=True)
     img = load_image(sample_id)
     nodes_xy, edges = parse_graph(sample_id)
 
@@ -113,32 +113,103 @@ def plot_graph_on_image(sample_id: int):
     # Plot overlay
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     ax.imshow(img)
-    # Draw edges
+    # Draw edges in blue
     for (u, v) in edges:
         if 0 <= u < len(nodes_xy) and 0 <= v < len(nodes_xy):
             x0, y0 = nodes_xy[u]
             x1, y1 = nodes_xy[v]
-            ax.plot([x0, x1], [y0, y1], color='yellow', linewidth=0.7, alpha=0.7)
-    # Draw nodes
-    ax.scatter(nodes_xy[:, 0], nodes_xy[:, 1], s=4, c='red', alpha=0.8)
-    ax.set_title(f"Graph Overlay - {sample_id}")
+            ax.plot([x0, x1], [y0, y1], color='blue', linewidth=1.0, alpha=0.8)
+    # Draw nodes in blue
+    ax.scatter(nodes_xy[:, 0], nodes_xy[:, 1], s=6, c='blue', alpha=0.9)
+    ax.set_title(f"Graph Overlay - Sample {sample_id}")
     ax.axis('off')
 
-    out_path = os.path.join(OUT_DIR, f"graph_overlay_{sample_id}.png")
+    out_path = os.path.join(OUT_DIR, f"graph_overlay_{sample_id:03d}.png")
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
-    print(f"Sample {sample_id} stats: {stats}")
-    print(f"✅ Saved: {out_path}")
+    print(f"✅ Sample {sample_id}: {stats['num_nodes']} nodes, {stats['num_edges']} edges -> {out_path}")
+    return stats
+
+
+def get_all_available_samples():
+    """Get all sample IDs that have both image and graph files."""
+    available_samples = []
+    
+    # Check what images are available
+    if os.path.exists(IMAGES_DIR):
+        image_files = [f for f in os.listdir(IMAGES_DIR) if f.endswith('_training.npy')]
+        image_samples = [int(f.split('_')[0]) for f in image_files]
+        print(f"📁 Found {len(image_samples)} training images: {sorted(image_samples)}")
+    else:
+        print(f"❌ Images directory not found: {IMAGES_DIR}")
+        return []
+    
+    # Check what graphs are available
+    if os.path.exists(GRAPHS_DIR):
+        graph_files = [f for f in os.listdir(GRAPHS_DIR) if f.endswith('.graph') or f.endswith('.npy.graph')]
+        graph_samples = list(set([int(f.split('_')[0]) for f in graph_files]))
+        print(f"📁 Found {len(graph_samples)} graph files: {sorted(graph_samples)}")
+    else:
+        print(f"❌ Graphs directory not found: {GRAPHS_DIR}")
+        return []
+    
+    # Find intersection (samples with both image and graph)
+    available_samples = sorted(list(set(image_samples) & set(graph_samples)))
+    print(f"🎯 {len(available_samples)} samples have both image and graph: {available_samples}")
+    
+    return available_samples
 
 
 def main():
-    for sid in SAMPLES:
+    print("=== OVERLAY ALL GRAPHS ON ALL TRAINING IMAGES ===")
+    
+    # Create output directory
+    os.makedirs(OUT_DIR, exist_ok=True)
+    print(f"📁 Output directory: {OUT_DIR}")
+    
+    # Get all available samples
+    available_samples = get_all_available_samples()
+    
+    if not available_samples:
+        print("❌ No samples found with both image and graph files!")
+        return
+    
+    # Process all samples
+    print(f"\n🎯 Processing {len(available_samples)} samples...")
+    
+    successful_samples = []
+    failed_samples = []
+    
+    for sample_id in tqdm(available_samples, desc="Processing samples"):
         try:
-            plot_graph_on_image(sid)
+            stats = plot_graph_on_image(sample_id)
+            successful_samples.append((sample_id, stats))
         except Exception as e:
-            print(f"❌ Failed on sample {sid}: {e}")
+            print(f"❌ Failed on sample {sample_id}: {e}")
+            failed_samples.append(sample_id)
+    
+    # Summary
+    print(f"\n=== SUMMARY ===")
+    print(f"✅ Successfully processed: {len(successful_samples)} samples")
+    if failed_samples:
+        print(f"❌ Failed: {len(failed_samples)} samples: {failed_samples}")
+    
+    if successful_samples:
+        # Calculate overall statistics
+        total_nodes = sum(stats['num_nodes'] for _, stats in successful_samples)
+        total_edges = sum(stats['num_edges'] for _, stats in successful_samples)
+        avg_nodes = total_nodes / len(successful_samples)
+        avg_edges = total_edges / len(successful_samples)
+        
+        print(f"\n📊 Overall Statistics:")
+        print(f"   • Total nodes across all graphs: {total_nodes}")
+        print(f"   • Total edges across all graphs: {total_edges}")
+        print(f"   • Average nodes per graph: {avg_nodes:.1f}")
+        print(f"   • Average edges per graph: {avg_edges:.1f}")
+    
+    print(f"\n🎯 All overlays saved to: {OUT_DIR}/")
 
 
 if __name__ == '__main__':

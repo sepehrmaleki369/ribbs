@@ -228,7 +228,17 @@ def train_regression():
                 dmax=snake_config.get('dmax', 15.0),
                 maxedgelen=snake_config.get('maxedgelen', 5.0),
                 extgradfac=snake_config.get('extgradfac', 2.0)
-            ).to(device)
+            )
+            
+            # Move to device properly for SnakeFastLoss
+            if device.type == 'cuda':
+                snake_loss = snake_loss.cuda()
+                # Force move the filter tensor to CUDA
+                snake_loss.fltrt = snake_loss.fltrt.cuda()
+                print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
+                print(f"🔍 iscuda flag: {snake_loss.iscuda}")
+            else:
+                snake_loss = snake_loss.to(device)
         else:  # simple
             snake_loss = SnakeSimpleLoss(
                 ndims=snake_config.get('ndims', 2),  # Get from config or default to 2
@@ -236,12 +246,22 @@ def train_regression():
                 alpha=snake_config.get('alpha', 0.0001),
                 beta=snake_config.get('beta', 0.01),
                 fltrstdev=snake_config.get('fltrstdev', 0.5),
-                nsteps=snake_config.get('nsteps', 10),
-                cropsz=snake_config.get('cropsz', [32, 32]),
+                nsteps=snake_config.get('nsteps', 5),
+                cropsz=snake_config.get('cropsz', [16, 16]),
                 dmax=snake_config.get('dmax', 15.0),
-                maxedgelen=snake_config.get('maxedgelen', 5.0),
-                extgradfac=snake_config.get('extgradfac', 2.0)
-            ).to(device)
+                maxedgelen=snake_config.get('maxedgelen', 3.0),
+                extgradfac=snake_config.get('extgradfac', 1.0)
+            )
+            
+            # Move to device properly for SnakeSimpleLoss
+            if device.type == 'cuda':
+                snake_loss = snake_loss.cuda()
+                # Force move the filter tensor to CUDA
+                snake_loss.fltrt = snake_loss.fltrt.cuda()
+                print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
+                print(f"🔍 iscuda flag: {snake_loss.iscuda}")
+            else:
+                snake_loss = snake_loss.to(device)
     
     # Training loop
     best_val_loss = float('inf')
@@ -298,14 +318,25 @@ def train_regression():
                         # Create a dummy graph if needed
                         lbl_graphs.append(None)
                 
+                # Debug: Check device status before snake loss
+                print(f"🔍 outputs device: {outputs.device}")
+                print(f"🔍 snake_loss.fltrt device: {snake_loss.fltrt.device}")
+                print(f"🔍 Device match: {outputs.device == snake_loss.fltrt.device}")
+                
+                # Ensure filter is on the same device as outputs
+                if outputs.device != snake_loss.fltrt.device:
+                    print(f"⚠️ Device mismatch detected! Moving filter from {snake_loss.fltrt.device} to {outputs.device}")
+                    snake_loss.fltrt = snake_loss.fltrt.to(outputs.device)
+                
                 # Calculate snake loss
                 loss = snake_loss(outputs, lbl_graphs)
                 
-                # Save evolved graphs after snake loss calculation
-                try:
-                    save_snake_evolution_graphs(snake_loss, sample_ids, epoch, evolved_graphs_dir)
-                except Exception as e:
-                    print(f"⚠️ Could not save evolved graphs: {e}")
+                # Save evolved graphs every 10 epochs
+                if epoch % 10 == 0:
+                    try:
+                        save_snake_evolution_graphs(snake_loss, sample_ids, epoch, evolved_graphs_dir)
+                    except Exception as e:
+                        print(f"⚠️ Could not save evolved graphs: {e}")
             else:
                 loss = criterion(outputs, targets.unsqueeze(1))
             

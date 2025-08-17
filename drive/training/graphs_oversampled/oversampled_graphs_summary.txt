@@ -1,0 +1,134 @@
+OVERsampled GRAPHS SAVING SUMMARY
+==================================================
+
+Oversampling spacing: 5 pixels
+Output directory: drive/training/graphs_oversampled
+Total samples processed: 20
+
+OVERALL STATISTICS:
+Original graphs: 61248 nodes, 62143 edges
+Oversampled graphs: 64308 nodes, 65203 edges
+Total node increase: 3060 nodes
+Total edge increase: 3060 edges
+
+DETAILED RESULTS:
+
+Sample 21:
+  Original: 2675 nodes, 2697 edges
+  Oversampled: 2832 nodes, 2854 edges
+  Increase: +157 nodes, +157 edges
+  Saved as: 21_oversampled_spacing5.npy
+
+Sample 22:
+  Original: 3437 nodes, 3481 edges
+  Oversampled: 3566 nodes, 3610 edges
+  Increase: +129 nodes, +129 edges
+  Saved as: 22_oversampled_spacing5.npy
+
+Sample 23:
+  Original: 1950 nodes, 1971 edges
+  Oversampled: 2054 nodes, 2075 edges
+  Increase: +104 nodes, +104 edges
+  Saved as: 23_oversampled_spacing5.npy
+
+Sample 24:
+  Original: 3830 nodes, 3905 edges
+  Oversampled: 4009 nodes, 4084 edges
+  Increase: +179 nodes, +179 edges
+  Saved as: 24_oversampled_spacing5.npy
+
+Sample 25:
+  Original: 3192 nodes, 3239 edges
+  Oversampled: 3324 nodes, 3371 edges
+  Increase: +132 nodes, +132 edges
+  Saved as: 25_oversampled_spacing5.npy
+
+Sample 26:
+  Original: 2877 nodes, 2914 edges
+  Oversampled: 2971 nodes, 3008 edges
+  Increase: +94 nodes, +94 edges
+  Saved as: 26_oversampled_spacing5.npy
+
+Sample 27:
+  Original: 3513 nodes, 3591 edges
+  Oversampled: 3680 nodes, 3758 edges
+  Increase: +167 nodes, +167 edges
+  Saved as: 27_oversampled_spacing5.npy
+
+Sample 28:
+  Original: 3495 nodes, 3555 edges
+  Oversampled: 3649 nodes, 3709 edges
+  Increase: +154 nodes, +154 edges
+  Saved as: 28_oversampled_spacing5.npy
+
+Sample 29:
+  Original: 3279 nodes, 3331 edges
+  Oversampled: 3407 nodes, 3459 edges
+  Increase: +128 nodes, +128 edges
+  Saved as: 29_oversampled_spacing5.npy
+
+Sample 30:
+  Original: 3055 nodes, 3099 edges
+  Oversampled: 3192 nodes, 3236 edges
+  Increase: +137 nodes, +137 edges
+  Saved as: 30_oversampled_spacing5.npy
+
+Sample 31:
+  Original: 2363 nodes, 2388 edges
+  Oversampled: 2500 nodes, 2525 edges
+  Increase: +137 nodes, +137 edges
+  Saved as: 31_oversampled_spacing5.npy
+
+Sample 32:
+  Original: 2998 nodes, 3039 edges
+  Oversampled: 3165 nodes, 3206 edges
+  Increase: +167 nodes, +167 edges
+  Saved as: 32_oversampled_spacing5.npy
+
+Sample 33:
+  Original: 3036 nodes, 3065 edges
+  Oversampled: 3190 nodes, 3219 edges
+  Increase: +154 nodes, +154 edges
+  Saved as: 33_oversampled_spacing5.npy
+
+Sample 34:
+  Original: 3386 nodes, 3474 edges
+  Oversampled: 3574 nodes, 3662 edges
+  Increase: +188 nodes, +188 edges
+  Saved as: 34_oversampled_spacing5.npy
+
+Sample 35:
+  Original: 3054 nodes, 3100 edges
+  Oversampled: 3198 nodes, 3244 edges
+  Increase: +144 nodes, +144 edges
+  Saved as: 35_oversampled_spacing5.npy
+
+Sample 36:
+  Original: 3551 nodes, 3599 edges
+  Oversampled: 3725 nodes, 3773 edges
+  Increase: +174 nodes, +174 edges
+  Saved as: 36_oversampled_spacing5.npy
+
+Sample 37:
+  Original: 2959 nodes, 3001 edges
+  Oversampled: 3124 nodes, 3166 edges
+  Increase: +165 nodes, +165 edges
+  Saved as: 37_oversampled_spacing5.npy
+
+Sample 38:
+  Original: 2879 nodes, 2918 edges
+  Oversampled: 3089 nodes, 3128 edges
+  Increase: +210 nodes, +210 edges
+  Saved as: 38_oversampled_spacing5.npy
+
+Sample 39:
+  Original: 3023 nodes, 3056 edges
+  Oversampled: 3176 nodes, 3209 edges
+  Increase: +153 nodes, +153 edges
+  Saved as: 39_oversampled_spacing5.npy
+
+Sample 40:
+  Original: 2696 nodes, 2720 edges
+  Oversampled: 2883 nodes, 2907 edges
+  Increase: +187 nodes, +187 edges
+  Saved as: 40_oversampled_spacing5.npy
