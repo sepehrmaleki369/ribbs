@@ -16,109 +16,56 @@ from utils.graphs import load_training_graph_by_id
 import networkx as nx
 
 
-def save_snake_evolution_graphs(snake_loss_obj, sample_ids, epoch, output_dir='graphs/evolved'):
+def save_evolved_graphs_correctly(snake_loss_obj, batch_data, epoch, output_dir='graphs/evolved'):
     """
-    Extract and save evolved snake graphs after optimization.
-    Updated to work with the actual snake loss object structure.
+    CORRECTLY save evolved snake graphs for each sample in the batch.
     
     Args:
         snake_loss_obj: The snake loss object after optimization
-        sample_ids: List of sample IDs for this batch
+        batch_data: The batch data containing correct sample IDs
         epoch: Current training epoch
         output_dir: Directory to save evolved graphs
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    try:
-        # Try to access the snake attribute which contains the evolved graphs
-        if hasattr(snake_loss_obj, 'snake'):
-            snake_data = snake_loss_obj.snake
+    # Check if the loss function has the fixed attributes
+    if not hasattr(snake_loss_obj, 'snakes') or not hasattr(snake_loss_obj, 'snake_sample_ids'):
+        print("⚠️ Warning: Loss function doesn't have fixed attributes. Make sure to apply the losses.py patch first!")
+        return
+    
+    # Get the correct sample IDs from the batch
+    sample_ids = batch_data.get('sample_ids', [])
+    if not sample_ids:
+        print("⚠️ No sample IDs found in batch data")
+        return
+    
+    print(f"🔍 Saving evolved graphs for {len(sample_ids)} samples: {sample_ids}")
+    
+    # Save each evolved graph with its correct sample ID
+    # FIXED: Use batch sample IDs instead of snake sample IDs
+    for i, snake in enumerate(snake_loss_obj.snakes):
+        if snake is not None and i < len(sample_ids):
+            # Get the correct sample ID from the batch
+            correct_sample_id = sample_ids[i]
             
-            print(f"✅ Found snake data, type: {type(snake_data)}")
+            # Create filename with correct sample ID
+            filename = f"evolved_sample_{correct_sample_id}_epoch_{epoch}.pkl"
+            filepath = os.path.join(output_dir, filename)
             
-            # The snake data might be a list or contain multiple graphs
-            if isinstance(snake_data, list):
-                graphs_list = snake_data
-                print(f"✅ Snake data is a list with {len(graphs_list)} items")
-            elif hasattr(snake_data, '__len__'):
-                graphs_list = list(snake_data)
-                print(f"✅ Snake data has length {len(graphs_list)}")
-            else:
-                graphs_list = [snake_data]
-                print(f"✅ Snake data is a single item")
-            
-            # Save each evolved graph
-            for i, sample_id in enumerate(sample_ids):
-                if i < len(graphs_list):
-                    evolved_graph = graphs_list[i]
-                    
-                    # Try to convert to NetworkX format
-                    try:
-                        if hasattr(evolved_graph, 'to_networkx'):
-                            nx_graph = evolved_graph.to_networkx()
-                            print(f"✅ Converted using to_networkx()")
-                        elif hasattr(evolved_graph, 'get_graph'):
-                            nx_graph = evolved_graph.get_graph()
-                            print(f"✅ Converted using get_graph()")
-                        elif hasattr(evolved_graph, 'graph'):
-                            nx_graph = evolved_graph.graph
-                            print(f"✅ Converted using .graph attribute")
-                        elif isinstance(evolved_graph, nx.Graph):
-                            nx_graph = evolved_graph
-                            print(f"✅ Already a NetworkX graph")
-                        else:
-                            # If we can't convert, save the raw data as pickle
-                            print(f"⚠️ Cannot convert graph format, saving raw data")
-                            filename = f"evolved_sample_{sample_id}_epoch_{epoch}.pkl"
-                            filepath = os.path.join(output_dir, filename)
-                            
-                            import pickle
-                            with open(filepath, 'wb') as f:
-                                pickle.dump(evolved_graph, f)
-                            print(f"✅ Saved raw snake data: {filename}")
-                            continue
-                        
-                        # Save the NetworkX graph
-                        filename = f"evolved_sample_{sample_id}_epoch_{epoch}.graph"
-                        filepath = os.path.join(output_dir, filename)
-                        nx.write_gpickle(nx_graph, filepath)
-                        print(f"✅ Saved evolved graph: {filename}")
-                        
-                    except Exception as e:
-                        print(f"⚠️ Error processing graph {i} for sample {sample_id}: {e}")
-                        # Fallback: save raw data
-                        try:
-                            filename = f"evolved_sample_{sample_id}_epoch_{epoch}_raw.pkl"
-                            filepath = os.path.join(output_dir, filename)
-                            import pickle
-                            with open(filepath, 'wb') as f:
-                                pickle.dump(evolved_graph, f)
-                            print(f"✅ Saved raw data as fallback: {filename}")
-                        except Exception as e2:
-                            print(f"❌ Failed to save even raw data: {e2}")
-                        continue
-                        
-                else:
-                    print(f"⚠️ No evolved graph available for sample {sample_id}")
-                    
+            try:
+                # Save the evolved graph
+                import pickle
+                with open(filepath, 'wb') as f:
+                    pickle.dump(snake, f)
+                print(f"✅ Saved evolved graph for sample {correct_sample_id} at epoch {epoch}")
+                
+            except Exception as e:
+                print(f"❌ Error saving evolved graph for sample {correct_sample_id}: {e}")
         else:
-            print(f"⚠️ Snake loss object has no 'snake' attribute")
-            print(f"Available attributes: {[attr for attr in dir(snake_loss_obj) if not attr.startswith('_')]}")
-            
-            # Try alternative approaches
-            if hasattr(snake_loss_obj, 'getGraph'):
-                print(f"✅ Found getGraph() method, trying to use it")
-                try:
-                    evolved_graphs = snake_loss_obj.getGraph()
-                    # Process evolved_graphs similar to above
-                    # ... (similar logic for processing)
-                except Exception as e:
-                    print(f"⚠️ getGraph() method failed: {e}")
-            
-    except Exception as e:
-        print(f"⚠️ Error saving evolved graphs: {e}")
-        print(f"Snake loss object type: {type(snake_loss_obj)}")
-        print(f"Available attributes: {[attr for attr in dir(snake_loss_obj) if not attr.startswith('_')]}")
+            if i < len(sample_ids):
+                print(f"⚠️ No evolved graph available for sample {sample_ids[i]}")
+            else:
+                print(f"⚠️ No evolved graph available for index {i}")
 
 
 def train_regression():
@@ -181,12 +128,33 @@ def train_regression():
     train_dataset = RegressionDataset(config, split='train')
     val_dataset = RegressionDataset(config, split='valid')
     
+    # FIXED: Custom collate function to preserve sample IDs
+    def collate_fn(batch):
+        """Custom collate function to preserve sample IDs."""
+        images = torch.stack([item['image'] for item in batch])
+        targets = torch.stack([item['distance_map'] for item in batch])
+        
+        # Handle missing label_graphs - create empty list for now
+        # We'll load the actual graphs during training
+        label_graphs = []  # Will be populated during training
+        
+        # Extract sample IDs
+        sample_ids = [item['sample_id'] for item in batch]
+        
+        return {
+            'image': images,
+            'distance_map': targets,
+            'label_graphs': label_graphs,  # Empty list, will be filled during training
+            'sample_ids': sample_ids  # Include sample IDs in batch
+        }
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=config.get('num_workers', 0),
-        pin_memory=config.get('pin_memory', False)
+        pin_memory=config.get('pin_memory', False),
+        collate_fn=collate_fn  # FIXED: Use custom collate function
     )
     
     val_loader = DataLoader(
@@ -194,7 +162,8 @@ def train_regression():
         batch_size=config.get('val_batch_size', 1), 
         shuffle=False, 
         num_workers=config.get('num_workers', 0),
-        pin_memory=config.get('pin_memory', False)
+        pin_memory=config.get('pin_memory', False),
+        collate_fn=collate_fn  # FIXED: Use custom collate function
     )
     
     print(f"✅ Training samples: {len(train_dataset)}")
@@ -211,7 +180,7 @@ def train_regression():
     evolved_graphs_dir = snake_config.get('evolved_graphs_dir', 'graphs/evolved')
     
     if use_snake_loss:
-        print(f"�� Snake loss enabled: {snake_type}")
+        print(f"🐍 Snake loss enabled: {snake_type}")
         print(f"🐍 Snake loss starts at epoch: {snake_start_epoch}")
         print(f"🐍 Evolved graphs will be saved to: {evolved_graphs_dir}")
         
@@ -284,7 +253,13 @@ def train_regression():
         for batch_idx, batch in enumerate(train_pbar):
             images = batch['image'].to(device)
             targets = batch['distance_map'].to(device)
-            sample_ids = batch.get('sample_id', [f"batch_{batch_idx}_sample_{i}" for i in range(len(images))])
+            
+            # FIXED: Get correct sample IDs from batch
+            sample_ids = batch['sample_ids']  # Now this will be a list of actual sample IDs
+            print(f"🔍 Processing batch {batch_idx} with sample IDs: {sample_ids}")
+            
+            # Store original dimensions for proper padding removal
+            original_h, original_w = images.shape[2], images.shape[3]
             
             # Add padding to make dimensions divisible by 4 (for UNet with 2 levels)
             h, w = images.shape[2], images.shape[3]
@@ -300,19 +275,24 @@ def train_regression():
             # Forward pass
             outputs = model(images)
             
-            # Remove padding for loss calculation
+            # FIXED: Remove padding for loss calculation using original dimensions
             if pad_h > 0 or pad_w > 0:
-                outputs = outputs[:, :, :h, :w]
-                targets = targets[:, :h, :w]  # targets has 3 dimensions, not 4
+                outputs = outputs[:, :, :original_h, :original_w]
+                targets = targets[:, :original_h, :original_w]  # targets has 3 dimensions, not 4
             
             # Calculate loss
             if use_snake_this_epoch:
-                # Load graph data for snake loss
+                # FIXED: Load graph data for snake loss using correct sample IDs
                 lbl_graphs = []
                 for sample_id in sample_ids:
                     try:
                         graph = load_training_graph_by_id(str(sample_id))
-                        lbl_graphs.append(graph)
+                        if graph is not None:
+                            lbl_graphs.append(graph)
+                            print(f"✅ Loaded graph for sample {sample_id}")
+                        else:
+                            print(f"⚠️ No graph found for sample {sample_id}")
+                            lbl_graphs.append(None)
                     except Exception as e:
                         print(f"⚠️ Could not load graph for sample {sample_id}: {e}")
                         # Create a dummy graph if needed
@@ -328,13 +308,13 @@ def train_regression():
                     print(f"⚠️ Device mismatch detected! Moving filter from {snake_loss.fltrt.device} to {outputs.device}")
                     snake_loss.fltrt = snake_loss.fltrt.to(outputs.device)
                 
-                # Calculate snake loss
+                # FIXED: Calculate snake loss - the loss function now stores all snakes
                 loss = snake_loss(outputs, lbl_graphs)
                 
-                # Save evolved graphs every 10 epochs
+                # FIXED: Save evolved graphs every epoch (or every 10 epochs if you prefer)
                 if epoch % 10 == 0:
                     try:
-                        save_snake_evolution_graphs(snake_loss, sample_ids, epoch, evolved_graphs_dir)
+                        save_evolved_graphs_correctly(snake_loss, batch, epoch, evolved_graphs_dir)
                     except Exception as e:
                         print(f"⚠️ Could not save evolved graphs: {e}")
             else:
@@ -361,6 +341,9 @@ def train_regression():
                 images = batch['image'].to(device)
                 targets = batch['distance_map'].to(device)
                 
+                # Store original dimensions for proper padding removal
+                original_h, original_w = images.shape[2], images.shape[3]
+                
                 # Add padding to make dimensions divisible by 4 (for UNet with 2 levels)
                 h, w = images.shape[2], images.shape[3]
                 pad_h = (4 - h % 4) % 4
@@ -372,10 +355,13 @@ def train_regression():
                 
                 outputs = model(images)
                 
-                # Remove padding for loss calculation
+                # FIXED: Remove padding for loss calculation using original dimensions
                 if pad_h > 0 or pad_w > 0:
-                    outputs = outputs[:, :, :h, :w]
-                    targets = targets[:, :h, :w]  # targets has 3 dimensions, not 4
+                    outputs = outputs[:, :, :original_h, :original_w]
+                    targets = targets[:, :original_h, :original_w]  # targets has 3 dimensions, not 4
+                
+                # Debug: Check tensor shapes
+                print(f"🔍 Validation - outputs shape: {outputs.shape}, targets shape: {targets.shape}")
                 
                 if use_snake_this_epoch:
                     # For validation, use MSE loss to compare fairly
@@ -391,7 +377,7 @@ def train_regression():
         print(f"Epoch {epoch}/{num_epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Save checkpoint every 50 epochs
-        if epoch % 50 == 0:
+        if epoch % 10 == 0:
             checkpoint_path = f'checkpoints_regression/checkpoint_epoch_{epoch}.pth'
             os.makedirs('checkpoints_regression', exist_ok=True)
             
@@ -433,7 +419,7 @@ def train_regression():
     print(f"✅ Snake loss enabled: {use_snake_loss}")
     if use_snake_loss:
         print(f"✅ Snake loss type: {snake_type}")
-        print(f"✅ Snake loss started at epoch: {snake_start_epoch}")
+        print(f"✅ Snake loss started at epoch: {snake_type}")
         print(f"✅ Evolved graphs saved to: {evolved_graphs_dir}")
     print(f"✅ Best validation loss: {best_val_loss:.4f}")
     print(f"✅ Checkpoints saved every 50 epochs")
