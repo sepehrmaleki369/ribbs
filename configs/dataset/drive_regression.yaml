@@ -40,24 +40,33 @@ test_batch_size: 1         # Reduced from 2 to 1 for Snake Fast memory efficienc
 num_workers: 0             # Reduced from 4 to 0 to save memory
 pin_memory: false          # Disabled to save memory
 
+# Training configuration
 training:
-  num_epochs: 3            # Test: 1 (MSE) + 2 (snake) = 3 total
-  resume_checkpoint: null  # No resume for test
-  additional_epochs: 2     # 2 epochs with snake loss
+  num_epochs: 150
+  resume_checkpoint: "/content/drive/MyDrive/ribbs/checkpoints_clipped_mse_simple/checkpoint_epoch_100.pth"
+  learning_rate: 0.001
+  
+# Debug configuration
+debug:
+  level: "batch"              # Options: "batch", "epoch", "minimal"
+  snake_loss_verbose: true     # Show detailed snake loss debugging
+  device_checks: true          # Show device matching checks
+  graph_loading: true          # Show graph loading status
+  save_evolved_graphs: true    # Save evolved graphs during training
 
 snake_loss:
   enabled: true
   type: simple             # Using Snake Simple
-  start_epoch: 2           # Start Snake Simple at epoch 2 (after 1 MSE epoch)
+  start_epoch: 101         # Start Snake Simple at epoch 101 (after resuming from epoch 100)
   pretrained_checkpoint: null
   ndims: 2                 # 2D for image data
-  stepsz: 0.1
-  alpha: 0.0001
-  beta: 0.01
+  stepsz: 0.5              # INCREASED: Stronger step size for more movement
+  alpha: 0.01              # INCREASED: Much stronger elasticity (was 0.0001)
+  beta: 0.1                # INCREASED: Stronger curvature (was 0.01)
   fltrstdev: 0.5
-  nsteps: 5                # 5 steps for simple
+  nsteps: 20               # INCREASED: More optimization steps (was 5)
   cropsz: [16, 16]        # [16, 16] for simple
   dmax: 15.0               # Matches your clipped distance maps
   maxedgelen: 3.0          # 3.0 for simple
-  extgradfac: 1.0          # 1.0 for simple
+  extgradfac: 2.0          # INCREASED: Stronger gradient influence (was 1.0)
   evolved_graphs_dir: graphs/evolved 

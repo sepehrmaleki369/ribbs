@@ -179,6 +179,20 @@ def train_regression():
     snake_type = snake_config.get('type', 'simple')
     evolved_graphs_dir = snake_config.get('evolved_graphs_dir', 'graphs/evolved')
     
+    # Debug configuration
+    debug_config = config.get('debug', {})
+    debug_level = debug_config.get('level', 'batch')  # batch, epoch, minimal
+    snake_loss_verbose = debug_config.get('snake_loss_verbose', True)
+    device_checks = debug_config.get('device_checks', True)
+    graph_loading = debug_config.get('graph_loading', True)
+    save_evolved_graphs = debug_config.get('save_evolved_graphs', True)
+    
+    print(f"🔧 Debug level: {debug_level}")
+    print(f"🔧 Snake loss verbose: {snake_loss_verbose}")
+    print(f"🔧 Device checks: {device_checks}")
+    print(f"🔧 Graph loading: {graph_loading}")
+    print(f"🔧 Save evolved graphs: {save_evolved_graphs}")
+    
     if use_snake_loss:
         print(f"🐍 Snake loss enabled: {snake_type}")
         print(f"🐍 Snake loss starts at epoch: {snake_start_epoch}")
@@ -204,8 +218,9 @@ def train_regression():
                 snake_loss = snake_loss.cuda()
                 # Force move the filter tensor to CUDA
                 snake_loss.fltrt = snake_loss.fltrt.cuda()
-                print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
-                print(f"🔍 iscuda flag: {snake_loss.iscuda}")
+                if device_checks:
+                    print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
+                    print(f"🔍 iscuda flag: {snake_loss.iscuda}")
             else:
                 snake_loss = snake_loss.to(device)
         else:  # simple
@@ -227,8 +242,9 @@ def train_regression():
                 snake_loss = snake_loss.cuda()
                 # Force move the filter tensor to CUDA
                 snake_loss.fltrt = snake_loss.fltrt.cuda()
-                print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
-                print(f"🔍 iscuda flag: {snake_loss.iscuda}")
+                if device_checks:
+                    print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
+                    print(f"🔍 iscuda flag: {snake_loss.iscuda}")
             else:
                 snake_loss = snake_loss.to(device)
     
@@ -256,7 +272,13 @@ def train_regression():
             
             # FIXED: Get correct sample IDs from batch
             sample_ids = batch['sample_ids']  # Now this will be a list of actual sample IDs
-            print(f"🔍 Processing batch {batch_idx} with sample IDs: {sample_ids}")
+            
+            # Debug level control
+            if debug_level == "batch":
+                print(f"🔍 Processing batch {batch_idx} with sample IDs: {sample_ids}")
+            elif debug_level == "minimal":
+                pass  # No batch-level output
+            # epoch level will be handled in epoch summary
             
             # Store original dimensions for proper padding removal
             original_h, original_w = images.shape[2], images.shape[3]
@@ -289,30 +311,50 @@ def train_regression():
                         graph = load_training_graph_by_id(str(sample_id))
                         if graph is not None:
                             lbl_graphs.append(graph)
-                            print(f"✅ Loaded graph for sample {sample_id}")
+                            if graph_loading:
+                                print(f"✅ Loaded graph for sample {sample_id}")
                         else:
-                            print(f"⚠️ No graph found for sample {sample_id}")
+                            if graph_loading:
+                                print(f"⚠️ No graph found for sample {sample_id}")
                             lbl_graphs.append(None)
                     except Exception as e:
-                        print(f"⚠️ Could not load graph for sample {sample_id}: {e}")
+                        if graph_loading:
+                            print(f"⚠️ Could not load graph for sample {sample_id}: {e}")
                         # Create a dummy graph if needed
                         lbl_graphs.append(None)
                 
                 # Debug: Check device status before snake loss
-                print(f"🔍 outputs device: {outputs.device}")
-                print(f"🔍 snake_loss.fltrt device: {snake_loss.fltrt.device}")
-                print(f"🔍 Device match: {outputs.device == snake_loss.fltrt.device}")
+                if device_checks:
+                    print(f"🔍 outputs device: {outputs.device}")
+                    print(f"🔍 snake_loss.fltrt device: {snake_loss.fltrt.device}")
+                    print(f"🔍 Device match: {outputs.device == snake_loss.fltrt.device}")
                 
                 # Ensure filter is on the same device as outputs
                 if outputs.device != snake_loss.fltrt.device:
-                    print(f"⚠️ Device mismatch detected! Moving filter from {snake_loss.fltrt.device} to {outputs.device}")
+                    if device_checks:
+                        print(f"⚠️ Device mismatch detected! Moving filter from {snake_loss.fltrt.device} to {outputs.device}")
                     snake_loss.fltrt = snake_loss.fltrt.to(outputs.device)
                 
                 # FIXED: Calculate snake loss - the loss function now stores all snakes
-                loss = snake_loss(outputs, lbl_graphs)
+                if snake_loss_verbose:
+                    loss = snake_loss(outputs, lbl_graphs)
+                else:
+                    # Temporarily disable print statements in snake loss
+                    import sys
+                    from io import StringIO
+                    
+                    # Redirect stdout to suppress print statements
+                    old_stdout = sys.stdout
+                    sys.stdout = StringIO()
+                    
+                    try:
+                        loss = snake_loss(outputs, lbl_graphs)
+                    finally:
+                        # Restore stdout
+                        sys.stdout = old_stdout
                 
                 # FIXED: Save evolved graphs every epoch (or every 10 epochs if you prefer)
-                if epoch % 10 == 0:
+                if save_evolved_graphs and epoch % 10 == 0:
                     try:
                         save_evolved_graphs_correctly(snake_loss, batch, epoch, evolved_graphs_dir)
                     except Exception as e:
@@ -331,6 +373,15 @@ def train_regression():
         
         # Calculate average training loss
         avg_train_loss = total_train_loss / len(train_loader)
+        
+        # Epoch-level debugging
+        if debug_level in ["epoch", "batch"]:
+            print(f"🔍 Epoch {epoch} Summary:")
+            print(f"🔍 Average train loss: {avg_train_loss:.4f}")
+            if use_snake_this_epoch:
+                print(f"🔍 Used snake loss: {snake_type}")
+            else:
+                print(f"🔍 Used MSE loss")
         
         # Validation
         model.eval()
