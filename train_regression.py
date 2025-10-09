@@ -52,12 +52,7 @@ def save_evolved_graphs_correctly(snake_loss_obj, batch_data, epoch, output_dir=
     # Get the correct sample IDs from the batch
     sample_ids = batch_data.get('sample_ids', [])
     if not sample_ids:
-        if debug_level == "batch":
-            print("⚠️ No sample IDs found in batch data")
         return
-    
-    if debug_level == "batch":
-        print(f"🔍 Saving evolved graphs for {len(sample_ids)} samples: {sample_ids}")
     
     # Save each evolved graph with its correct sample ID
     for i, snake in enumerate(snake_loss_obj.snakes):
@@ -70,18 +65,9 @@ def save_evolved_graphs_correctly(snake_loss_obj, batch_data, epoch, output_dir=
                 import pickle
                 with open(filepath, 'wb') as f:
                     pickle.dump(snake, f)
-                if debug_level in ["batch", "epoch"]:
-                    print(f"✅ Saved evolved graph for sample {correct_sample_id} at epoch {epoch}")
                 
             except Exception as e:
-                if debug_level in ["batch", "epoch"]:
-                    print(f"❌ Error saving evolved graph for sample {correct_sample_id}: {e}")
-        else:
-            if debug_level == "batch":
-                if i < len(sample_ids):
-                    print(f"⚠️ No evolved graph available for sample {sample_ids[i]}")
-                else:
-                    print(f"⚠️ No evolved graph available for index {i}")
+                pass
 
 
 def train_regression():
@@ -230,6 +216,7 @@ def train_regression():
     snake_config = config.get('snake_loss', {})
     use_snake_loss = snake_config.get('enabled', False)
     snake_start_epoch = snake_config.get('start_epoch', 1)
+    snake_end_epoch = snake_config.get('end_epoch', None)  # None means run until end
     snake_type = snake_config.get('type', 'simple')
     evolved_graphs_dir = snake_config.get('evolved_graphs_dir', 'graphs/evolved')
     
@@ -289,9 +276,6 @@ def train_regression():
             if device.type == 'cuda':
                 snake_loss = snake_loss.cuda()
                 snake_loss.fltrt = snake_loss.fltrt.cuda()
-                if device_checks and debug_level == "batch":
-                    print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
-                    print(f"🔍 iscuda flag: {snake_loss.iscuda}")
             else:
                 snake_loss = snake_loss.to(device)
         else:  # simple
@@ -311,9 +295,6 @@ def train_regression():
             if device.type == 'cuda':
                 snake_loss = snake_loss.cuda()
                 snake_loss.fltrt = snake_loss.fltrt.cuda()
-                if device_checks and debug_level == "batch":
-                    print(f"🔍 After cuda() - Filter device: {snake_loss.fltrt.device}")
-                    print(f"🔍 iscuda flag: {snake_loss.iscuda}")
             else:
                 snake_loss = snake_loss.to(device)
     
@@ -327,6 +308,10 @@ def train_regression():
         # Determine which loss to use this epoch
         use_snake_this_epoch = use_snake_loss and epoch >= snake_start_epoch
         
+        # Set epoch for snake loss tracking and debugging
+        if use_snake_this_epoch:
+            snake_loss.set_epoch(epoch)
+        
         # Only show loss type and current LR for epoch level and above
         if debug_level in ["batch", "epoch"]:
             if use_snake_this_epoch:
@@ -339,8 +324,8 @@ def train_regression():
             except Exception:
                 pass
         
-        # Training loop
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [Train]")
+        # Training loop - disable progress bar, just iterate
+        train_pbar = train_loader
         
         # Initialize epoch gradient tracking
         total_gradient_norm = 0.0
@@ -351,9 +336,6 @@ def train_regression():
             targets = batch['distance_map'].to(device)
             sample_ids = batch['sample_ids']
             
-            # Debug level control - only show batch details for "batch" level
-            if debug_level == "batch":
-                print(f"🔍 Processing batch {batch_idx} with sample IDs: {sample_ids}")
             
             # Store original dimensions for proper padding removal
             original_h, original_w = images.shape[2], images.shape[3]
@@ -383,40 +365,24 @@ def train_regression():
                 lbl_graphs = []
                 for sample_id in sample_ids:
                     try:
-                        # Suppress graph loading prints based on debug level
-                        if graph_loading and debug_level == "batch":
-                            # Allow prints for batch level
+                        # Always suppress graph loading prints
+                        with suppress_stdout():
                             graph = load_training_graph_by_id(str(sample_id))
-                        else:
-                            # Suppress prints for epoch and minimal levels
-                            with suppress_stdout():
-                                graph = load_training_graph_by_id(str(sample_id))
                         
                         if graph is not None:
                             lbl_graphs.append(graph)
-                            # Only print our own graph loading info for batch level
-                            if graph_loading and debug_level == "batch":
-                                print(f"✅ Loaded graph for sample {sample_id}")
                         else:
-                            if graph_loading and debug_level == "batch":
-                                print(f"⚠️ No graph found for sample {sample_id}")
                             lbl_graphs.append(None)
                     except Exception as e:
-                        if graph_loading and debug_level == "batch":
-                            print(f"⚠️ Could not load graph for sample {sample_id}: {e}")
                         lbl_graphs.append(None)
                 
-                # Debug device status only for batch level
-                if device_checks and debug_level == "batch":
-                    print(f"🔍 outputs device: {outputs.device}")
-                    print(f"🔍 snake_loss.fltrt device: {snake_loss.fltrt.device}")
-                    print(f"🔍 Device match: {outputs.device == snake_loss.fltrt.device}")
                 
                 # Ensure filter is on the same device as outputs
                 if outputs.device != snake_loss.fltrt.device:
-                    if device_checks and debug_level == "batch":
-                        print(f"⚠️ Device mismatch detected! Moving filter from {snake_loss.fltrt.device} to {outputs.device}")
                     snake_loss.fltrt = snake_loss.fltrt.to(outputs.device)
+                
+                # Store ground truth targets for snake loss visualization
+                snake_loss.current_targets = targets
                 
                 # Calculate snake loss - handle verbose output properly
                 if snake_loss_verbose and debug_level == "batch":
@@ -455,9 +421,6 @@ def train_regression():
             # Debug level control for gradient info
             if debug_level in ["epoch", "batch"]:
                 loss_type = "Snake" if use_snake_this_epoch else "MSE"
-                # Only show batch-level gradient info for batch debug level
-                if debug_level == "batch":
-                    print(f"🔍 {loss_type} Gradient norm: {total_norm:.3f}")
             
             # Add gradient clipping to prevent explosion (for both MSE and Snake)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -465,34 +428,20 @@ def train_regression():
             optimizer.step()
             
             total_train_loss += loss.item()
-            
-            # Update progress bar
-            train_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
         
         # Calculate average training loss and gradient norm
         avg_train_loss = total_train_loss / len(train_loader)
         avg_gradient_norm = total_gradient_norm / batch_count if batch_count > 0 else 0.0
         
-        # Epoch-level debugging summary
-        if debug_level in ["epoch", "batch"]:
-            print(f"🔍 Epoch {epoch} Summary:")
-            print(f"🔍 Average train loss: {avg_train_loss:.4f}")
-            print(f"🔍 Average gradient norm: {avg_gradient_norm:.4f}")
-            if use_snake_this_epoch:
-                print(f"🔍 Used snake loss: {snake_type}")
-            else:
-                print(f"🔍 Used MSE loss")
         
         # Validation every 5 epochs
         avg_val_loss = None
         if epoch % 5 == 0:
-            print(f"🔍 Running validation at epoch {epoch}...")
             model.eval()
             total_val_loss = 0.0
             
             with torch.no_grad():
-                val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{num_epochs} [Valid]")
-                for batch in val_pbar:
+                for batch in val_loader:
                     images = batch['image'].to(device)
                     targets = batch['distance_map'].to(device)
                     
@@ -516,9 +465,6 @@ def train_regression():
                         targets = targets[:, :original_h, :original_w]
                     
                     # Debug tensor shapes only for batch level
-                    if debug_level == "batch":
-                        print(f"🔍 Validation - outputs shape: {outputs.shape}, targets shape: {targets.shape}")
-                    
                     # Always use MSE loss for validation
                     val_loss = criterion(outputs, targets.unsqueeze(1))
                     total_val_loss += val_loss.item()
@@ -547,8 +493,8 @@ def train_regression():
             # Save best model only when we have validation loss
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                best_model_path = 'checkpoints_regression/best_model.pth'
-                os.makedirs('checkpoints_regression', exist_ok=True)
+                best_model_path = '/content/drive/MyDrive/ribbs/october/best_model.pth'
+                os.makedirs('/content/drive/MyDrive/ribbs/october', exist_ok=True)
                 
                 torch.save({
                     'epoch': epoch,
@@ -568,8 +514,8 @@ def train_regression():
         
         # Save checkpoint every 5 epochs (same schedule as validation)
         if epoch % 10 == 0:
-            checkpoint_path = f'checkpoints_regression/checkpoint_epoch_{epoch}.pth'
-            os.makedirs('checkpoints_regression', exist_ok=True)
+            checkpoint_path = f'/content/drive/MyDrive/ribbs/october/checkpoint_epoch_{epoch}.pth'
+            os.makedirs('/content/drive/MyDrive/ribbs/october', exist_ok=True)
             
             torch.save({
                 'epoch': epoch,
@@ -593,8 +539,29 @@ def train_regression():
         print(f"✅ Snake loss started at epoch: {snake_start_epoch}")
         print(f"✅ Evolved graphs saved to: {evolved_graphs_dir}")
     print(f"✅ Best validation loss: {best_val_loss:.4f}")
-    print(f"✅ Checkpoints saved every 5 epochs")
-    print(f"✅ Best model saved to: checkpoints_regression/best_model.pth")
+    print(f"✅ Checkpoints saved every 10 epochs")
+    print(f"✅ Best model saved to: /content/drive/MyDrive/ribbs/october/best_model.pth")
+    
+    # Send email notification if configured
+    try:
+        from send_training_email import send_training_complete_email, get_training_summary_from_checkpoint
+        
+        recipient_email = os.environ.get('EMAIL_ADDRESS')
+        sender_password = os.environ.get('EMAIL_PASSWORD')
+        
+        if recipient_email and sender_password:
+            print("\n📧 Sending email notification...")
+            checkpoint_path = '/content/drive/MyDrive/ribbs/october/best_model.pth'
+            summary = get_training_summary_from_checkpoint(checkpoint_path)
+            send_training_complete_email(
+                recipient_email=recipient_email,
+                training_summary=summary,
+                sender_password=sender_password
+            )
+        else:
+            print("\n📧 Email notification skipped (EMAIL_ADDRESS or EMAIL_PASSWORD not set)")
+    except Exception as e:
+        print(f"\n⚠️ Email notification failed: {e}")
 
 
 if __name__ == "__main__":
