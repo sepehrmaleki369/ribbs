@@ -42,7 +42,7 @@ pin_memory: false          # Disabled to save memory
 
 # Training configuration
 training:
-  num_epochs: 150
+  num_epochs: 300
   resume_checkpoint: "/content/drive/MyDrive/ribbs/checkpoints_clipped_mse_simple/checkpoint_epoch_100.pth"
   learning_rate: 0.001
   optimizer:
@@ -65,13 +65,13 @@ snake_loss:
   start_epoch: 101         # Start Snake Simple at epoch 101 (after resuming from epoch 100)
   pretrained_checkpoint: null
   ndims: 2                 # 2D for image data
-  stepsz: 0.5              # INCREASED: Stronger step size for more movement
-  alpha: 0.01              # INCREASED: Much stronger elasticity (was 0.0001)
-  beta: 0.1                # INCREASED: Stronger curvature (was 0.01)
+  stepsz: 0.1             # INCREASED: Stronger step size for more movement
+  alpha: 0.0001              # INCREASED: Much stronger elasticity (was 0.0001)
+  beta: 0.01                # INCREASED: Stronger curvature (was 0.01)
   fltrstdev: 0.5
-  nsteps: 20               # INCREASED: More optimization steps (was 5)
+  nsteps: 10               # INCREASED: More optimization steps (was 5)
   cropsz: [16, 16]        # [16, 16] for simple
   dmax: 15.0               # Matches your clipped distance maps
-  maxedgelen: 3.0          # 3.0 for simple
+  maxedgelen: 5.0          # 3.0 for simple
   extgradfac: 2.0          # INCREASED: Stronger gradient influence (was 1.0)
   evolved_graphs_dir: graphs/evolved 

@@ -6,19 +6,27 @@ import networkx as nx
 def drawLine(lbl,begPoint,endPoint):
     # endPoint and begPoint should be np.arrays
     # lbl is an np.array to which the line is rendered
+    # FIX: Graph nodes store positions as (x, y), but numpy array indexing is [row, col] = [y, x]
+    # So we need to swap coordinates when indexing into lbl
     d=endPoint-begPoint
     mi=np.argmax(np.fabs(d))
     if d[mi]==0: # beginning and end points the same
-        lbl[tuple(begPoint.astype(int))]=1
+        # Swap x,y to y,x for correct array indexing
+        pos_swapped = begPoint[::-1].astype(int)  # Reverse order: (x,y) -> (y,x)
+        lbl[tuple(pos_swapped)]=1
     else:
         coef=d/d[mi] # a vector that points from the current to the next pixel
         sz=np.array(lbl.shape) # an array holding a shape not an array of shape
+        # Note: sz is in (height, width) = (y, x) order, but pos is in (x, y) order
+        sz_swapped = sz[::-1]  # Swap to (x, y) for comparison with pos
         numsteps=int(abs(d[mi]))+1
         step=int(d[mi]/abs(d[mi])) # +-1
         for t in range(0,numsteps):
             pos=begPoint+coef*t*step
-            if np.all(pos<sz) and np.all(pos>=0):
-                lbl[tuple(np.round(pos).astype(int))]=1
+            if np.all(pos<sz_swapped) and np.all(pos>=0):
+                # Swap x,y to y,x for correct array indexing
+                pos_swapped = np.round(pos)[::-1].astype(int)  # Reverse order: (x,y) -> (y,x)
+                lbl[tuple(pos_swapped)]=1
             else:
                 print("warning: reqested point",pos,"but the volume size is",sz)
     return lbl
